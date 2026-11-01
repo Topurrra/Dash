@@ -5,10 +5,10 @@
 use std::ops::Range;
 
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, rgba, size, App, Bounds, ClipboardItem, Context, CursorStyle,
-    ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId,
-    Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, ContentMask, UTF16Selection, UnderlineStyle, Window,
+    actions, div, fill, point, prelude::*, px, relative, rgba, size, App, Bounds, ClipboardItem, ContentMask, Context,
+    CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use unicode_segmentation::*;
 
@@ -321,11 +321,12 @@ fn char_kind(c: char) -> CharKind {
 
 /// The run of same-kind characters around `offset` (a word, a stretch of
 /// punctuation or of spaces), preferring a word: Cortex's `surrounding_word`.
-fn surrounding_word(text: &str, offset: usize) -> Range<usize> {
+pub(crate) fn surrounding_word(text: &str, offset: usize) -> Range<usize> {
     let offset = clamp_range(text, &(offset..offset)).start;
     let (before, after) = text.split_at(offset);
     let kind = before.chars().next_back().map(char_kind).max(after.chars().next().map(char_kind));
-    let start = offset - before.chars().rev().take_while(|&c| Some(char_kind(c)) == kind).map(char::len_utf8).sum::<usize>();
+    let start =
+        offset - before.chars().rev().take_while(|&c| Some(char_kind(c)) == kind).map(char::len_utf8).sum::<usize>();
     let end = offset + after.chars().take_while(|&c| Some(char_kind(c)) == kind).map(char::len_utf8).sum::<usize>();
     start..end
 }
@@ -526,11 +527,8 @@ impl Element for TextElement {
         let old_scroll = input.scroll_x;
         let marked_range = input.marked_range.clone();
         let style = window.text_style();
-        let (display_text, text_color) = if empty {
-            (input.placeholder.clone(), self.placeholder_color)
-        } else {
-            (content, style.color)
-        };
+        let (display_text, text_color) =
+            if empty { (input.placeholder.clone(), self.placeholder_color) } else { (content, style.color) };
         let run = TextRun {
             len: display_text.len(),
             font: style.font(),
@@ -693,7 +691,7 @@ mod tests {
         let text = "aé€b"; // 1 + 2 + 3 + 1 bytes
         assert_eq!(clamp_range(text, &(0..7)), 0..7);
         assert_eq!(clamp_range(text, &(3..99)), 3..7, "past the end");
-        assert_eq!(clamp_range(text, &(5..2)), 1..3, "reversed and mid-character");
+        assert_eq!(clamp_range(text, &std::ops::Range { start: 5, end: 2 }), 1..3, "reversed and mid-character");
         assert_eq!(clamp_range(text, &(2..4)), 1..3, "inside é and €");
         assert_eq!(clamp_range("", &(1..2)), 0..0);
         for start in 0..9 {

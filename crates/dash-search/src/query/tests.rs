@@ -25,7 +25,7 @@ fn f(path: &str) -> T {
         size: 1024,
         modified_ms: ms(2025, 6, 18, 14, 0),
         created_ms: ms(2025, 6, 18, 14, 0),
-        depth: path.matches(['\\', '/']).count() as u16,
+        depth: u16::try_from(path.matches(['\\', '/']).count()).unwrap(),
         child_count: None,
     }
 }
@@ -86,7 +86,7 @@ fn at(y: i32, m: u8, day: u8, h: u8, mi: u8) -> OffsetDateTime {
 
 /// Unix ms of a local (UTC+4) time.
 fn ms(y: i32, m: u8, day: u8, h: u8, mi: u8) -> u64 {
-    (at(y, m, day, h, mi).unix_timestamp_nanos() / 1_000_000) as u64
+    u64::try_from(at(y, m, day, h, mi).unix_timestamp_nanos() / 1_000_000).unwrap()
 }
 
 fn q(text: &str) -> Query {
@@ -824,10 +824,7 @@ fn tokenizer() {
     let w = |s: &str| Tok::Word { text: s.to_string(), quote_at: None };
     assert_eq!(tokenize("a (b|c) -d"), vec![w("a"), Tok::Open, w("b"), Tok::Or, w("c"), Tok::Close, Tok::Not, w("d")]);
     assert_eq!(tokenize("x-y !z"), vec![w("x-y"), Tok::Not, w("z")]);
-    assert_eq!(
-        tokenize("path:\"a b\" c"),
-        vec![Tok::Word { text: "path:a b".into(), quote_at: Some(5) }, w("c")]
-    );
+    assert_eq!(tokenize("path:\"a b\" c"), vec![Tok::Word { text: "path:a b".into(), quote_at: Some(5) }, w("c")]);
     assert_eq!(tokenize("case:regex:a|(b) )"), vec![w("case:regex:a|(b)"), Tok::Close]);
 }
 
@@ -839,11 +836,20 @@ fn perf_one_million_entries() {
     let entries: Vec<T> = (0..1_000_000u64)
         .map(|i| {
             let ext = ["pdf", "txt", "jpg", "docx", "rs"][(i % 5) as usize];
-            let name = if i % 7 == 0 { format!("Отчёт {i}.{ext}") } else { format!("Q{} Report {i}.{ext}", i % 4) };
+            let name =
+                if i % 7 == 0 { format!("Отчёт {i}.{ext}") } else { format!("Q{} Report {i}.{ext}", i % 4) };
             f(&format!(r"C:\Users\me\Documents\folder{}\{name}", i % 100)).size(i * 37 % (20 * MB))
         })
         .collect();
-    for text in ["rep pdf", "отчёт", "*.pdf", "IMG_????.jpg", "size:>1mb ext:pdf;docx", "regex:^q\\d", "path:folder4 | dm:today"] {
+    for text in [
+        "rep pdf",
+        "отчёт",
+        "*.pdf",
+        "IMG_????.jpg",
+        "size:>1mb ext:pdf;docx",
+        "regex:^q\\d",
+        "path:folder4 | dm:today",
+    ] {
         let query = q(text);
         let started = std::time::Instant::now();
         let n = entries.iter().filter(|t| query.matches(&t.e())).count();

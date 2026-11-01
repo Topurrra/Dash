@@ -1,8 +1,8 @@
 use redb::{Database, TableDefinition};
 use serde::{de::DeserializeOwned, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,8 +31,7 @@ const JSON_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("json");
 /// guards only the cache map (a fast HashMap lookup, plus the one-time open
 /// per path); it is never held across a database read/write transaction, so a
 /// reader no longer blocks behind an unrelated write's fsync.
-static DB_CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<Database>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static DB_CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<Database>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Set to `true` by `quarantine_corrupt_db` when it has to move the
 /// corrupt database aside and create a fresh one. The flag is
@@ -88,8 +87,7 @@ pub fn database_path_for_dir(dir: &Path) -> PathBuf {
 
 fn open_db(path: &Path) -> Result<Database, String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Cannot create database directory: {error}"))?;
+        fs::create_dir_all(parent).map_err(|error| format!("Cannot create database directory: {error}"))?;
     }
 
     // Graceful corruption recovery: if `Database::open` fails on an
@@ -114,30 +112,22 @@ fn open_db(path: &Path) -> Result<Database, String> {
                 return Err(format!("Cannot open local database: {error}"));
             }
             Err(error) => {
-                eprintln!(
-                    "local_db: cannot open existing database ({error}); quarantining and starting fresh."
-                );
+                eprintln!("local_db: cannot open existing database ({error}); quarantining and starting fresh.");
                 quarantine_corrupt_db(path)?;
-                Database::create(path).map_err(|e| {
-                    format!("Cannot create fresh database after quarantine: {e}")
-                })?
+                Database::create(path).map_err(|e| format!("Cannot create fresh database after quarantine: {e}"))?
             }
         }
     } else {
         Database::create(path).map_err(|error| format!("Cannot create local database: {error}"))?
     };
 
-    let write_txn = db
-        .begin_write()
-        .map_err(|error| format!("Cannot initialize local database: {error}"))?;
+    let write_txn = db.begin_write().map_err(|error| format!("Cannot initialize local database: {error}"))?;
     {
         let _table = write_txn
             .open_table(JSON_TABLE)
             .map_err(|error| format!("Cannot initialize local database table: {error}"))?;
     }
-    write_txn
-        .commit()
-        .map_err(|error| format!("Cannot commit local database initialization: {error}"))?;
+    write_txn.commit().map_err(|error| format!("Cannot commit local database initialization: {error}"))?;
 
     Ok(db)
 }
@@ -155,9 +145,7 @@ fn is_corruption(error: &redb::DatabaseError) -> bool {
 /// WITHOUT any app-level lock, so a reader never blocks behind an unrelated
 /// writer's fsync.
 fn get_db(path: &Path) -> Result<Arc<Database>, String> {
-    let mut cache = DB_CACHE
-        .lock()
-        .map_err(|_| "Local database cache lock was poisoned".to_string())?;
+    let mut cache = DB_CACHE.lock().map_err(|_| "Local database cache lock was poisoned".to_string())?;
     if let Some(db) = cache.get(path) {
         return Ok(db.clone());
     }
@@ -175,13 +163,9 @@ fn get_db(path: &Path) -> Result<Arc<Database>, String> {
 /// Sets `DB_CORRUPTION_RECOVERED` so the frontend can show a one-time
 /// warning banner informing the user that their preferences were reset.
 fn quarantine_corrupt_db(path: &Path) -> Result<(), String> {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_millis())
-        .unwrap_or(0);
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0);
     let quarantine = path.with_extension(format!("corrupt-{timestamp}.redb"));
-    fs::rename(path, quarantine)
-        .map_err(|error| format!("Cannot quarantine corrupt database: {error}"))?;
+    fs::rename(path, quarantine).map_err(|error| format!("Cannot quarantine corrupt database: {error}"))?;
     // Signal the frontend that a corruption recovery happened. The flag
     // is consumed by `take_db_corruption_notice` (lib.rs) once the main
     // window's layout polls it on mount — the banner then shows once.
@@ -194,22 +178,16 @@ where
     T: Clone + DeserializeOwned + Serialize,
 {
     let db = get_db(db_path)?;
-    let read_txn = db
-        .begin_read()
-        .map_err(|error| format!("Cannot read local database: {error}"))?;
+    let read_txn = db.begin_read().map_err(|error| format!("Cannot read local database: {error}"))?;
     // The redb value may be DPAPI-protected (post-encryption installs) or
     // raw JSON (legacy installs from before encryption shipped). We always
     // route through `decrypt_from_db` so the DPAPI module's version-byte
     // check transparently handles both cases — protected blobs come back
     // as plaintext, legacy blobs pass through unchanged.
     {
-        let table = read_txn
-            .open_table(JSON_TABLE)
-            .map_err(|error| format!("Cannot read local database table: {error}"))?;
-        if let Some(value) = table
-            .get(key)
-            .map_err(|error| format!("Cannot read local database value: {error}"))?
-        {
+        let table =
+            read_txn.open_table(JSON_TABLE).map_err(|error| format!("Cannot read local database table: {error}"))?;
+        if let Some(value) = table.get(key).map_err(|error| format!("Cannot read local database value: {error}"))? {
             // A value we can't read (e.g. written by a newer version) is
             // kept as-is: use the default without saving over it.
             let parsed = decrypt_from_db(value.value())
@@ -243,16 +221,10 @@ where
     }
 
     let db = get_db(db_path)?;
-    let read_txn = db
-        .begin_read()
-        .map_err(|error| format!("Cannot read local database: {error}"))?;
-    let table = read_txn
-        .open_table(JSON_TABLE)
-        .map_err(|error| format!("Cannot read local database table: {error}"))?;
-    let Some(value) = table
-        .get(key)
-        .map_err(|error| format!("Cannot read local database value: {error}"))?
-    else {
+    let read_txn = db.begin_read().map_err(|error| format!("Cannot read local database: {error}"))?;
+    let table =
+        read_txn.open_table(JSON_TABLE).map_err(|error| format!("Cannot read local database table: {error}"))?;
+    let Some(value) = table.get(key).map_err(|error| format!("Cannot read local database value: {error}"))? else {
         return Ok(None);
     };
     // Same DPAPI-transparent path as `read_json_or_default` — the
@@ -267,8 +239,8 @@ pub fn write_json<T>(db_path: &Path, key: &str, value: &T) -> Result<(), String>
 where
     T: Serialize,
 {
-    let data = serde_json::to_vec_pretty(value)
-        .map_err(|error| format!("Cannot serialize local database value: {error}"))?;
+    let data =
+        serde_json::to_vec_pretty(value).map_err(|error| format!("Cannot serialize local database value: {error}"))?;
     write_json_bytes(db_path, key, &data)
 }
 
@@ -282,20 +254,15 @@ pub fn write_json_bytes(db_path: &Path, key: &str, data: &[u8]) -> Result<(), St
 /// bytes and get back a Result, identical to before.
 fn write_json_bytes_to_db(db: &Database, key: &str, data: &[u8]) -> Result<(), String> {
     let encrypted = encrypt_for_db(data)?;
-    let write_txn = db
-        .begin_write()
-        .map_err(|error| format!("Cannot write local database: {error}"))?;
+    let write_txn = db.begin_write().map_err(|error| format!("Cannot write local database: {error}"))?;
     {
-        let mut table = write_txn
-            .open_table(JSON_TABLE)
-            .map_err(|error| format!("Cannot write local database table: {error}"))?;
+        let mut table =
+            write_txn.open_table(JSON_TABLE).map_err(|error| format!("Cannot write local database table: {error}"))?;
         table
             .insert(key, encrypted.as_slice())
             .map_err(|error| format!("Cannot write local database value: {error}"))?;
     }
-    write_txn
-        .commit()
-        .map_err(|error| format!("Cannot commit local database value: {error}"))
+    write_txn.commit().map_err(|error| format!("Cannot commit local database value: {error}"))
 }
 
 /// Remove a single key from the local DB. Used by features that legitimately
@@ -306,20 +273,13 @@ pub fn remove_json(db_path: &Path, key: &str) -> Result<(), String> {
         return Ok(());
     }
     let db = get_db(db_path)?;
-    let write_txn = db
-        .begin_write()
-        .map_err(|error| format!("Cannot write local database: {error}"))?;
+    let write_txn = db.begin_write().map_err(|error| format!("Cannot write local database: {error}"))?;
     {
-        let mut table = write_txn
-            .open_table(JSON_TABLE)
-            .map_err(|error| format!("Cannot open local database table: {error}"))?;
-        table
-            .remove(key)
-            .map_err(|error| format!("Cannot remove local database value: {error}"))?;
+        let mut table =
+            write_txn.open_table(JSON_TABLE).map_err(|error| format!("Cannot open local database table: {error}"))?;
+        table.remove(key).map_err(|error| format!("Cannot remove local database value: {error}"))?;
     }
-    write_txn
-        .commit()
-        .map_err(|error| format!("Cannot commit local database removal: {error}"))
+    write_txn.commit().map_err(|error| format!("Cannot commit local database removal: {error}"))
 }
 
 #[cfg(test)]
@@ -334,7 +294,7 @@ mod tests {
         let path = database_path_for_dir(&dir);
         let held = Database::create(&path).unwrap();
 
-        let error = open_db(&path).err().expect("busy database must not open");
+        let error = open_db(&path).expect_err("busy database must not open");
         assert!(error.contains("in use"), "{error}");
         let names: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names.len(), 1, "nothing moved aside: {names:?}");

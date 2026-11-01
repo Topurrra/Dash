@@ -153,7 +153,8 @@ pub fn save_filter(dir: &Path, name: &str, query: &str) -> Result<(), String> {
         None => list.push((name.to_string(), query.to_string())),
     }
     let clock = Clock::local();
-    let mut check = Parser { toks: tokenize(query), pos: 0, clock: &clock, filters: Some(&list), expanding: vec![key], depth: 0 };
+    let mut check =
+        Parser { toks: tokenize(query), pos: 0, clock: &clock, filters: Some(&list), expanding: vec![key], depth: 0 };
     check.parse_all()?;
     write_filters(dir, &list)
 }
@@ -228,7 +229,7 @@ impl Node {
             }
             Node::Parent(want) => path_eq(e.parent, want),
             Node::Depth(s) => s.contains(e.depth as u64),
-            Node::ChildCount(s) => e.is_dir && e.child_count.map_or(false, |c| s.contains(c as u64)),
+            Node::ChildCount(s) => e.is_dir && e.child_count.is_some_and(|c| s.contains(c as u64)),
             Node::Empty => {
                 if e.is_dir {
                     e.child_count == Some(0)
@@ -374,7 +375,8 @@ impl Needle {
             return hay.starts_with(self.text.as_str());
         }
         if hay.is_ascii() && self.ascii {
-            return hay.len() >= self.text.len() && hay.as_bytes()[..self.text.len()].eq_ignore_ascii_case(self.text.as_bytes());
+            return hay.len() >= self.text.len()
+                && hay.as_bytes()[..self.text.len()].eq_ignore_ascii_case(self.text.as_bytes());
         }
         starts_folded(hay, &self.text)
     }
@@ -472,7 +474,10 @@ fn path_eq(path: &str, want: &str) -> bool {
 enum Tok {
     /// `quote_at`: where (in `text`) the first quoted part began; prefixes
     /// and keywords are only recognised before it.
-    Word { text: String, quote_at: Option<usize> },
+    Word {
+        text: String,
+        quote_at: Option<usize>,
+    },
     Open,
     Close,
     Or,
@@ -530,7 +535,7 @@ fn tokenize(text: &str) -> Vec<Tok> {
                 });
             }
             '!' if cur.is_empty() && quote_at.is_none() => toks.push(Tok::Not),
-            '-' if cur.is_empty() && quote_at.is_none() && chars.peek().map_or(false, |n| !n.is_whitespace()) => {
+            '-' if cur.is_empty() && quote_at.is_none() && chars.peek().is_some_and(|n| !n.is_whitespace()) => {
                 toks.push(Tok::Not)
             }
             _ => {
@@ -549,7 +554,7 @@ fn tokenize(text: &str) -> Vec<Tok> {
 fn opens_regex(cur: &str) -> bool {
     let body = &cur[..cur.len() - 1];
     let mut parts = body.rsplit(':');
-    parts.next().map_or(false, |last| last.eq_ignore_ascii_case("regex"))
+    parts.next().is_some_and(|last| last.eq_ignore_ascii_case("regex"))
         && parts.all(|p| MODIFIERS.iter().any(|m| p.eq_ignore_ascii_case(m)))
 }
 
@@ -772,8 +777,7 @@ impl<'a> Parser<'a> {
     fn find_filter(&self, name: &str) -> Option<&'a str> {
         let key = name.to_lowercase();
         let filters: &'a [(String, String)] = self.filters?;
-        filters
-            .iter().find(|(n, _)| n.to_lowercase() == key).map(|(_, q)| q.as_str())
+        filters.iter().find(|(n, _)| n.to_lowercase() == key).map(|(_, q)| q.as_str())
     }
 
     /// The saved filter `name`, parsed as its own group.
@@ -792,7 +796,14 @@ impl<'a> Parser<'a> {
         let mut expanding = self.expanding.clone();
         expanding.push(key);
         // Starts at our depth, so filters nested in filters stay within the limit.
-        let mut inner = Parser { toks: tokenize(text), pos: 0, clock: self.clock, filters: self.filters, expanding, depth: self.depth };
+        let mut inner = Parser {
+            toks: tokenize(text),
+            pos: 0,
+            clock: self.clock,
+            filters: self.filters,
+            expanding,
+            depth: self.depth,
+        };
         let node = inner.parse_all().map_err(|e| {
             if e.contains("saved filter") {
                 e
@@ -851,7 +862,10 @@ fn wildcard(text: &str, case: bool) -> Result<TextMatch, String> {
 /// A value as a range: `x` (the atom's own span), `>x`, `>=x`, `<x`, `<=x`,
 /// `=x`, `a..b`, `..b`, `a..`. The atom returns the span one value covers
 /// (`bare` when it stands alone, e.g. `size:10mb` covers all of 10.x MB).
-fn parse_span(raw: &str, label: &str, atom: &dyn Fn(&str, bool) -> Result<(u64, u64), String>) -> Result<Span, String> {
+/// Turns one value into the span it covers; see `parse_span`.
+type SpanAtom<'a> = dyn Fn(&str, bool) -> Result<(u64, u64), String> + 'a;
+
+fn parse_span(raw: &str, label: &str, atom: &SpanAtom<'_>) -> Result<Span, String> {
     let raw = raw.trim();
     if let Some((a, b)) = raw.split_once("..") {
         let (a, b) = (a.trim(), b.trim());
@@ -909,6 +923,11 @@ fn size_atom(t: &str, bare: bool) -> Result<(u64, u64), String> {
     if !bytes.is_finite() || bytes >= u64::MAX as f64 {
         return Err("size: that number is too big".into());
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked finite and below u64::MAX above; never negative since `num` holds only digits and dots"
+    )]
     let bytes = bytes as u64;
     if bare && unit_bytes > 1 {
         Ok((bytes, bytes.saturating_add(unit_bytes - 1)))
@@ -952,7 +971,8 @@ impl Clock {
                 offset = o;
             }
         }
-        (local.assume_offset(offset).unix_timestamp_nanos() / 1_000_000) as i64
+        i64::try_from(local.assume_offset(offset).unix_timestamp_nanos() / 1_000_000)
+            .expect("`time` caps years at 999,999, far inside i64 milliseconds")
     }
 
     /// From the start of `start` to just before the start of `end`.
@@ -1031,11 +1051,12 @@ impl Clock {
 }
 
 fn instant_ms(t: OffsetDateTime) -> i64 {
-    (t.unix_timestamp_nanos() / 1_000_000) as i64
+    i64::try_from(t.unix_timestamp_nanos() / 1_000_000)
+        .expect("`time` caps years at 999,999, far inside i64 milliseconds")
 }
 
 fn clamp_ms(ms: i64) -> u64 {
-    ms.max(0) as u64
+    u64::try_from(ms).unwrap_or(0)
 }
 
 const NUMBER_WORDS: [(&str, i64); 12] = [
@@ -1066,7 +1087,7 @@ fn split_count(s: &str) -> Option<(i64, &str)> {
 fn add_months(date: Date, delta: i64) -> Option<Date> {
     let total = (date.year() as i64) * 12 + (date.month() as i64 - 1) + delta;
     let year: i32 = total.div_euclid(12).try_into().ok()?;
-    let month = Month::try_from((total.rem_euclid(12) + 1) as u8).ok()?;
+    let month = Month::try_from(u8::try_from(total.rem_euclid(12) + 1).ok()?).ok()?;
     let day = date.day().min(month_len(year, month));
     Date::from_calendar_date(year, month, day).ok()
 }

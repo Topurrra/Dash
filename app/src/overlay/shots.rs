@@ -20,11 +20,20 @@ fn files(view: &mut Overlay, text: &str, cx: &mut Context<Overlay>) {
 }
 
 const SCENES: &[(&str, Scene)] = &[
-    ("1-search-empty", |v, w, cx| {
+    ("1-welcome", |v, w, cx| {
         // Fixed starting views, whatever is saved (nothing here is saved).
         (v.search_view, v.clip_view, v.show_pane) = (SearchView::Table, ClipView::List, true);
+        v.welcome = true;
         v.set_mode(Mode::Search, w, cx);
         type_query(v, "", cx);
+        v.watch_welcome_progress(cx);
+    }),
+    ("1a-update-offered", |_, _, cx| crate::update::show_sample(Some("0.2.0"), cx)),
+    ("1b-search-empty", |v, _, cx| {
+        crate::update::show_sample(None, cx);
+        // Not `finish_welcome`: that would save "seen" in the real preferences.
+        v.welcome = false;
+        cx.notify();
     }),
     ("2-files", |v, _, cx| type_query(v, "invoice", cx)),
     ("3-files-text", |v, _, cx| v.table_move(1, false, cx)),
@@ -103,10 +112,36 @@ const SCENES: &[(&str, Scene)] = &[
         type_query(v, "", cx);
     }),
     ("24-clip-menu", |_, w, _| right_click(w, (200, 160))),
+    // A text in the pane (this repo's README as a clipboard entry, so it
+    // works with no index), then a drag across it.
+    ("25-text-shown", |v, _, cx| {
+        v.clip_menu = None;
+        let text = include_str!("../../../README.md");
+        v.clips = vec![Clip {
+            id: u64::MAX,
+            text: "README.md".into(),
+            image: None,
+            meta: "Dash · today".into(),
+            pinned: false,
+            full_text: text.into(),
+            full_image: None,
+            app_path: None,
+        }];
+        v.selected = 0;
+        v.clip_preview = None;
+        v.update_clip_preview();
+        cx.notify();
+    }),
+    ("26-text-selected", |_, w, _| drag(w, (520, 113), (760, 205))),
 ];
 
 /// A right-click at `at` (client pixels), sent to this window only.
 #[cfg(windows)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "like MAKELPARAM: each client coordinate goes into 16 bits of the LPARAM"
+)]
 fn right_click(window: &Window, at: (i32, i32)) {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP};
@@ -125,6 +160,11 @@ fn right_click(_: &Window, _: (i32, i32)) {}
 
 /// Presses at `from`, moves in steps to `to`, releases (client pixels).
 #[cfg(windows)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "like MAKELPARAM: each client coordinate goes into 16 bits of the LPARAM"
+)]
 fn drag(window: &Window, from: (i32, i32), to: (i32, i32)) {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
@@ -191,9 +231,10 @@ pub fn run(dir: PathBuf, cx: &mut App) {
             show_offscreen(window);
         }
         // Every view dark, then again light.
-        for (light, (name, scene)) in [false, true].into_iter().flat_map(|light| SCENES.iter().map(move |s| (light, s))) {
+        for (light, (name, scene)) in [false, true].into_iter().flat_map(|light| SCENES.iter().map(move |s| (light, s)))
+        {
             theme::set_light(light);
-            let _ = handle.update(cx, |view, window, cx| scene(view, window, cx));
+            let _ = handle.update(cx, scene);
             cx.background_executor().timer(SETTLE).await;
             let path = dir.join(format!("{}{name}.png", if light { "light-" } else { "" }));
             let saved = handle.update(cx, |_, window, _| capture(window, &path)).unwrap_or_else(|e| Err(e.to_string()));
@@ -221,9 +262,11 @@ fn window_handle(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
 fn show_offscreen((hwnd, scale): (Option<windows::Win32::Foundation::HWND>, f32)) {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClientRect, GetWindowRect, SetWindowPos, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+        GetClientRect, GetWindowRect, SetWindowPos, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        SWP_SHOWWINDOW,
     };
     let Some(hwnd) = hwnd else { return };
+    #[expect(clippy::cast_possible_truncation, reason = "a window size in pixels at the display scale, far inside i32")]
     let (w, h) = ((1120. * scale) as i32, (620. * scale) as i32);
     let (mut outer, mut client) = (RECT::default(), RECT::default());
     // SAFETY: `hwnd` is this live window's. Shown first, then sized: GPUI
@@ -233,7 +276,8 @@ fn show_offscreen((hwnd, scale): (Option<windows::Win32::Foundation::HWND>, f32)
         let _ = SetWindowPos(hwnd, HWND_BOTTOM, -20_000, 0, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_SHOWWINDOW);
         let _ = GetWindowRect(hwnd, &mut outer);
         let _ = GetClientRect(hwnd, &mut client);
-        let (extra_w, extra_h) = ((outer.right - outer.left) - client.right, (outer.bottom - outer.top) - client.bottom);
+        let (extra_w, extra_h) =
+            ((outer.right - outer.left) - client.right, (outer.bottom - outer.top) - client.bottom);
         let _ = SetWindowPos(hwnd, None, 0, 0, w + extra_w, h + extra_h, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER);
     }
 }
@@ -243,8 +287,8 @@ fn show_offscreen((hwnd, scale): (Option<windows::Win32::Foundation::HWND>, f32)
 fn capture(window: &Window, path: &std::path::Path) -> Result<(), String> {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Gdi::{
-        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SelectObject, BITMAPINFO,
-        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SelectObject,
+        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
     };
     use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
     use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
@@ -256,6 +300,9 @@ fn capture(window: &Window, path: &std::path::Path) -> Result<(), String> {
     let pixels = unsafe {
         GetClientRect(hwnd, &mut rect).map_err(|e| e.to_string())?;
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+        let (Ok(width), Ok(height)) = (u32::try_from(w), u32::try_from(h)) else {
+            return Err("The window has no size".into());
+        };
         let screen = GetDC(None);
         let dc = CreateCompatibleDC(screen);
         let bitmap = CreateCompatibleBitmap(screen, w, h);
@@ -265,7 +312,7 @@ fn capture(window: &Window, path: &std::path::Path) -> Result<(), String> {
         let printed = PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(3)).as_bool();
         let mut info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biSize: u32::try_from(size_of::<BITMAPINFOHEADER>()).expect("BITMAPINFOHEADER is 40 bytes"),
                 biWidth: w,
                 biHeight: -h,
                 biPlanes: 1,
@@ -275,8 +322,8 @@ fn capture(window: &Window, path: &std::path::Path) -> Result<(), String> {
             },
             ..Default::default()
         };
-        let mut pixels = vec![0u8; (w * h * 4) as usize];
-        let lines = GetDIBits(dc, bitmap, 0, h as u32, Some(pixels.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS);
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        let lines = GetDIBits(dc, bitmap, 0, height, Some(pixels.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS);
         SelectObject(dc, old);
         let _ = DeleteObject(bitmap);
         let _ = DeleteDC(dc);
@@ -284,7 +331,7 @@ fn capture(window: &Window, path: &std::path::Path) -> Result<(), String> {
         if !printed || lines == 0 {
             return Err("Windows wouldn't copy the window".into());
         }
-        (w as u32, h as u32, pixels)
+        (width, height, pixels)
     };
     let (w, h, mut bgra) = pixels;
     for px in bgra.chunks_exact_mut(4) {

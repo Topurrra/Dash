@@ -15,6 +15,7 @@ mod scrollbar;
 mod settings;
 mod shell;
 mod theme;
+mod update;
 
 use gpui::{App, Application};
 
@@ -25,7 +26,10 @@ fn main() {
     }
     // `--shots <folder>`: pictures of each view, then quit (overlay/shots.rs).
     let args: Vec<String> = std::env::args().collect();
-    let shots = args.iter().position(|a| a == "--shots").map(|i| args.get(i + 1).cloned().unwrap_or_else(|| "dash-shots".into()));
+    let shots = args
+        .iter()
+        .position(|a| a == "--shots")
+        .map(|i| args.get(i + 1).cloned().unwrap_or_else(|| "dash-shots".into()));
     // Restarted after losing ownership: the old process is still exiting.
     if args.iter().any(|a| a == host::RESTARTED) {
         std::thread::sleep(std::time::Duration::from_millis(1500));
@@ -52,6 +56,7 @@ fn main() {
             return;
         }
         shell::init(cx);
+        update::start_checks(cx);
         // Started at sign-in: wait in the tray.
         if !std::env::args().any(|a| a == "--background") {
             overlay::summon(overlay::Mode::Search, cx);

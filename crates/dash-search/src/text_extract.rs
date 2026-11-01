@@ -31,17 +31,12 @@ use pdfium_render::prelude::*;
 /// to save disk space, but raising it past the tier's natural limit has no
 /// effect (the tier caps win).
 fn tier_bytes_for_path(path: &Path) -> usize {
-    let ext = path
-        .extension()
-        .and_then(|v| v.to_str())
-        .unwrap_or_default()
-        .to_lowercase();
+    let ext = path.extension().and_then(|v| v.to_str()).unwrap_or_default().to_lowercase();
 
     let kb: usize = match ext.as_str() {
         // Code files — rare to be over a few KB, 64 KB is generous.
-        "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "go" | "java" | "kt"
-        | "c" | "cpp" | "h" | "hpp" | "swift" | "php" | "rb" | "sh" | "ps1"
-        | "svelte" | "html" | "css" => 64,
+        "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "go" | "java" | "kt" | "c" | "cpp" | "h" | "hpp" | "swift"
+        | "php" | "rb" | "sh" | "ps1" | "svelte" | "html" | "css" => 64,
 
         // Config / small structured files.
         "ini" | "cfg" | "conf" | "env" | "toml" | "yaml" | "yml" => 64,
@@ -49,8 +44,7 @@ fn tier_bytes_for_path(path: &Path) -> usize {
         // Plain text, logs, structured data. Larger because logs and JSON
         // dumps can be sizable but still mostly fit in a quarter MB. `.ki` is
         // Note files (Markdown + YAML frontmatter).
-        "txt" | "md" | "markdown" | "ki" | "log" | "json" | "xml" | "sql"
-        | "csv" | "tsv" => 256,
+        "txt" | "md" | "markdown" | "ki" | "log" | "json" | "xml" | "sql" | "csv" | "tsv" => 256,
 
         // Rich-text documents — bumped from the old global default so the
         // body, footers, comments, and speaker notes all comfortably fit.
@@ -112,10 +106,8 @@ struct HeavyExtractionGate {
     slot_freed: Condvar,
 }
 
-static HEAVY_EXTRACTION_GATE: HeavyExtractionGate = HeavyExtractionGate {
-    active: Mutex::new(0),
-    slot_freed: Condvar::new(),
-};
+static HEAVY_EXTRACTION_GATE: HeavyExtractionGate =
+    HeavyExtractionGate { active: Mutex::new(0), slot_freed: Condvar::new() };
 
 /// RAII permit for a heavy extraction slot. `acquire` blocks until a slot is
 /// free; the slot is released on drop — including during panic unwinding, so a
@@ -124,15 +116,9 @@ struct HeavyExtractionPermit;
 
 impl HeavyExtractionPermit {
     fn acquire() -> Self {
-        let mut active = HEAVY_EXTRACTION_GATE
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut active = HEAVY_EXTRACTION_GATE.active.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         while *active >= MAX_CONCURRENT_HEAVY_EXTRACTIONS {
-            active = HEAVY_EXTRACTION_GATE
-                .slot_freed
-                .wait(active)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            active = HEAVY_EXTRACTION_GATE.slot_freed.wait(active).unwrap_or_else(|poisoned| poisoned.into_inner());
         }
         *active += 1;
         HeavyExtractionPermit
@@ -142,10 +128,7 @@ impl HeavyExtractionPermit {
 impl Drop for HeavyExtractionPermit {
     fn drop(&mut self) {
         {
-            let mut active = HEAVY_EXTRACTION_GATE
-                .active
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut active = HEAVY_EXTRACTION_GATE.active.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             *active = active.saturating_sub(1);
         }
         HEAVY_EXTRACTION_GATE.slot_freed.notify_one();
@@ -159,11 +142,7 @@ impl Drop for HeavyExtractionPermit {
 /// its own tier default; the effective per-file limit is the smaller of
 /// the two so the user's cap always wins.
 pub fn extract_text_for_indexing(path: &Path, user_max_bytes: usize) -> Option<String> {
-    let ext = path
-        .extension()
-        .and_then(|v| v.to_str())
-        .unwrap_or_default()
-        .to_lowercase();
+    let ext = path.extension().and_then(|v| v.to_str()).unwrap_or_default().to_lowercase();
 
     // Apply per-format tier limit capped by the user's global ceiling.
     let max_bytes = tier_bytes_for_path(path).min(user_max_bytes);
@@ -234,13 +213,52 @@ pub fn extract_text_for_indexing(path: &Path, user_max_bytes: usize) -> Option<S
 pub fn is_text_or_doc_extension(ext: &str) -> bool {
     matches!(
         ext,
-        "txt" | "md" | "markdown" | "ki" | "csv" | "tsv" | "json" | "yaml" | "yml"
-        | "toml" | "xml" | "log" | "ini" | "cfg" | "conf" | "env" | "sql"
-        | "js" | "ts" | "jsx" | "tsx" | "rs" | "py" | "go" | "java" | "kt"
-        | "c" | "cpp" | "h" | "hpp" | "swift" | "php" | "rb" | "sh" | "ps1"
-        | "svelte" | "html" | "css"
-        | "pdf" | "docx" | "xlsx" | "pptx"
-        | "odt" | "ods" | "odp" | "rtf"
+        "txt"
+            | "md"
+            | "markdown"
+            | "ki"
+            | "csv"
+            | "tsv"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "xml"
+            | "log"
+            | "ini"
+            | "cfg"
+            | "conf"
+            | "env"
+            | "sql"
+            | "js"
+            | "ts"
+            | "jsx"
+            | "tsx"
+            | "rs"
+            | "py"
+            | "go"
+            | "java"
+            | "kt"
+            | "c"
+            | "cpp"
+            | "h"
+            | "hpp"
+            | "swift"
+            | "php"
+            | "rb"
+            | "sh"
+            | "ps1"
+            | "svelte"
+            | "html"
+            | "css"
+            | "pdf"
+            | "docx"
+            | "xlsx"
+            | "pptx"
+            | "odt"
+            | "ods"
+            | "odp"
+            | "rtf"
     )
 }
 
@@ -255,10 +273,7 @@ pub fn is_text_or_doc_extension(ext: &str) -> bool {
 /// images BEFORE submitting them to the extractor pool — saves the
 /// IPC round-trip when OCR is off or the path isn't in scope.
 pub fn is_ocr_image_extension(ext: &str) -> bool {
-    matches!(
-        ext,
-        "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "webp"
-    )
+    matches!(ext, "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "webp")
 }
 
 // ─── Plain-text extractor ──────────────────────────────────────────────────
@@ -353,27 +368,12 @@ impl OcrChildEnv {
             // (Windows allows them in file names), so newline is the safe
             // delimiter. Paths cannot legally contain newlines on Windows
             // or Unix file systems.
-            vars.push((
-                "DASH_OCR_FOLDERS".to_string(),
-                folders.join("\n"),
-            ));
-            vars.push((
-                "DASH_OCR_MAX_PAGES".to_string(),
-                max_pages.to_string(),
-            ));
+            vars.push(("DASH_OCR_FOLDERS".to_string(), folders.join("\n")));
+            vars.push(("DASH_OCR_MAX_PAGES".to_string(), max_pages.to_string()));
             vars.push(("DASH_OCR_LANGS".to_string(), langs.to_string()));
-            vars.push((
-                "DASH_OCR_MIN_DIM".to_string(),
-                min_image_dim.to_string(),
-            ));
-            vars.push((
-                "DASH_OCR_MAX_ASPECT".to_string(),
-                max_aspect_ratio.to_string(),
-            ));
-            vars.push((
-                "DASH_OCR_TIMEOUT_SECS".to_string(),
-                per_file_timeout_secs.to_string(),
-            ));
+            vars.push(("DASH_OCR_MIN_DIM".to_string(), min_image_dim.to_string()));
+            vars.push(("DASH_OCR_MAX_ASPECT".to_string(), max_aspect_ratio.to_string()));
+            vars.push(("DASH_OCR_TIMEOUT_SECS".to_string(), per_file_timeout_secs.to_string()));
         }
         // Pages may be OCR'd one after another, each up to its own timeout
         // (an untimed OCR is budgeted 5 minutes a page).
@@ -399,11 +399,44 @@ impl OcrChildEnv {
 pub fn is_plain_text_extension(ext: &str) -> bool {
     matches!(
         ext,
-        "txt" | "md" | "markdown" | "ki" | "csv" | "tsv" | "json" | "yaml" | "yml"
-            | "toml" | "xml" | "log" | "ini" | "cfg" | "conf" | "env" | "sql"
-            | "js" | "ts" | "jsx" | "tsx" | "rs" | "py" | "go" | "java" | "kt"
-            | "c" | "cpp" | "h" | "hpp" | "swift" | "php" | "rb" | "sh" | "ps1"
-            | "svelte" | "html" | "css"
+        "txt"
+            | "md"
+            | "markdown"
+            | "ki"
+            | "csv"
+            | "tsv"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "xml"
+            | "log"
+            | "ini"
+            | "cfg"
+            | "conf"
+            | "env"
+            | "sql"
+            | "js"
+            | "ts"
+            | "jsx"
+            | "tsx"
+            | "rs"
+            | "py"
+            | "go"
+            | "java"
+            | "kt"
+            | "c"
+            | "cpp"
+            | "h"
+            | "hpp"
+            | "swift"
+            | "php"
+            | "rb"
+            | "sh"
+            | "ps1"
+            | "svelte"
+            | "html"
+            | "css"
     )
 }
 
@@ -446,10 +479,7 @@ struct OcrIndexConfig {
 
 impl OcrIndexConfig {
     fn from_env() -> Self {
-        let enabled = std::env::var("DASH_OCR_ENABLED")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let enabled = std::env::var("DASH_OCR_ENABLED").ok().as_deref() == Some("1");
         let folders = std::env::var("DASH_OCR_FOLDERS")
             .ok()
             .unwrap_or_default()
@@ -463,34 +493,18 @@ impl OcrIndexConfig {
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(20)
             .clamp(1, 200);
-        let langs = std::env::var("DASH_OCR_LANGS")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "eng".to_string());
+        let langs =
+            std::env::var("DASH_OCR_LANGS").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "eng".to_string());
         // Wave 8.2: smart-skip heuristics. Defaults chosen to skip
         // obvious-junk (thumbnails / banners / icons) without losing
         // real document scans.
-        let min_image_dim = std::env::var("DASH_OCR_MIN_DIM")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(400);
-        let max_aspect_ratio = std::env::var("DASH_OCR_MAX_ASPECT")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(5.0);
-        let per_file_timeout_secs = std::env::var("DASH_OCR_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(30);
-        Self {
-            enabled,
-            folders,
-            max_pages,
-            langs,
-            min_image_dim,
-            max_aspect_ratio,
-            per_file_timeout_secs,
-        }
+        let min_image_dim =
+            std::env::var("DASH_OCR_MIN_DIM").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(400);
+        let max_aspect_ratio =
+            std::env::var("DASH_OCR_MAX_ASPECT").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(5.0);
+        let per_file_timeout_secs =
+            std::env::var("DASH_OCR_TIMEOUT_SECS").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(30);
+        Self { enabled, folders, max_pages, langs, min_image_dim, max_aspect_ratio, per_file_timeout_secs }
     }
 
     /// True when OCR is enabled AND the path lives inside (or equals) at
@@ -508,15 +522,9 @@ impl OcrIndexConfig {
         if !self.enabled || self.folders.is_empty() {
             return false;
         }
-        let path_str = path
-            .to_string_lossy()
-            .to_lowercase()
-            .replace('\\', "/");
+        let path_str = path.to_string_lossy().to_lowercase().replace('\\', "/");
         self.folders.iter().any(|root| {
-            let root_str = root
-                .to_string_lossy()
-                .to_lowercase()
-                .replace('\\', "/");
+            let root_str = root.to_string_lossy().to_lowercase().replace('\\', "/");
             let root_str = root_str.trim_end_matches('/');
             path_str == root_str || path_str.starts_with(&format!("{}/", root_str))
         })
@@ -585,22 +593,19 @@ fn ocr_fallback_for_pdf(path: &Path, max_bytes: usize) -> Option<String> {
     }
     let mut rendered: Vec<RenderedPage> = Vec::with_capacity(config.max_pages as usize);
     for page_index in 0..config.max_pages {
-        let Some(png_bytes) = pdfium_render_page_to_png(path, page_index as u16, OCR_RENDER_DPI)
-        else {
+        // pdfium page indexes are u16; there is no page past that to render.
+        let Ok(pdfium_index) = u16::try_from(page_index) else {
             break;
         };
-        let temp_path = temp_dir.join(format!(
-            "dash-ocr-{pid}-{}-{}.png",
-            std::ptr::addr_of!(config) as usize,
-            page_index
-        ));
+        let Some(png_bytes) = pdfium_render_page_to_png(path, pdfium_index, OCR_RENDER_DPI) else {
+            break;
+        };
+        let temp_path =
+            temp_dir.join(format!("dash-ocr-{pid}-{}-{}.png", std::ptr::addr_of!(config) as usize, page_index));
         if fs::write(&temp_path, &png_bytes).is_err() {
             continue;
         }
-        rendered.push(RenderedPage {
-            index: page_index,
-            temp_path,
-        });
+        rendered.push(RenderedPage { index: page_index, temp_path });
     }
 
     // Phase 2: OCR all rendered pages in parallel. Wrap each result
@@ -611,11 +616,7 @@ fn ocr_fallback_for_pdf(path: &Path, max_bytes: usize) -> Option<String> {
         .par_iter()
         .map(|rp| {
             let _cleanup = TempPngFile(rp.temp_path.clone());
-            let result = ocr_with_timeout(
-                &rp.temp_path,
-                &config.langs,
-                config.per_file_timeout_secs,
-            );
+            let result = ocr_with_timeout(&rp.temp_path, &config.langs, config.per_file_timeout_secs);
             (rp.index, result.ok())
         })
         .collect();
@@ -684,11 +685,7 @@ fn extract_image_text_via_ocr(path: &Path, max_bytes: usize) -> Option<String> {
     if !config.applies_to(path) {
         return None;
     }
-    let ext = path
-        .extension()
-        .and_then(|v| v.to_str())
-        .unwrap_or_default()
-        .to_lowercase();
+    let ext = path.extension().and_then(|v| v.to_str()).unwrap_or_default().to_lowercase();
 
     // Cheap file-size floor — a real-content scan is almost never under
     // 8 KB. Saves opening every tiny PNG on disk just to discover it's
@@ -705,9 +702,7 @@ fn extract_image_text_via_ocr(path: &Path, max_bytes: usize) -> Option<String> {
     // gates BEFORE we spend any of Tesseract's time on the file.
     if config.min_image_dim > 0 || config.max_aspect_ratio > 0.0 {
         if let Some((w, h)) = read_image_dimensions(path) {
-            if config.min_image_dim > 0
-                && (w < config.min_image_dim || h < config.min_image_dim)
-            {
+            if config.min_image_dim > 0 && (w < config.min_image_dim || h < config.min_image_dim) {
                 return None;
             }
             if config.max_aspect_ratio > 0.0 {
@@ -736,9 +731,7 @@ fn extract_image_text_via_ocr(path: &Path, max_bytes: usize) -> Option<String> {
                 let dyn_image = image::open(path).ok()?;
                 let mut buf: Vec<u8> = Vec::new();
                 use std::io::Cursor;
-                dyn_image
-                    .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-                    .ok()?;
+                dyn_image.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).ok()?;
                 Some(buf)
             })) {
                 Ok(Some(b)) => b,
@@ -746,10 +739,7 @@ fn extract_image_text_via_ocr(path: &Path, max_bytes: usize) -> Option<String> {
             };
             let temp_dir = std::env::temp_dir();
             let pid = std::process::id();
-            let temp_path = temp_dir.join(format!(
-                "dash-ocr-img-{pid}-{}.png",
-                std::ptr::addr_of!(config) as usize,
-            ));
+            let temp_path = temp_dir.join(format!("dash-ocr-img-{pid}-{}.png", std::ptr::addr_of!(config) as usize,));
             if fs::write(&temp_path, &png_bytes).is_err() {
                 return None;
             }
@@ -815,11 +805,8 @@ fn ocr_with_timeout(image_path: &Path, langs: &str, timeout_secs: u32) -> Result
     // A counter, not the clock: parallel PDF pages can start in the same
     // nanosecond and must not share an id.
     static NEXT_OCR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let op_id = format!(
-        "ocr-{}-{}",
-        std::process::id(),
-        NEXT_OCR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
+    let op_id =
+        format!("ocr-{}-{}", std::process::id(), NEXT_OCR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let op_id_for_watchdog = op_id.clone();
     let timeout = std::time::Duration::from_secs(timeout_secs as u64);
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -882,13 +869,9 @@ thread_local! {
 /// works in both the main process and the same-exe extractor worker), then the
 /// OS library search path. Returns None when no PDFium library is present.
 fn bind_pdfium() -> Option<Pdfium> {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
     let bindings = exe_dir
-        .and_then(|dir| {
-            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir)).ok()
-        })
+        .and_then(|dir| Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir)).ok())
         .or_else(|| Pdfium::bind_to_system_library().ok())?;
     Some(Pdfium::new(bindings))
 }
@@ -984,14 +967,20 @@ fn pdfium_render_page_to_png(path: &Path, page_index: u16, dpi: u32) -> Option<V
             // PdfPoints are in PDF points (1pt = 1/72 inch). Scale to the
             // requested DPI before allocating the bitmap.
             let scale = clamped_dpi as f32 / 72.0;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "rounded and at least 1; `as` saturates instead of wrapping for an absurd page size"
+            )]
             let width_px = (page.width().value * scale).round().max(1.0) as i32;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "rounded and at least 1; `as` saturates instead of wrapping for an absurd page size"
+            )]
             let height_px = (page.height().value * scale).round().max(1.0) as i32;
             let bitmap = page.render(width_px, height_px, None).ok()?;
             let dyn_image = bitmap.as_image();
             let mut buf: Vec<u8> = Vec::new();
-            dyn_image
-                .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-                .ok()?;
+            dyn_image.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).ok()?;
             Some(buf)
         }))
         .ok()
@@ -1004,11 +993,7 @@ fn lopdf_extract_pdf_text(path: &Path, max_bytes: usize) -> Option<String> {
 
     // PDFs can be slow or fail to parse — catch panics from lopdf's internals
     // so a single malformed file doesn't abort the indexer.
-    let doc = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        Document::load(path)
-    }))
-    .ok()?
-    .ok()?;
+    let doc = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Document::load(path))).ok()?.ok()?;
 
     let mut text = String::with_capacity(8 * 1024);
     let pages = doc.get_pages();
@@ -1025,11 +1010,9 @@ fn lopdf_extract_pdf_text(path: &Path, max_bytes: usize) -> Option<String> {
         if text.len() >= max_bytes {
             break;
         }
-        let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            doc.extract_text(&[page_num])
-        }))
-        .ok()
-        .and_then(|r| r.ok());
+        let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doc.extract_text(&[page_num])))
+            .ok()
+            .and_then(|r| r.ok());
 
         if let Some(page_text) = extracted {
             if !page_text.is_empty() {
@@ -1210,8 +1193,9 @@ fn extract_rtf_text(path: &Path, max_bytes: usize) -> Option<String> {
                         }
                     }
                     if let Ok(code) = num.parse::<i32>() {
-                        let unicode = if code < 0 { (code + 0x10000) as u32 } else { code as u32 };
-                        if let Some(c) = char::from_u32(unicode) {
+                        // RTF writes code points above 32767 as negative numbers.
+                        let unicode = if code < 0 { code + 0x10000 } else { code };
+                        if let Some(c) = u32::try_from(unicode).ok().and_then(char::from_u32) {
                             if skip_until_depth.is_none() {
                                 out.push(c);
                             }
@@ -1259,29 +1243,23 @@ fn extract_rtf_text(path: &Path, max_bytes: usize) -> Option<String> {
                     // Translate / handle specific keywords.
                     match word.as_str() {
                         // Soft separators — emit a space so words don't run together.
-                        "par" | "line" | "tab" | "page" | "sect" | "cell" | "row" => {
-                            if skip_until_depth.is_none() {
-                                out.push(' ');
-                            }
+                        "par" | "line" | "tab" | "page" | "sect" | "cell" | "row" if skip_until_depth.is_none() => {
+                            out.push(' ');
                         }
                         // Non-breaking space / hyphens.
-                        "nbsp" | "~" => {
-                            if skip_until_depth.is_none() {
-                                out.push(' ');
-                            }
+                        "nbsp" | "~" if skip_until_depth.is_none() => {
+                            out.push(' ');
                         }
                         // Metadata / binary destinations — skip the entire group.
-                        "fonttbl" | "colortbl" | "stylesheet" | "info" | "themedata"
-                        | "datastore" | "listtable" | "listoverridetable" | "rsidtbl"
-                        | "filetbl" | "background" | "pgptbl" | "pict" | "object"
-                        | "shppict" | "nonshppict" | "shp" | "shpgrp" | "shpinst"
-                        | "panose" | "generator" | "creatim" | "revtim" | "operator"
-                        | "title" | "subject" | "author" | "comment" | "keywords"
-                        | "company" | "category" | "manager" | "doccomm" | "version"
-                        | "hyperlinkbase" | "buptim" | "printim" => {
-                            if skip_until_depth.is_none() {
-                                skip_until_depth = Some(group_depth);
-                            }
+                        "fonttbl" | "colortbl" | "stylesheet" | "info" | "themedata" | "datastore" | "listtable"
+                        | "listoverridetable" | "rsidtbl" | "filetbl" | "background" | "pgptbl" | "pict" | "object"
+                        | "shppict" | "nonshppict" | "shp" | "shpgrp" | "shpinst" | "panose" | "generator"
+                        | "creatim" | "revtim" | "operator" | "title" | "subject" | "author" | "comment"
+                        | "keywords" | "company" | "category" | "manager" | "doccomm" | "version" | "hyperlinkbase"
+                        | "buptim" | "printim"
+                            if skip_until_depth.is_none() =>
+                        {
+                            skip_until_depth = Some(group_depth);
                         }
                         _ => {} // ignore other control words (formatting hints, etc.)
                     }
@@ -1349,11 +1327,7 @@ fn cp1252_to_char(byte: u8) -> char {
 
 /// Shared helper for DOCX-like formats: try a list of candidate XML paths
 /// inside a ZIP, concatenate stripped text from whichever exist.
-fn extract_from_zip_xml_files(
-    path: &Path,
-    candidates: &[&str],
-    max_bytes: usize,
-) -> Option<String> {
+fn extract_from_zip_xml_files(path: &Path, candidates: &[&str], max_bytes: usize) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let mut archive = zip::ZipArchive::new(file).ok()?;
     let mut text = String::with_capacity(8 * 1024);
@@ -1422,9 +1396,7 @@ fn append_xlsx_sheet_names(reader: impl std::io::BufRead, out: &mut String, max_
             break;
         }
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Empty(e)) | Ok(Event::Start(e))
-                if e.local_name().as_ref() == b"sheet" =>
-            {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.local_name().as_ref() == b"sheet" => {
                 if let Ok(Some(attr)) = e.try_get_attribute("name") {
                     // Sheet names are plain text (entities are vanishingly rare
                     // in them), so a direct UTF-8 decode of the raw value is

@@ -219,8 +219,10 @@ impl Settings {
                     .flex()
                     .items_center()
                     .gap_8()
-                    .child(stat(thousands(names as usize), "file names"))
-                    .when(content_on, |d| d.child(stat(thousands(documents as usize), "documents")))
+                    .child(stat(thousands(usize::try_from(names).unwrap_or(usize::MAX)), "file names"))
+                    .when(content_on, |d| {
+                        d.child(stat(thousands(usize::try_from(documents).unwrap_or(usize::MAX)), "documents"))
+                    })
                     .child(div().flex_1())
                     .when(indexing, |d| {
                         d.child(button("stop", "Stop").on_click(cx.listener(|this, _, _, cx| {
@@ -229,7 +231,10 @@ impl Settings {
                             cx.notify();
                         })))
                     })
-                    .child(primary_button("rebuild", "Rebuild now").on_click(cx.listener(|this, _, _, cx| this.rebuild(cx)))),
+                    .child(
+                        primary_button("rebuild", "Rebuild now")
+                            .on_click(cx.listener(|this, _, _, cx| this.rebuild(cx))),
+                    ),
             )
             .child(
                 div()
@@ -238,7 +243,11 @@ impl Settings {
                     .gap_2()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(div().size(px(7.)).rounded_full().bg(if indexing { theme::accent() } else { theme::success() }))
+                    .child(div().size(px(7.)).rounded_full().bg(if indexing {
+                        theme::accent()
+                    } else {
+                        theme::success()
+                    }))
                     .child(state),
             );
 
@@ -311,31 +320,28 @@ impl Settings {
                 .child(toggle(
                     "semantic",
                     semantic_on,
-                    cx.listener(move |this, _, _, cx| this.save(|o| o.semantic_search_enabled = !semantic_on, true, cx)),
+                    cx.listener(move |this, _, _, cx| {
+                        this.save(|o| o.semantic_search_enabled = !semantic_on, true, cx)
+                    }),
                 ))
                 .into_any_element(),
             );
         }
 
         let file_types = row("Skipped file types", Some("Extensions, separated by commas.".into()))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .items_center()
-                    .child(field(self.extensions.clone()).w(px(200.)))
-                    .child(button("save-ext", "Apply").on_click(cx.listener(|this, _, _, cx| {
-                        let list: Vec<String> = this
-                            .extensions
-                            .read(cx)
-                            .text()
-                            .split(|c: char| c == ',' || c.is_whitespace())
-                            .map(|e| e.trim().trim_start_matches('.').to_lowercase())
-                            .filter(|e| !e.is_empty())
-                            .collect();
-                        this.save(|o| o.exclude_extensions = list, true, cx);
-                    }))),
-            )
+            .child(div().flex().gap_2().items_center().child(field(self.extensions.clone()).w(px(200.))).child(
+                button("save-ext", "Apply").on_click(cx.listener(|this, _, _, cx| {
+                    let list: Vec<String> = this
+                        .extensions
+                        .read(cx)
+                        .text()
+                        .split(|c: char| c == ',' || c.is_whitespace())
+                        .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+                        .filter(|e| !e.is_empty())
+                        .collect();
+                    this.save(|o| o.exclude_extensions = list, true, cx);
+                })),
+            ))
             .into_any_element();
 
         div()
@@ -374,14 +380,18 @@ impl Settings {
                         .child(toggle(
                             "hidden",
                             o.include_hidden,
-                            cx.listener(move |this, _, _, cx| this.save(|o| o.include_hidden = !o.include_hidden, true, cx)),
+                            cx.listener(move |this, _, _, cx| {
+                                this.save(|o| o.include_hidden = !o.include_hidden, true, cx)
+                            }),
                         ))
                         .into_any_element(),
                     row("Watch for changes", Some("Keep the index up to date as files change.".into()))
                         .child(toggle(
                             "watch",
                             o.watcher_enabled,
-                            cx.listener(move |this, _, _, cx| this.save(|o| o.watcher_enabled = !o.watcher_enabled, false, cx)),
+                            cx.listener(move |this, _, _, cx| {
+                                this.save(|o| o.watcher_enabled = !o.watcher_enabled, false, cx)
+                            }),
                         ))
                         .into_any_element(),
                     row("Speed", Some("Quiet uses the least CPU.".into()))
@@ -419,16 +429,20 @@ impl Settings {
             .flex()
             .flex_col()
             .gap_2()
-            .child(row(title, Some(hint.into())).child(
-                button_with_icon(id, Icon::Plus, "Add folder").on_click(cx.listener(move |this, _, window, cx| {
-                    this.add_folders(which, window, cx)
-                })),
-            ))
+            .child(
+                row(title, Some(hint.into())).child(
+                    button_with_icon(id, Icon::Plus, "Add folder")
+                        .on_click(cx.listener(move |this, _, window, cx| this.add_folders(which, window, cx))),
+                ),
+            )
             .child(list_items(
                 folders.iter().enumerate().map(|(ix, folder)| {
-                    list_item(Some(Icon::Folder), folder.clone(), (id, ix), cx.listener(move |this, _, _, cx| {
-                        this.remove_folder(which, ix, cx)
-                    }))
+                    list_item(
+                        Some(Icon::Folder),
+                        folder.clone(),
+                        (id, ix),
+                        cx.listener(move |this, _, _, cx| this.remove_folder(which, ix, cx)),
+                    )
                 }),
                 folders.is_empty(),
             ))
@@ -443,15 +457,28 @@ impl Settings {
         let image_days = c::get_clipboard_image_retention_days();
         let apps = c::get_clipboard_exclusions();
         let confirm = self.confirm_clear;
-        const KEEP: &[(u32, &str)] = &[(1, "1 day"), (7, "7 days"), (14, "14 days"), (30, "30 days"), (90, "90 days"), (0, "Always")];
+        const KEEP: &[(u32, &str)] =
+            &[(1, "1 day"), (7, "7 days"), (14, "14 days"), (30, "30 days"), (90, "90 days"), (0, "Always")];
         // Images: 2 days by default (they're big).
-        const KEEP_IMAGES: &[(u32, &str)] = &[(1, "1 day"), (2, "2 days"), (7, "7 days"), (14, "14 days"), (30, "30 days"), (90, "90 days"), (0, "Always")];
+        const KEEP_IMAGES: &[(u32, &str)] = &[
+            (1, "1 day"),
+            (2, "2 days"),
+            (7, "7 days"),
+            (14, "14 days"),
+            (30, "30 days"),
+            (90, "90 days"),
+            (0, "Always"),
+        ];
         let never = div()
             .flex()
             .flex_col()
             .gap_2()
             .child(
-                row("Never save from", Some("Copies made in these apps are skipped (password managers by default).".into())).child(
+                row(
+                    "Never save from",
+                    Some("Copies made in these apps are skipped (password managers by default).".into()),
+                )
+                .child(
                     div()
                         .flex()
                         .gap_2()
@@ -479,11 +506,17 @@ impl Settings {
             .child(list_items(
                 apps.iter().enumerate().map(|(ix, app)| {
                     let name = app.clone();
-                    list_item(None, app.clone(), ("app", ix), cx.listener(move |_, _, _, cx| {
-                        let apps: Vec<String> = c::get_clipboard_exclusions().into_iter().filter(|a| *a != name).collect();
-                        let _ = c::set_clipboard_exclusions(apps);
-                        cx.notify();
-                    }))
+                    list_item(
+                        None,
+                        app.clone(),
+                        ("app", ix),
+                        cx.listener(move |_, _, _, cx| {
+                            let apps: Vec<String> =
+                                c::get_clipboard_exclusions().into_iter().filter(|a| *a != name).collect();
+                            let _ = c::set_clipboard_exclusions(apps);
+                            cx.notify();
+                        }),
+                    )
                 }),
                 apps.is_empty(),
             ))
@@ -651,8 +684,13 @@ impl Settings {
             .child(group(
                 "Shortcuts",
                 vec![
-                    self.hotkey_row(crate::shell::Which::Search, "Search", "Opens Dash in Search mode from anywhere.", cx)
-                        .into_any_element(),
+                    self.hotkey_row(
+                        crate::shell::Which::Search,
+                        "Search",
+                        "Opens Dash in Search mode from anywhere.",
+                        cx,
+                    )
+                    .into_any_element(),
                     self.hotkey_row(crate::shell::Which::Clipboard, "Clipboard", "Opens the clipboard history.", cx)
                         .into_any_element(),
                     row("Settings", Some("Inside Dash.".into())).child(keycap("Ctrl+,")).into_any_element(),
@@ -660,6 +698,29 @@ impl Settings {
                         .child(keycap("Ctrl+P"))
                         .into_any_element(),
                 ],
+            ))
+            .child(group(
+                "Appearance",
+                vec![row("Theme", Some("System follows your Windows light / dark setting.".into()))
+                    .child(chips(
+                        "theme",
+                        &[
+                            (0, theme::Mode::System.label()),
+                            (1, theme::Mode::Light.label()),
+                            (2, theme::Mode::Dark.label()),
+                        ],
+                        theme::Mode::ALL
+                            .iter()
+                            .position(|m| *m == theme::mode())
+                            .and_then(|i| u32::try_from(i).ok())
+                            .unwrap_or(0),
+                        cx,
+                        |_, v, cx| {
+                            theme::set_mode(theme::Mode::ALL[v as usize], cx.window_appearance());
+                            cx.refresh_windows();
+                        },
+                    ))
+                    .into_any_element()],
             ))
             .child(group(
                 "System",
@@ -683,6 +744,25 @@ impl Settings {
                         }))
                         .into_any_element(),
                     row("Indexing and clipboard", Some(engines)).into_any_element(),
+                    row(
+                        "Updates",
+                        Some(format!(
+                            "Dash {}. Checked once a day; you choose when to install.",
+                            crate::update::current_version()
+                        )),
+                    )
+                    .child(button("check-updates", "Check now").on_click(cx.listener(|this, _, _, cx| {
+                        this.message = Some("Checking for updates…".into());
+                        cx.notify();
+                        let me = cx.entity().downgrade();
+                        crate::update::check_now(cx, move |message, cx| {
+                            let _ = me.update(cx, |this, cx| {
+                                this.message = Some(message.into());
+                                cx.notify();
+                            });
+                        });
+                    })))
+                    .into_any_element(),
                 ],
             ))
             .child(group(
@@ -780,32 +860,32 @@ impl Render for Settings {
                     .flex_1()
                     .min_w_0()
                     .child(
-                        div()
-                            .id("settings-body")
-                            .flex_1()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll)
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_6()
-                                    .max_w(px(680.))
-                                    .w_full()
-                                    .mx_auto()
-                                    .px_8()
-                                    .pt_6()
-                                    .pb_10()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_1()
-                                            .child(div().text_size(px(20.)).font_weight(gpui::FontWeight::SEMIBOLD).child(title))
-                                            .child(div().text_sm().text_color(theme::muted()).child(subtitle)),
-                                    )
-                                    .child(body),
-                            ),
+                        div().id("settings-body").flex_1().overflow_y_scroll().track_scroll(&self.scroll).child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_6()
+                                .max_w(px(680.))
+                                .w_full()
+                                .mx_auto()
+                                .px_8()
+                                .pt_6()
+                                .pb_10()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_size(px(20.))
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .child(title),
+                                        )
+                                        .child(div().text_sm().text_color(theme::muted()).child(subtitle)),
+                                )
+                                .child(body),
+                        ),
                     )
                     .child(scrollbar("settings-scrollbar", &self.scroll)),
             )
@@ -835,16 +915,17 @@ fn group(title: &'static str, rows: Vec<gpui::AnyElement>) -> impl IntoElement {
         .gap_2()
         .child(div().px_1().text_xs().font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::muted()).child(title))
         .child(
-            div()
-                .flex()
-                .flex_col()
-                .rounded_lg()
-                .border_1()
-                .border_color(theme::border())
-                .bg(theme::panel())
-                .children(rows.into_iter().enumerate().map(|(ix, row)| {
-                    div().flex().flex_col().px_4().py_3().when(ix > 0, |d| d.border_t_1().border_color(theme::border())).child(row)
-                })),
+            div().flex().flex_col().rounded_lg().border_1().border_color(theme::border()).bg(theme::panel()).children(
+                rows.into_iter().enumerate().map(|(ix, row)| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .px_4()
+                        .py_3()
+                        .when(ix > 0, |d| d.border_t_1().border_color(theme::border()))
+                        .child(row)
+                }),
+            ),
         )
 }
 
@@ -1048,7 +1129,9 @@ fn chips(
                 .rounded(px(5.))
                 .text_xs()
                 .cursor_pointer()
-                .when(active, |d| d.bg(theme::menu()).text_color(theme::text()).font_weight(gpui::FontWeight::MEDIUM).shadow_sm())
+                .when(active, |d| {
+                    d.bg(theme::menu()).text_color(theme::text()).font_weight(gpui::FontWeight::MEDIUM).shadow_sm()
+                })
                 .when(!active, |d| d.text_color(theme::muted()).hover(|s| s.text_color(theme::text())))
                 .on_click(cx.listener(move |this, _, _, cx| pick(this, value, cx)))
                 .child(label)
@@ -1069,11 +1152,16 @@ mod startup {
 
     #[cfg(windows)]
     pub fn enabled() -> bool {
+        // SAFETY: HKCU is a predefined key, the names are static wide strings,
+        // and no output buffers are passed.
         unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN, w!("Dash"), RRF_RT_REG_SZ, None, None, None).is_ok() }
     }
 
     #[cfg(windows)]
     pub fn set(on: bool) -> Result<(), String> {
+        // SAFETY: HKCU is a predefined key and the names are static or owned
+        // wide strings; `value` is NUL-terminated, lives past the call, and
+        // the size passed is its length in bytes.
         unsafe {
             let result = if on {
                 let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -1085,7 +1173,7 @@ mod startup {
                     &HSTRING::from("Dash"),
                     REG_SZ.0,
                     Some(value.as_ptr().cast()),
-                    (value.len() * 2) as u32,
+                    u32::try_from(value.len() * 2).map_err(|_| "Dash's path is too long")?,
                 )
             } else {
                 RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN, w!("Dash"))
@@ -1160,7 +1248,11 @@ mod startup {
     /// Text for a plist `<string>`.
     #[cfg(any(not(windows), test))]
     fn xml_escape(text: &str) -> String {
-        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
     }
 
     /// One quoted argument for a .desktop `Exec=` line (Desktop Entry spec):

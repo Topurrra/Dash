@@ -39,9 +39,7 @@
 #![cfg(windows)]
 
 use windows::Win32::Foundation::LocalFree;
-use windows::Win32::Security::Cryptography::{
-    CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
-};
+use windows::Win32::Security::Cryptography::{CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB};
 
 /// Magic byte prepended to every DPAPI-encrypted value so reads can
 /// distinguish ciphertext from legacy plaintext during migration.
@@ -57,17 +55,11 @@ pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     // for the duration of the call. On success we copy the output into a
     // Vec and LocalFree it; on failure there is no output buffer to free.
     unsafe {
-        let mut in_blob = CRYPT_INTEGER_BLOB {
-            cbData: len,
-            pbData: plaintext.as_ptr() as *mut u8,
-        };
-        let mut out_blob = CRYPT_INTEGER_BLOB {
-            cbData: 0,
-            pbData: std::ptr::null_mut(),
-        };
+        let in_blob = CRYPT_INTEGER_BLOB { cbData: len, pbData: plaintext.as_ptr() as *mut u8 };
+        let mut out_blob = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
 
         CryptProtectData(
-            &mut in_blob,
+            &in_blob,
             None,
             None,
             None,
@@ -94,9 +86,7 @@ pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
         // Free the Win32-allocated buffer. Failing to do this would leak
         // memory on every encrypt call, which adds up fast over a long
         // session of clipboard captures.
-        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(
-            out_blob.pbData as *mut _,
-        ));
+        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(out_blob.pbData as *mut _));
 
         Ok(output)
     }
@@ -117,18 +107,15 @@ pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
 
     let ciphertext = &blob[1..];
     let len = u32::try_from(ciphertext.len()).map_err(|_| "DPAPI decrypt: value too large".to_string())?;
+    // SAFETY: same contract as `protect`: the input slice outlives the call
+    // and `len` is its exact length; on success DPAPI hands us a LocalAlloc'd
+    // buffer of cbData bytes, which we null-check, copy out, then LocalFree.
     unsafe {
-        let mut in_blob = CRYPT_INTEGER_BLOB {
-            cbData: len,
-            pbData: ciphertext.as_ptr() as *mut u8,
-        };
-        let mut out_blob = CRYPT_INTEGER_BLOB {
-            cbData: 0,
-            pbData: std::ptr::null_mut(),
-        };
+        let in_blob = CRYPT_INTEGER_BLOB { cbData: len, pbData: ciphertext.as_ptr() as *mut u8 };
+        let mut out_blob = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
 
         CryptUnprotectData(
-            &mut in_blob,
+            &in_blob,
             None,
             None,
             None,
@@ -145,9 +132,7 @@ pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
 
         let raw = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
         let plaintext = raw.to_vec();
-        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(
-            out_blob.pbData as *mut _,
-        ));
+        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(out_blob.pbData as *mut _));
         Ok(plaintext)
     }
 }

@@ -30,3 +30,6 @@ windows = { workspace = true, features = [
 # macOS / Linux clipboard (text + images; Wayland too). Pinned (2026-11-01).
 [target.'cfg(not(windows))'.dependencies]
 arboard = { version = "=3.4.1", features = ["wayland-data-control"] }
+
+[lints]
+workspace = true

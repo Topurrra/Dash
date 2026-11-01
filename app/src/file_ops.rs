@@ -26,7 +26,13 @@ pub fn rename_in_place(path: &Path, new_name: &str) -> Result<PathBuf, String> {
         return Err(taken());
     }
     // The check above is for a clear message; this refuses a clash anyway.
-    rename_no_replace(path, &target).map_err(|e| if e.kind() == std::io::ErrorKind::AlreadyExists { taken() } else { e.to_string() })?;
+    rename_no_replace(path, &target).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            taken()
+        } else {
+            e.to_string()
+        }
+    })?;
     Ok(target)
 }
 
@@ -57,7 +63,7 @@ fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 /// works; the `windows` crate's own conversion keeps the HRESULT).
 #[cfg(windows)]
 fn win_io(e: windows::core::Error) -> std::io::Error {
-    let code = e.code().0 as u32;
+    let code = e.code().0.cast_unsigned();
     if code & 0xFFFF_0000 == 0x8007_0000 {
         std::io::Error::from_raw_os_error((code & 0xFFFF) as i32)
     } else {
@@ -211,7 +217,10 @@ pub fn recycle(paths: &[String]) -> Result<(), String> {
         pFrom: PCWSTR(from.as_ptr()),
         // FOF_WANTNUKEWARNING overrides FOF_NOCONFIRMATION for items that
         // would be destroyed instead of recycled.
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT | FOF_WANTNUKEWARNING).0 as u16,
+        fFlags: u16::try_from(
+            (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT | FOF_WANTNUKEWARNING).0,
+        )
+        .expect("the FOF_* flags all sit in the low 16 bits"),
         ..Default::default()
     };
     // Called off the UI thread: the shell wants COM there.
@@ -272,6 +281,8 @@ impl Pidls {
 impl Drop for Pidls {
     fn drop(&mut self) {
         for p in &self.0 {
+            // SAFETY: each pointer came from a successful SHParseDisplayName,
+            // is owned only by this guard and is freed exactly once here.
             unsafe { windows::Win32::UI::Shell::ILFree(Some(*p as *const _)) };
         }
     }
@@ -285,7 +296,11 @@ pub fn reveal_many(paths: &[String]) -> Result<(), String> {
     for (folder, items) in group_by_folder(paths).into_iter().take(10) {
         let folder = Pidls::parse(&[folder])?;
         let items = Pidls::parse(&items)?;
+        // SAFETY: each pidl is a valid id list owned by `items`; the result
+        // points inside it, and `items` outlives `children`.
         let children: Vec<_> = items.0.iter().map(|p| unsafe { ILFindLastID(*p as *const _) } as *const _).collect();
+        // SAFETY: `folder` holds exactly one valid pidl (parse of one path)
+        // and `children` point into `items`, both alive for the call.
         unsafe { SHOpenFolderAndSelectItems(folder.0[0], Some(&children), 0) }.map_err(|e| e.message().to_string())?;
     }
     Ok(())
@@ -305,6 +320,9 @@ pub fn drag_out(paths: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let pidls = Pidls::parse(paths)?;
+    // SAFETY: the pidls are valid and alive until the end of the function;
+    // the shell item array and data object are COM objects we own here, and
+    // this runs on the UI thread where OLE is initialized (see doc comment).
     unsafe {
         let items = SHCreateShellItemArrayFromIDLists(&pidls.as_const()).map_err(|e| e.message().to_string())?;
         let data: IDataObject = items.BindToHandler(None, &BHID_DataObject).map_err(|e| e.message().to_string())?;

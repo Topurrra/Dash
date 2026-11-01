@@ -125,18 +125,22 @@ impl Overlay {
             Mode::Search => Some(
                 group
                     .children(SearchView::ALL.into_iter().map(|view| {
-                        chip(view.key(), view.icon(), self.search_view == view).on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_search_view(view, cx);
-                        }))
+                        chip(view.key(), view.icon(), self.search_view == view).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.set_search_view(view, cx);
+                            },
+                        ))
                     }))
                     .into_any_element(),
             ),
             Mode::Clipboard => Some(
                 group
                     .children(ClipView::ALL.into_iter().map(|view| {
-                        chip(view.key(), view.icon(), self.clip_view == view).on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_clip_view(view, cx);
-                        }))
+                        chip(view.key(), view.icon(), self.clip_view == view).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.set_clip_view(view, cx);
+                            },
+                        ))
                     }))
                     .into_any_element(),
             ),
@@ -162,19 +166,37 @@ impl Overlay {
 
     /// The list being shown is a grid (Files tab or Clipboard).
     pub(super) fn grid_active(&self) -> bool {
-        (self.files_tab() && self.search_view == SearchView::Grid) || (self.mode == Mode::Clipboard && self.clip_view == ClipView::Grid)
+        (self.files_tab() && self.search_view == SearchView::Grid)
+            || (self.mode == Mode::Clipboard && self.clip_view == ClipView::Grid)
     }
 
     /// Items per grid row: as many tiles as fit the list's width.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "fixed pixel widths over a tile width: a small column count, at least 1"
+    )]
     pub(super) fn grid_cols(&self) -> usize {
-        let width = if self.show_pane { if self.files_tab() { 660. } else { 470. } } else { WINDOW_WIDTH };
+        let width = if self.show_pane {
+            if self.files_tab() {
+                660.
+            } else {
+                470.
+            }
+        } else {
+            WINDOW_WIDTH
+        };
         let tile = if self.files_tab() { TILE_W } else { CARD_W } + GRID_GAP;
         (((width - 16.) / tile).floor() as usize).max(1)
     }
 
     /// How far Up / Down move: a row of tiles in a grid.
     pub(super) fn step(&self) -> isize {
-        if self.grid_active() { self.grid_cols() as isize } else { 1 }
+        if self.grid_active() {
+            self.grid_cols() as isize
+        } else {
+            1
+        }
     }
 
     /// Scrolls item `ix` into view (its row, in a grid).
@@ -245,14 +267,28 @@ impl Overlay {
                             .cursor_pointer()
                             .when(active, |d| d.bg(theme::selected()))
                             .when(!active, |d| d.hover(|s| s.bg(theme::hover())))
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                this.click_clip(ix, event.click_count, window, cx)
-                            }))
-                            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                                this.clip_right_click(ix, event.position, cx)
-                            }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                    this.click_clip(ix, event.click_count, window, cx)
+                                }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                    this.clip_right_click(ix, event.position, cx)
+                                }),
+                            )
                             .when(clip.image.is_some(), |d| d.child(icon(Icon::Image, 13., theme::muted())))
-                            .child(div().flex_1().min_w_0().text_sm().text_color(theme::text()).one_line().child(clip.text.clone()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .text_color(theme::text())
+                                    .one_line()
+                                    .child(clip.text.clone()),
+                            )
                             .when(clip.pinned, |d| d.child(icon(Icon::Pin, 12., theme::accent())))
                             .child(div().flex_none().text_xs().text_color(theme::muted()).child(age))
                     })
@@ -317,13 +353,23 @@ impl Overlay {
                                     .border_1()
                                     .cursor_pointer()
                                     .when(active, |d| d.bg(theme::selected()).border_color(theme::accent()))
-                                    .when(!active, |d| d.bg(theme::panel()).border_color(theme::border()).hover(|s| s.bg(theme::hover())))
-                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                        this.click_clip(ix, event.click_count, window, cx)
-                                    }))
-                                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                                        this.clip_right_click(ix, event.position, cx)
-                                    }))
+                                    .when(!active, |d| {
+                                        d.bg(theme::panel())
+                                            .border_color(theme::border())
+                                            .hover(|s| s.bg(theme::hover()))
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                            this.click_clip(ix, event.click_count, window, cx)
+                                        }),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                            this.clip_right_click(ix, event.position, cx)
+                                        }),
+                                    )
                                     .child(body)
                                     .child(
                                         div()
@@ -398,7 +444,10 @@ impl Overlay {
                             .text_color(if action == ClipAction::Delete { theme::danger() } else { theme::text() })
                             .cursor_pointer()
                             .hover(|s| s.bg(theme::hover()))
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| this.run_clip_action(action, window, cx)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| this.run_clip_action(action, window, cx)),
+                            )
                             .child(label)
                             .child(div().text_xs().text_color(theme::muted()).child(keys))
                     })),

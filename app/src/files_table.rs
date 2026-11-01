@@ -49,7 +49,8 @@ impl Selection {
 
     /// A plain click (or arrow key): just this row.
     pub fn select_only(&mut self, ix: usize) {
-        self.ranges = vec![ix..ix + 1];
+        self.ranges.clear();
+        self.ranges.push(ix..ix + 1);
         self.anchor = ix;
         self.focus = ix;
     }
@@ -67,7 +68,8 @@ impl Selection {
 
     /// Shift+click / Shift+arrow: the rows from the anchor to here, only.
     pub fn extend_to(&mut self, ix: usize) {
-        self.ranges = vec![self.anchor.min(ix)..self.anchor.max(ix) + 1];
+        self.ranges.clear();
+        self.ranges.push(self.anchor.min(ix)..self.anchor.max(ix) + 1);
         self.focus = ix;
     }
 
@@ -92,7 +94,7 @@ impl Selection {
         if total == 0 {
             return;
         }
-        let next = (self.focus as isize + delta).clamp(0, total as isize - 1) as usize;
+        let next = self.focus.saturating_add_signed(delta).min(total - 1);
         if extend {
             self.extend_to(next);
         } else {
@@ -101,7 +103,10 @@ impl Selection {
     }
 
     pub fn select_all(&mut self, total: usize) {
-        self.ranges = if total == 0 { Vec::new() } else { vec![0..total] };
+        self.ranges.clear();
+        if total > 0 {
+            self.ranges.push(0..total);
+        }
     }
 
     /// Back to the first row (a new query or order).
@@ -363,6 +368,10 @@ pub fn type_text(row: &NameRow) -> String {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::single_range_in_vec_init,
+    reason = "selections are lists of ranges; one range is a valid expected value"
+)]
 mod tests {
     use super::*;
 

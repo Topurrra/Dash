@@ -12,7 +12,7 @@
 use super::*;
 
 use dash_search::entry::{NameQueryOptions, NameRow, NameSearchResult, SortKey};
-use gpui::{anchored, deferred, KeyDownEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PathPromptOptions};
+use gpui::{anchored, deferred, KeyDownEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels};
 
 use crate::file_ops;
 use crate::files_table::{self as ft, PageCache, Selection, PAGE};
@@ -207,7 +207,12 @@ impl Overlay {
     }
 
     /// The first page of a search arrived: it replaces the table.
-    pub(super) fn apply_first_page(&mut self, result: Result<NameSearchResult, String>, keep_focus: bool, cx: &mut Context<Self>) {
+    pub(super) fn apply_first_page(
+        &mut self,
+        result: Result<NameSearchResult, String>,
+        keep_focus: bool,
+        cx: &mut Context<Self>,
+    ) {
         let focus = self.table.sel.focus();
         self.table.cache.clear();
         match result {
@@ -250,7 +255,8 @@ impl Overlay {
                     }
                     match result {
                         Ok(r) => {
-                            let icons: Vec<(String, bool)> = r.rows.iter().map(|row| (row.path.clone(), row.is_dir)).collect();
+                            let icons: Vec<(String, bool)> =
+                                r.rows.iter().map(|row| (row.path.clone(), row.is_dir)).collect();
                             this.table.cache.insert(page, r.rows);
                             this.request_icons(icons, cx);
                             if this.files_tab() && this.table.sel.focus() / PAGE == page {
@@ -298,13 +304,18 @@ impl Overlay {
     }
 
     /// Runs `then` on the selected rows, fetching any not loaded yet.
-    fn with_selection(&mut self, cx: &mut Context<Self>, then: impl FnOnce(&mut Self, Vec<(usize, NameRow)>, &mut Context<Self>) + 'static) {
+    fn with_selection(
+        &mut self,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, Vec<(usize, NameRow)>, &mut Context<Self>) + 'static,
+    ) {
         let count = self.table.sel.count();
         if count == 0 {
             return;
         }
         if count > MAX_ACT {
-            self.table.notice = Some(format!("{} selected; select at most {} at a time.", thousands(count), thousands(MAX_ACT)).into());
+            self.table.notice =
+                Some(format!("{} selected; select at most {} at a time.", thousands(count), thousands(MAX_ACT)).into());
             cx.notify();
             return;
         }
@@ -449,7 +460,9 @@ impl Overlay {
         if m.control || m.alt || m.platform {
             return;
         }
-        let Some(typed) = event.keystroke.key_char.clone().filter(|c| !c.is_empty() && !c.chars().any(char::is_control)) else {
+        let Some(typed) =
+            event.keystroke.key_char.clone().filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
+        else {
             return;
         };
         let text = format!("{}{}", self.input.read(cx).text(), typed);
@@ -592,7 +605,11 @@ impl Overlay {
         self.with_selection(cx, |this, rows, cx| {
             let text = rows.iter().map(|(_, r)| r.path.as_str()).collect::<Vec<_>>().join("\r\n");
             cx.write_to_clipboard(ClipboardItem::new_string(text));
-            this.table.notice = Some(if rows.len() == 1 { "Path copied.".into() } else { format!("{} paths copied.", rows.len()).into() });
+            this.table.notice = Some(if rows.len() == 1 {
+                "Path copied.".into()
+            } else {
+                format!("{} paths copied.", rows.len()).into()
+            });
             cx.notify();
         });
     }
@@ -1024,7 +1041,9 @@ impl Overlay {
         };
         let name = match renaming {
             Some(input) => rename_box(input, true),
-            None => div().flex_1().min_w_0().one_line().text_color(theme::text()).child(row.name.clone()).into_any_element(),
+            None => {
+                div().flex_1().min_w_0().one_line().text_color(theme::text()).child(row.name.clone()).into_any_element()
+            }
         };
         let cell = || div().flex_none().text_xs().text_color(theme::muted()).one_line();
         // With several selected, a faint ring marks the focused (previewed) one.
@@ -1052,10 +1071,20 @@ impl Overlay {
             )
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| this.row_right_click(ix, event, window, cx)),
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.row_right_click(ix, event, window, cx)
+                }),
             )
             .child(div().flex().flex_1().min_w_0().items_center().gap_2().child(icon).child(name))
-            .child(div().flex_1().min_w_0().one_line().text_xs().text_color(theme::muted()).child(ft::short_folder(ft::folder_of(&row.path), 30)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .one_line()
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(ft::short_folder(ft::folder_of(&row.path), 30)),
+            )
             .child(cell().w(px(60.)).text_right().child(if row.is_dir { String::new() } else { human_size(row.size) }))
             .child(cell().w(px(116.)).child(ft::modified_text(row.modified_ms)))
             .child(cell().w(px(48.)).child(ft::type_text(&row)))
@@ -1082,7 +1111,12 @@ impl Overlay {
     }
 
     /// Mouse handlers every view's item shares (select, open, drag, menu).
-    fn item_mouse(&self, item: gpui::Stateful<gpui::Div>, ix: usize, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn item_mouse(
+        &self,
+        item: gpui::Stateful<gpui::Div>,
+        ix: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         item.on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| this.row_mouse_down(ix, event, window, cx)),
@@ -1131,9 +1165,20 @@ impl Overlay {
                     .gap_0p5()
                     .child(match renaming {
                         Some(input) => rename_box(input, false),
-                        None => div().text_sm().text_color(theme::text()).one_line().child(row.name.clone()).into_any_element(),
+                        None => div()
+                            .text_sm()
+                            .text_color(theme::text())
+                            .one_line()
+                            .child(row.name.clone())
+                            .into_any_element(),
                     })
-                    .child(div().text_xs().text_color(theme::muted()).one_line().child(ft::folder_of(&row.path).to_string())),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .one_line()
+                            .child(ft::folder_of(&row.path).to_string()),
+                    ),
             )
             .child(div().flex_none().text_xs().text_color(theme::muted()).child(meta));
         self.item_mouse(item, ix, cx).into_any_element()
@@ -1158,7 +1203,13 @@ impl Overlay {
                         .bg(theme::panel_2())
                         .child(img(thumb).size_full().object_fit(ObjectFit::Cover))
                         .into_any_element(),
-                    None => div().size(px(84.)).flex().items_center().justify_center().child(self.file_icon(&row, 52.)).into_any_element(),
+                    None => div()
+                        .size(px(84.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(self.file_icon(&row, 52.))
+                        .into_any_element(),
                 };
                 let item = div()
                     .id(ix)
@@ -1287,7 +1338,10 @@ impl Overlay {
                                 .text_color(theme::text())
                                 .cursor_pointer()
                                 .hover(|s| s.bg(theme::border()))
-                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| this.run_menu(item, window, cx)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| this.run_menu(item, window, cx)),
+                                )
                                 .child(label)
                                 .child(div().text_xs().text_color(theme::muted()).child(keys))
                         },
@@ -1328,7 +1382,9 @@ impl Overlay {
         if let Some(confirm) = &self.table.confirm {
             let (question, key) = match confirm {
                 Confirm::Recycle(rows) => (format!("Move {} to the Recycle Bin?", plural(rows.len())), "Del"),
-                Confirm::Forever(rows) => (format!("Delete {} for good? This can't be undone.", plural(rows.len())), "Shift+Del"),
+                Confirm::Forever(rows) => {
+                    (format!("Delete {} for good? This can't be undone.", plural(rows.len())), "Shift+Del")
+                }
             };
             let button = |id: &'static str, label: String| {
                 div()
@@ -1349,11 +1405,13 @@ impl Overlay {
                 .gap_2()
                 .text_color(theme::text())
                 .child(question)
-                .child(button("confirm-delete", format!("Delete ({key} / ↵)")).on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(confirm) = this.table.confirm.take() {
-                        this.run_delete(confirm, cx);
-                    }
-                })))
+                .child(button("confirm-delete", format!("Delete ({key} / ↵)")).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        if let Some(confirm) = this.table.confirm.take() {
+                            this.run_delete(confirm, cx);
+                        }
+                    },
+                )))
                 .child(button("cancel-delete", "Cancel (Esc)".into()).on_click(cx.listener(|this, _, _, cx| {
                     this.table.confirm = None;
                     cx.notify();
@@ -1361,7 +1419,13 @@ impl Overlay {
                 .into_any_element();
         }
         if let Some(notice) = &self.table.notice {
-            return div().flex_1().min_w_0().text_color(theme::text_2()).one_line().child(notice.clone()).into_any_element();
+            return div()
+                .flex_1()
+                .min_w_0()
+                .text_color(theme::text_2())
+                .one_line()
+                .child(notice.clone())
+                .into_any_element();
         }
         // Renaming: the keys are on the right.
         div().flex_1().into_any_element()

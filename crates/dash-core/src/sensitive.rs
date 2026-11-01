@@ -102,44 +102,20 @@ const PATTERNS: &[(&str, &str, Tier)] = &[
     // Slack tokens have a strict prefix.
     ("slack_token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}", Tier::High),
     // Slack incoming-webhook URL — leaks a post-to-channel capability.
-    (
-        "slack_webhook",
-        r"https://hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+",
-        Tier::High,
-    ),
+    ("slack_webhook", r"https://hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+", Tier::High),
     // Stripe live/test keys.
-    (
-        "stripe_secret_key",
-        r"\b(sk|rk)_(live|test)_[A-Za-z0-9]{24,}",
-        Tier::High,
-    ),
+    ("stripe_secret_key", r"\b(sk|rk)_(live|test)_[A-Za-z0-9]{24,}", Tier::High),
     // Google API key.
     ("google_api_key", r"\bAIza[0-9A-Za-z_-]{35}\b", Tier::High),
     // Twilio account SID.
     ("twilio_account_sid", r"\bAC[a-f0-9]{32}\b", Tier::High),
     // SendGrid API key.
-    (
-        "sendgrid_api_key",
-        r"\bSG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{40,}",
-        Tier::High,
-    ),
+    ("sendgrid_api_key", r"\bSG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{40,}", Tier::High),
     // JWT tokens — three base64url chunks separated by dots, header `eyJ`.
-    (
-        "jwt_token",
-        r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
-        Tier::High,
-    ),
+    ("jwt_token", r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b", Tier::High),
     // ─── Private keys ──────────────────────────────────────────────────
-    (
-        "private_key_pem",
-        r"-----BEGIN ([A-Z]+ )*PRIVATE KEY( BLOCK)?-----",
-        Tier::High,
-    ),
-    (
-        "pgp_private_key",
-        r"-----BEGIN PGP PRIVATE KEY BLOCK-----",
-        Tier::High,
-    ),
+    ("private_key_pem", r"-----BEGIN ([A-Z]+ )*PRIVATE KEY( BLOCK)?-----", Tier::High),
+    ("pgp_private_key", r"-----BEGIN PGP PRIVATE KEY BLOCK-----", Tier::High),
     // ─── Connection strings ───────────────────────────────────────────
     (
         "database_url_with_password",
@@ -148,21 +124,13 @@ const PATTERNS: &[(&str, &str, Tier)] = &[
     ),
     // ─── Crypto keys ──────────────────────────────────────────────────
     ("ethereum_private_key", r"\b0x[a-fA-F0-9]{64}\b", Tier::High),
-    (
-        "bitcoin_wif_private_key",
-        r"\b[5KL][1-9A-HJ-NP-Za-km-z]{50,51}\b",
-        Tier::High,
-    ),
+    ("bitcoin_wif_private_key", r"\b[5KL][1-9A-HJ-NP-Za-km-z]{50,51}\b", Tier::High),
     // ─── More cloud / package-registry tokens ─────────────────────────
     // Anthropic BEFORE OpenAI — the `sk-ant-` prefix is more specific, and a
     // small post-filter in `scan_text_detailed` drops the openai duplicate that
     // the (lookahead-free) `regex` crate would otherwise also emit for it.
     ("anthropic_api_key", r"\bsk-ant-[A-Za-z0-9_\-]{20,}", Tier::High),
-    (
-        "openai_api_key",
-        r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}",
-        Tier::High,
-    ),
+    ("openai_api_key", r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}", Tier::High),
     ("npm_token", r"\bnpm_[A-Za-z0-9]{36,}\b", Tier::High),
     // ─── Crypto wallet addresses ──────────────────────────────────────
     // Deterministic prefix/length → near-zero false positives. The
@@ -185,12 +153,8 @@ static REGEX_SET: LazyLock<RegexSet> =
 
 /// HIGH-tier patterns compiled individually for span extraction. Same
 /// indexing as PATTERNS, so a RegexSet hit at index N → INDIVIDUAL[N].
-static INDIVIDUAL_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    PATTERNS
-        .iter()
-        .map(|(_, p, _)| Regex::new(p).expect("invalid pattern"))
-        .collect()
-});
+static INDIVIDUAL_REGEXES: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| PATTERNS.iter().map(|(_, p, _)| Regex::new(p).expect("invalid pattern")).collect());
 
 // ─── MEDIUM-tier: fancy-regex with inline placeholder rejection ───────
 
@@ -228,7 +192,7 @@ static CRED_FANCY: LazyLock<FancyRegex> = LazyLock::new(|| {
 /// on length + sub-substring placeholders for the rest.
 static BEARER_FANCY: LazyLock<FancyRegex> = LazyLock::new(|| {
     FancyRegex::new(
-        r"(?i)\bbearer\s+(?!\$|your|example|placeholder|redacted|todo|test_|dummy|sample|xxx)([A-Za-z0-9_\-\.]{20,})"
+        r"(?i)\bbearer\s+(?!\$|your|example|placeholder|redacted|todo|test_|dummy|sample|xxx)([A-Za-z0-9_\-\.]{20,})",
     )
     .expect("invalid bearer regex")
 });
@@ -239,9 +203,8 @@ static SSN_REGEX: LazyLock<Regex> =
 
 /// Credit-card candidate finder. Matches 13–19 digit runs (with optional
 /// spaces/dashes); each candidate is Luhn-validated downstream.
-static CREDIT_CARD_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:\d[ -]?){12,18}\d\b").expect("invalid credit card regex")
-});
+static CREDIT_CARD_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:\d[ -]?){12,18}\d\b").expect("invalid credit card regex"));
 
 // ─── LOW-tier (off by default) ─────────────────────────────────────────
 //
@@ -250,25 +213,16 @@ static CREDIT_CARD_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 // flag every time. The Secret Leak Scanner tool's Privacy preset opts in.
 
 const LOW_PATTERNS: &[(&str, &str)] = &[
-    (
-        "email",
-        r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b",
-    ),
+    ("email", r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),
     // Phone — international or national-format. Loose by design (low tier).
-    (
-        "phone",
-        r"\b(?:\+?\d{1,3}[ \-\.]?)?(?:\(\d{1,4}\)|\d{1,4})[ \-\.]?\d{3,4}[ \-\.]?\d{4}\b",
-    ),
+    ("phone", r"\b(?:\+?\d{1,3}[ \-\.]?)?(?:\(\d{1,4}\)|\d{1,4})[ \-\.]?\d{3,4}[ \-\.]?\d{4}\b"),
     // IPv4 — four dotted octets. We don't structurally validate ranges
     // (RFC 1918 / link-local / loopback) — too low tier to bother.
     ("ipv4", r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
 ];
 
 static LOW_REGEXES: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
-    LOW_PATTERNS
-        .iter()
-        .map(|(label, p)| (*label, Regex::new(p).expect("invalid low pattern")))
-        .collect()
+    LOW_PATTERNS.iter().map(|(label, p)| (*label, Regex::new(p).expect("invalid low pattern"))).collect()
 });
 
 // ─── Ported PII catalog (always-on MEDIUM) ─────────────────────────────
@@ -288,9 +242,8 @@ static IBAN: LazyLock<Regex> =
 
 // Italian Codice Fiscale: 6 letters + 2 digits + letter + 2 digits + letter
 // + 3 digits + letter (16 chars). Distinctive letter/digit alternation.
-static ITALIAN_CF: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[A-Z]{6}\d{2}[A-Z]\d{2}[A-Z]\d{3}[A-Z]\b").expect("invalid italian cf regex")
-});
+static ITALIAN_CF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[A-Z]{6}\d{2}[A-Z]\d{2}[A-Z]\d{3}[A-Z]\b").expect("invalid italian cf regex"));
 
 // UK National Insurance — 2 prefix letters + 6 digits + suffix A–D.
 static UK_NINO: LazyLock<Regex> = LazyLock::new(|| {
@@ -305,37 +258,34 @@ static FRANCE_NIR: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 // VIN — 17 chars, no I/O/Q. Pass requires a mix of letters+digits (real VINs).
-static VIN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b[A-HJ-NPR-Z0-9]{17}\b").expect("invalid vin regex"));
+static VIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[A-HJ-NPR-Z0-9]{17}\b").expect("invalid vin regex"));
 
 // Spain DNI (8 digits + letter) / NIE ([XYZ] + 7 digits + letter); check-letter validated.
 static SPAIN_DNI: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b([XYZ]?)(\d{7,8})-?([A-Z])\b").expect("invalid dni regex"));
 
 // US ITIN — SSN-shaped but 9xx area (the numbers the SSN validator rejects).
-static US_ITIN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b9\d{2}-(?:7\d|8[0-8]|9[0-2]|9[4-9])-\d{4}\b").expect("invalid itin regex")
-});
+static US_ITIN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b9\d{2}-(?:7\d|8[0-8]|9[0-2]|9[4-9])-\d{4}\b").expect("invalid itin regex"));
 
 // Contextual (label → value). Capture group 1 is the value we flag.
 static PASSPORT_CTX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bpassport\s*(?:no\.?|number|num|#)?\s*[:#]?\s*([A-Z0-9]{6,9})\b")
-        .expect("invalid passport regex")
+    Regex::new(r"(?i)\bpassport\s*(?:no\.?|number|num|#)?\s*[:#]?\s*([A-Z0-9]{6,9})\b").expect("invalid passport regex")
 });
 static DL_CTX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:driver'?s?\s*licen[sc]e|driving\s*licen[sc]e)\s*(?:no\.?|number|num|#)?\s*[:#]?\s*([A-Z0-9-]{5,16})\b").expect("invalid dl regex")
 });
 static ACCT_CTX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\b(?:bank\s*)?acc(?:oun)?t\.?\s*(?:no\.?|number|num|#)?\s*[:#]?\s*(\d{6,17})\b",
-    )
-    .expect("invalid acct regex")
+    Regex::new(r"(?i)\b(?:bank\s*)?acc(?:oun)?t\.?\s*(?:no\.?|number|num|#)?\s*[:#]?\s*(\d{6,17})\b")
+        .expect("invalid acct regex")
 });
 static MRN_CTX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:MRN|medical\s*record(?:\s*(?:no\.?|number|num|#))?)\s*[:#]?\s*([A-Z0-9-]{5,12})\b").expect("invalid mrn regex")
+    Regex::new(r"(?i)\b(?:MRN|medical\s*record(?:\s*(?:no\.?|number|num|#))?)\s*[:#]?\s*([A-Z0-9-]{5,12})\b")
+        .expect("invalid mrn regex")
 });
 static DOB_CTX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:DOB|date\s*of\s*birth|born)\s*(?:on)?\s*[:#]?\s*(\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4})\b").expect("invalid dob regex")
+    Regex::new(r"(?i)\b(?:DOB|date\s*of\s*birth|born)\s*(?:on)?\s*[:#]?\s*(\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4})\b")
+        .expect("invalid dob regex")
 });
 static ROUTING_CTX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:routing|aba)\s*(?:no\.?|number|num|#|transit)?\s*[:#]?\s*(\d{9})\b")
@@ -349,25 +299,21 @@ static ROUTING_CTX: LazyLock<Regex> = LazyLock::new(|| {
 // doesn't flood every document.
 
 // MAC address — six hex pairs, `:`/`-` separated.
-static MAC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b").expect("invalid mac regex")
-});
+static MAC: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b").expect("invalid mac regex"));
 
 // Date — ISO `YYYY-MM-DD` or `M/D/YYYY`. Inherently noisy (any date matches).
-static DATE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b").expect("invalid date regex")
-});
+static DATE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b").expect("invalid date regex"));
 
 // Georgian national ID ("personal number") — bare 11-digit run. No public
 // checksum; surfaced as a suggestion only (hence include_low-gated).
-static GEORGIAN_ID: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{11}\b").expect("invalid georgian id regex"));
+static GEORGIAN_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{11}\b").expect("invalid georgian id regex"));
 
 // Local Georgian mobile: 9 digits starting with 5, often grouped 3-2-2-2.
 // International +995 numbers are caught by the generic phone detector.
 static GEORGIAN_MOBILE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b5\d{2}[\s.\-]?\d{2}[\s.\-]?\d{2}[\s.\-]?\d{2}\b")
-        .expect("invalid georgian mobile regex")
+    Regex::new(r"\b5\d{2}[\s.\-]?\d{2}[\s.\-]?\d{2}[\s.\-]?\d{2}\b").expect("invalid georgian mobile regex")
 });
 
 // India Aadhaar: 12-digit UID, first digit 2-9, contiguous or space/dash-grouped.
@@ -375,12 +321,10 @@ static INDIA_AADHAAR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b[2-9]\d{3}[ -]?\d{4}[ -]?\d{4}\b").expect("invalid aadhaar regex"));
 
 // US EIN — employer ID, `NN-NNNNNNN` (distinctive dash position).
-static US_EIN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{2}-\d{7}\b").expect("invalid ein regex"));
+static US_EIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{2}-\d{7}\b").expect("invalid ein regex"));
 
 // Dutch BSN — 8 or 9 digit run, modulo-11 (elfproef) validated downstream.
-static DUTCH_BSN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{8,9}\b").expect("invalid bsn regex"));
+static DUTCH_BSN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{8,9}\b").expect("invalid bsn regex"));
 
 // ─── Scan API ──────────────────────────────────────────────────────────
 
@@ -408,12 +352,7 @@ pub fn scan_text_detailed(text: &str, include_low: bool) -> Vec<Finding> {
     for idx in hits {
         let (label, _, tier) = PATTERNS[idx];
         for m in INDIVIDUAL_REGEXES[idx].find_iter(text) {
-            findings.push(Finding {
-                kind: label,
-                tier,
-                start: m.start(),
-                end: m.end(),
-            });
+            findings.push(Finding { kind: label, tier, start: m.start(), end: m.end() });
         }
     }
 
@@ -435,12 +374,7 @@ pub fn scan_text_detailed(text: &str, include_low: bool) -> Vec<Finding> {
         if !is_valid_card_iin(&digits) || is_monotonic_placeholder(&digits) {
             continue;
         }
-        findings.push(Finding {
-            kind: "credit_card",
-            tier: Tier::High,
-            start: m.start(),
-            end: m.end(),
-        });
+        findings.push(Finding { kind: "credit_card", tier: Tier::High, start: m.start(), end: m.end() });
     }
 
     // 3. MEDIUM — generic key=value (fancy-regex inline rejection +
@@ -485,12 +419,7 @@ pub fn scan_text_detailed(text: &str, include_low: bool) -> Vec<Finding> {
             continue;
         }
         let m = caps.get(0).expect("ssn match exists");
-        findings.push(Finding {
-            kind: "us_ssn",
-            tier: Tier::Medium,
-            start: m.start(),
-            end: m.end(),
-        });
+        findings.push(Finding { kind: "us_ssn", tier: Tier::Medium, start: m.start(), end: m.end() });
     }
 
     // 5b. MEDIUM — always-on ported PII catalog. Each detector is
@@ -506,12 +435,7 @@ pub fn scan_text_detailed(text: &str, include_low: bool) -> Vec<Finding> {
     for m in VIN.find_iter(text) {
         let s = &text[m.start()..m.end()];
         if s.bytes().any(|b| b.is_ascii_alphabetic()) && s.bytes().any(|b| b.is_ascii_digit()) {
-            findings.push(Finding {
-                kind: "vin",
-                tier: Tier::Medium,
-                start: m.start(),
-                end: m.end(),
-            });
+            findings.push(Finding { kind: "vin", tier: Tier::Medium, start: m.start(), end: m.end() });
         }
     }
 
@@ -521,15 +445,9 @@ pub fn scan_text_detailed(text: &str, include_low: bool) -> Vec<Finding> {
         let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
         let digits = caps.get(2).map(|m| m.as_str()).unwrap_or("");
         let letter = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-        let len_ok =
-            (prefix.is_empty() && digits.len() == 8) || (!prefix.is_empty() && digits.len() == 7);
+        let len_ok = (prefix.is_empty() && digits.len() == 8) || (!prefix.is_empty() && digits.len() == 7);
         if len_ok && is_valid_dni(prefix, digits, letter) {
-            findings.push(Finding {
-                kind: "spain_dni",
-                tier: Tier::Medium,
-                start: whole.start(),
-                end: whole.end(),
-            });
+            findings.push(Finding { kind: "spain_dni", tier: Tier::Medium, start: whole.start(), end: whole.end() });
         }
     }
 
@@ -544,12 +462,7 @@ pub fn scan_text_detailed(text: &str, include_low: bool) -> Vec<Finding> {
     for caps in ROUTING_CTX.captures_iter(text) {
         if let Some(v) = caps.get(1) {
             if is_valid_aba(v.as_str()) {
-                findings.push(Finding {
-                    kind: "routing_number",
-                    tier: Tier::Medium,
-                    start: v.start(),
-                    end: v.end(),
-                });
+                findings.push(Finding { kind: "routing_number", tier: Tier::Medium, start: v.start(), end: v.end() });
             }
         }
     }
@@ -558,12 +471,7 @@ pub fn scan_text_detailed(text: &str, include_low: bool) -> Vec<Finding> {
     if include_low {
         for (label, regex) in LOW_REGEXES.iter() {
             for m in regex.find_iter(text) {
-                findings.push(Finding {
-                    kind: *label,
-                    tier: Tier::Low,
-                    start: m.start(),
-                    end: m.end(),
-                });
+                findings.push(Finding { kind: label, tier: Tier::Low, start: m.start(), end: m.end() });
             }
         }
 
@@ -578,12 +486,7 @@ pub fn scan_text_detailed(text: &str, include_low: bool) -> Vec<Finding> {
         // Dutch BSN — 8-9 digits, modulo-11 validated.
         for m in DUTCH_BSN.find_iter(text) {
             if is_valid_bsn(&text[m.start()..m.end()]) {
-                findings.push(Finding {
-                    kind: "dutch_bsn",
-                    tier: Tier::Low,
-                    start: m.start(),
-                    end: m.end(),
-                });
+                findings.push(Finding { kind: "dutch_bsn", tier: Tier::Low, start: m.start(), end: m.end() });
             }
         }
     }
@@ -593,17 +496,11 @@ pub fn scan_text_detailed(text: &str, include_low: bool) -> Vec<Finding> {
     // Drop any openai finding fully covered by an anthropic finding. This is
     // intentionally narrow — the module's general "overlapping spans are NOT
     // deduplicated" contract is preserved for every other detector.
-    let anthropic_spans: Vec<(usize, usize)> = findings
-        .iter()
-        .filter(|f| f.kind == "anthropic_api_key")
-        .map(|f| (f.start, f.end))
-        .collect();
+    let anthropic_spans: Vec<(usize, usize)> =
+        findings.iter().filter(|f| f.kind == "anthropic_api_key").map(|f| (f.start, f.end)).collect();
     if !anthropic_spans.is_empty() {
         findings.retain(|f| {
-            f.kind != "openai_api_key"
-                || !anthropic_spans
-                    .iter()
-                    .any(|&(s, e)| s <= f.start && e >= f.end)
+            f.kind != "openai_api_key" || !anthropic_spans.iter().any(|&(s, e)| s <= f.start && e >= f.end)
         });
     }
 
@@ -614,24 +511,14 @@ pub fn scan_text_detailed(text: &str, include_low: bool) -> Vec<Finding> {
 /// Push every full-match span of `re` as a MEDIUM finding labelled `kind`.
 fn push_full_matches(out: &mut Vec<Finding>, re: &Regex, text: &str, kind: &'static str) {
     for m in re.find_iter(text) {
-        out.push(Finding {
-            kind,
-            tier: Tier::Medium,
-            start: m.start(),
-            end: m.end(),
-        });
+        out.push(Finding { kind, tier: Tier::Medium, start: m.start(), end: m.end() });
     }
 }
 
 /// Push every full-match span of `re` as a LOW finding labelled `kind`.
 fn push_low_matches(out: &mut Vec<Finding>, re: &Regex, text: &str, kind: &'static str) {
     for m in re.find_iter(text) {
-        out.push(Finding {
-            kind,
-            tier: Tier::Low,
-            start: m.start(),
-            end: m.end(),
-        });
+        out.push(Finding { kind, tier: Tier::Low, start: m.start(), end: m.end() });
     }
 }
 
@@ -640,12 +527,7 @@ fn push_low_matches(out: &mut Vec<Finding>, re: &Regex, text: &str, kind: &'stat
 fn push_captured(out: &mut Vec<Finding>, re: &Regex, text: &str, kind: &'static str) {
     for caps in re.captures_iter(text) {
         if let Some(v) = caps.get(1) {
-            out.push(Finding {
-                kind,
-                tier: Tier::Medium,
-                start: v.start(),
-                end: v.end(),
-            });
+            out.push(Finding { kind, tier: Tier::Medium, start: v.start(), end: v.end() });
         }
     }
 }
@@ -726,11 +608,7 @@ pub const EXCERPT_CONTEXT_LINES: usize = 2;
 /// merge overlapping windows, and rewrite span offsets to be relative
 /// to the excerpt slice. Empty input → empty output (no excerpt at all
 /// when there's nothing to highlight).
-pub fn extract_excerpts(
-    content: &str,
-    findings: &[Finding],
-    context_lines: usize,
-) -> Vec<PreviewExcerpt> {
+pub fn extract_excerpts(content: &str, findings: &[Finding], context_lines: usize) -> Vec<PreviewExcerpt> {
     if findings.is_empty() || content.is_empty() {
         return Vec::new();
     }
@@ -803,10 +681,7 @@ pub fn extract_excerpts(
         // Slice the excerpt text. Use char_indices to avoid splitting in
         // the middle of a multi-byte UTF-8 sequence (e.g. an emoji that
         // happens to straddle a line boundary).
-        let excerpt_text = content
-            .get(byte_start..byte_end)
-            .unwrap_or("")
-            .to_string();
+        let excerpt_text = content.get(byte_start..byte_end).unwrap_or("").to_string();
 
         // Rewrite each in-window finding's span to be relative to the
         // excerpt slice. Findings whose span falls outside the window
@@ -815,12 +690,7 @@ pub fn extract_excerpts(
         let excerpt_findings: Vec<Finding> = findings
             .iter()
             .filter(|f| f.start >= byte_start && f.end <= byte_end)
-            .map(|f| Finding {
-                kind: f.kind,
-                tier: f.tier,
-                start: f.start - byte_start,
-                end: f.end - byte_start,
-            })
+            .map(|f| Finding { kind: f.kind, tier: f.tier, start: f.start - byte_start, end: f.end - byte_start })
             .collect();
 
         excerpts.push(PreviewExcerpt {
@@ -851,7 +721,7 @@ pub fn extract_excerpts(
 ///   - all-same-char masks (`***`, `xxxxxx`)
 ///   - entropy gate for unquoted prose
 fn is_plausible_secret_value(raw: &str, quoted: bool) -> bool {
-    let value = raw.trim_end_matches(|c| c == ',' || c == ';' || c == '.');
+    let value = raw.trim_end_matches([',', ';', '.']);
     if value.len() < 6 {
         return false;
     }
@@ -865,33 +735,16 @@ fn is_plausible_secret_value(raw: &str, quoted: bool) -> bool {
     if value.contains('(') {
         return false;
     }
-    const REF_MARKERS: &[&str] = &[
-        "process.env",
-        "os.environ",
-        "import.meta.env",
-        "getenv",
-        "config.",
-        "settings.",
-        "{{",
-        "}}",
-    ];
+    const REF_MARKERS: &[&str] =
+        &["process.env", "os.environ", "import.meta.env", "getenv", "config.", "settings.", "{{", "}}"];
     if REF_MARKERS.iter().any(|m| lower.contains(m)) {
         return false;
     }
 
     // Placeholder / mask substrings — safe words that never appear in
     // a real high-entropy secret.
-    const PLACEHOLDER_SUBSTR: &[&str] = &[
-        "your",
-        "example",
-        "placeholder",
-        "redacted",
-        "changethis",
-        "xxxx",
-        "....",
-        "dummy",
-        "sample",
-    ];
+    const PLACEHOLDER_SUBSTR: &[&str] =
+        &["your", "example", "placeholder", "redacted", "changethis", "xxxx", "....", "dummy", "sample"];
     if PLACEHOLDER_SUBSTR.iter().any(|m| lower.contains(m)) {
         return false;
     }
@@ -941,10 +794,7 @@ fn is_plausible_secret_value(raw: &str, quoted: bool) -> bool {
 /// Deliberately lenient — only gates UNQUOTED values, where the
 /// alternative is prose.
 fn looks_secretish(value: &str) -> bool {
-    value.chars().any(|c| c.is_ascii_digit())
-        || value.len() >= 20
-        || value.contains('/')
-        || value.contains('+')
+    value.chars().any(|c| c.is_ascii_digit()) || value.len() >= 20 || value.contains('/') || value.contains('+')
 }
 
 /// Returns `true` when the extracted digit string has a structurally plausible
@@ -995,7 +845,7 @@ fn is_valid_card_iin(digits: &str) -> bool {
             }
         }
         6 => (12..=19).contains(&len), // Discover / Maestro / UnionPay — wide range
-        _ => false, // MII 0,1,2,7,8,9 are never bank-card ranges
+        _ => false,                    // MII 0,1,2,7,8,9 are never bank-card ranges
     }
 }
 
@@ -1077,11 +927,7 @@ fn is_valid_dni(prefix: &str, digits: &str, letter: &str) -> bool {
 /// Result must be divisible by 11 and non-zero. 8-digit BSNs are padded with
 /// a leading zero to 9 digits before validation.
 fn is_valid_bsn(raw: &str) -> bool {
-    let digits: Vec<u32> = raw
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .filter_map(|c| c.to_digit(10))
-        .collect();
+    let digits: Vec<u32> = raw.chars().filter(|c| c.is_ascii_digit()).filter_map(|c| c.to_digit(10)).collect();
     // Accept 8 or 9 digit runs; pad 8-digit to 9 for the formula.
     let d: Vec<u32> = match digits.len() {
         9 => digits,
@@ -1096,11 +942,7 @@ fn is_valid_bsn(raw: &str) -> bool {
         return false; // leading zero only valid in the padded 8-digit case, handled above
     }
     let weights: [i64; 9] = [9, 8, 7, 6, 5, 4, 3, 2, -1];
-    let sum: i64 = d
-        .iter()
-        .zip(weights.iter())
-        .map(|(&di, &w)| w * di as i64)
-        .sum();
+    let sum: i64 = d.iter().zip(weights.iter()).map(|(&di, &w)| w * di as i64).sum();
     sum > 0 && sum % 11 == 0
 }
 
@@ -1213,10 +1055,7 @@ mod tests {
         // 4111 1111 1111 1111 passes Luhn and is a valid Visa IIN (4, 16 digits),
         // but has only 2 distinct digits ({4,1}) → correctly rejected as placeholder.
         let kinds = scan_text("card: 4111 1111 1111 1111");
-        assert!(
-            !kinds.contains(&"credit_card"),
-            "Visa test-card placeholder must be rejected, got: {kinds:?}"
-        );
+        assert!(!kinds.contains(&"credit_card"), "Visa test-card placeholder must be rejected, got: {kinds:?}");
     }
 
     #[test]
@@ -1291,40 +1130,24 @@ mod tests {
 
     #[test]
     fn rejects_placeholder_credential_values() {
-        assert!(
-            !scan_text(r#"api_key = "YOUR_API_KEY_HERE""#)
-                .contains(&"generic_credential_assignment")
-        );
+        assert!(!scan_text(r#"api_key = "YOUR_API_KEY_HERE""#).contains(&"generic_credential_assignment"));
         assert!(!scan_text("password = changethis").contains(&"generic_credential_assignment"));
-        assert!(
-            !scan_text("secret_key: example_value_goes").contains(&"generic_credential_assignment")
-        );
+        assert!(!scan_text("secret_key: example_value_goes").contains(&"generic_credential_assignment"));
         assert!(!scan_text("password = ******").contains(&"generic_credential_assignment"));
     }
 
     #[test]
     fn rejects_env_var_reference_values() {
-        assert!(
-            !scan_text("password = process.env.DB_PASSWORD")
-                .contains(&"generic_credential_assignment")
-        );
-        assert!(
-            !scan_text("api_key = os.getenv('KEY')").contains(&"generic_credential_assignment")
-        );
-        assert!(
-            !scan_text("password=$DB_PASS_VARIABLE").contains(&"generic_credential_assignment")
-        );
+        assert!(!scan_text("password = process.env.DB_PASSWORD").contains(&"generic_credential_assignment"));
+        assert!(!scan_text("api_key = os.getenv('KEY')").contains(&"generic_credential_assignment"));
+        assert!(!scan_text("password=$DB_PASS_VARIABLE").contains(&"generic_credential_assignment"));
         assert!(!scan_text("password=%DB_PASSWORD%").contains(&"generic_credential_assignment"));
     }
 
     #[test]
     fn still_detects_real_credential_values() {
-        assert!(
-            scan_text(r#"api_key="A1b2C3d4E5f6G7h8""#)
-                .contains(&"generic_credential_assignment")
-        );
-        assert!(scan_text("password = hunter2supersecret")
-            .contains(&"generic_credential_assignment"));
+        assert!(scan_text(r#"api_key="A1b2C3d4E5f6G7h8""#).contains(&"generic_credential_assignment"));
+        assert!(scan_text("password = hunter2supersecret").contains(&"generic_credential_assignment"));
     }
 
     #[test]
@@ -1332,39 +1155,25 @@ mod tests {
         let kinds = scan_text(
             "For Mendix developers building a formal OutSystems credential: Associate Reactive Developer — entry point.",
         );
-        assert!(
-            !kinds.contains(&"generic_credential_assignment"),
-            "prose 'credential:' must not flag, got {kinds:?}"
-        );
-        assert!(
-            !kinds.contains(&"sensitive"),
-            "the document should not be flagged sensitive at all, got {kinds:?}"
-        );
+        assert!(!kinds.contains(&"generic_credential_assignment"), "prose 'credential:' must not flag, got {kinds:?}");
+        assert!(!kinds.contains(&"sensitive"), "the document should not be flagged sensitive at all, got {kinds:?}");
     }
 
     #[test]
     fn ignores_unquoted_prose_values() {
         assert!(!scan_text("password: Associate").contains(&"generic_credential_assignment"));
         assert!(!scan_text("api_key: available").contains(&"generic_credential_assignment"));
-        assert!(
-            !scan_text("Your password should be memorable but unique")
-                .contains(&"generic_credential_assignment")
-        );
+        assert!(!scan_text("Your password should be memorable but unique").contains(&"generic_credential_assignment"));
     }
 
     #[test]
     fn accepts_quoted_literal_even_when_wordlike() {
-        assert!(
-            scan_text(r#"password = "supersafeword""#)
-                .contains(&"generic_credential_assignment")
-        );
+        assert!(scan_text(r#"password = "supersafeword""#).contains(&"generic_credential_assignment"));
     }
 
     #[test]
     fn detects_unquoted_secretish_value() {
-        assert!(
-            scan_text("API_KEY=abc123def456ghi").contains(&"generic_credential_assignment")
-        );
+        assert!(scan_text("API_KEY=abc123def456ghi").contains(&"generic_credential_assignment"));
     }
 
     // ── Named tokens ──
@@ -1383,9 +1192,7 @@ mod tests {
 
     #[test]
     fn detects_npm_publish_token() {
-        let kinds = scan_text(
-            "//registry.npmjs.org/:_authToken=npm_abcdefghij1234567890ABCDEFghij1234567890",
-        );
+        let kinds = scan_text("//registry.npmjs.org/:_authToken=npm_abcdefghij1234567890ABCDEFghij1234567890");
         assert!(kinds.contains(&"npm_token"));
     }
 
@@ -1430,10 +1237,7 @@ mod tests {
     fn finding_carries_correct_span_for_github_token() {
         let text = "prefix ghp_1234567890abcdefghijklmnopqrstuvwxyzAB suffix";
         let findings = scan_text_detailed(text, false);
-        let f = findings
-            .iter()
-            .find(|f| f.kind == "github_token")
-            .expect("token finding");
+        let f = findings.iter().find(|f| f.kind == "github_token").expect("token finding");
         assert_eq!(&text[f.start..f.end], "ghp_1234567890abcdefghijklmnopqrstuvwxyzAB");
         assert_eq!(f.tier, Tier::High);
     }
@@ -1443,10 +1247,7 @@ mod tests {
         // The span should cover only the VALUE, not the keyword.
         let text = r#"api_key = "1234567890abcdef""#;
         let findings = scan_text_detailed(text, false);
-        let f = findings
-            .iter()
-            .find(|f| f.kind == "generic_credential_assignment")
-            .expect("cred finding");
+        let f = findings.iter().find(|f| f.kind == "generic_credential_assignment").expect("cred finding");
         assert_eq!(&text[f.start..f.end], "1234567890abcdef");
         assert_eq!(f.tier, Tier::Medium);
     }
@@ -1505,8 +1306,7 @@ mod tests {
     fn scan_text_kinds_only_still_dedupes_and_tags() {
         // Two AWS keys in one string → kinds list has one "aws_access_key"
         // entry (deduped) plus the universal "sensitive" tag at position 0.
-        let kinds =
-            scan_text("AKIA1234567890ABCDEF and another AKIA0987654321FEDCBA");
+        let kinds = scan_text("AKIA1234567890ABCDEF and another AKIA0987654321FEDCBA");
         assert_eq!(kinds.first(), Some(&"sensitive"));
         assert_eq!(kinds.iter().filter(|&&k| k == "aws_access_key").count(), 1);
     }
@@ -1521,14 +1321,8 @@ mod tests {
             "key=sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx end",
             false,
         );
-        assert!(
-            f.iter().any(|x| x.kind == "anthropic_api_key"),
-            "expected anthropic_api_key, got: {f:?}"
-        );
-        assert!(
-            !f.iter().any(|x| x.kind == "openai_api_key"),
-            "anthropic key must not also be labeled openai: {f:?}"
-        );
+        assert!(f.iter().any(|x| x.kind == "anthropic_api_key"), "expected anthropic_api_key, got: {f:?}");
+        assert!(!f.iter().any(|x| x.kind == "openai_api_key"), "anthropic key must not also be labeled openai: {f:?}");
     }
 
     #[test]
@@ -1552,14 +1346,9 @@ mod tests {
 
     #[test]
     fn ethereum_private_key_not_confused_with_address() {
-        let f = scan_text(
-            "key 0x4c0883a69102937d6231471b5dbb6e538eba2ef67d8b6e7c7bae8e22cbf4bc01 end",
-        );
+        let f = scan_text("key 0x4c0883a69102937d6231471b5dbb6e538eba2ef67d8b6e7c7bae8e22cbf4bc01 end");
         assert!(f.contains(&"ethereum_private_key"), "got: {f:?}");
-        assert!(
-            !f.contains(&"ethereum_address"),
-            "64-char key must not also match as address: {f:?}"
-        );
+        assert!(!f.contains(&"ethereum_address"), "64-char key must not also match as address: {f:?}");
     }
 
     #[test]
@@ -1590,10 +1379,7 @@ mod tests {
         ];
         for (text, kind) in cases {
             let f = scan_text_detailed(text, false);
-            assert!(
-                f.iter().any(|x| x.kind == *kind),
-                "expected {kind} (always-on) in {text:?} -> {f:?}"
-            );
+            assert!(f.iter().any(|x| x.kind == *kind), "expected {kind} (always-on) in {text:?} -> {f:?}");
         }
     }
 
@@ -1605,16 +1391,10 @@ mod tests {
         assert!(!f.iter().any(|x| x.kind == "bank_account"), "no bare account: {f:?}");
         // Invalid ABA checksum behind a routing label is rejected.
         let f2 = scan_text_detailed("Routing number: 123456789", false);
-        assert!(
-            !f2.iter().any(|x| x.kind == "routing_number"),
-            "bad ABA rejected: {f2:?}"
-        );
+        assert!(!f2.iter().any(|x| x.kind == "routing_number"), "bad ABA rejected: {f2:?}");
         // Spain DNI with the wrong check letter (Z is correct for 12345678, not A).
         let f3 = scan_text_detailed("DNI 12345678A here", false);
-        assert!(
-            !f3.iter().any(|x| x.kind == "spain_dni"),
-            "bad DNI letter rejected: {f3:?}"
-        );
+        assert!(!f3.iter().any(|x| x.kind == "spain_dni"), "bad DNI letter rejected: {f3:?}");
     }
 
     #[test]
@@ -1639,10 +1419,7 @@ mod tests {
         ];
         for (text, kind) in cases {
             let f = scan_text_detailed(text, true);
-            assert!(
-                f.iter().any(|x| x.kind == *kind),
-                "expected {kind} (gated) in {text:?} -> {f:?}"
-            );
+            assert!(f.iter().any(|x| x.kind == *kind), "expected {kind} (gated) in {text:?} -> {f:?}");
         }
     }
 
@@ -1671,10 +1448,7 @@ mod tests {
     fn dutch_bsn_invalid_rejected() {
         // 123456789 fails the modulo-11 check even with include_low on.
         let f = scan_text_detailed("nummer 123456789 wrong", true);
-        assert!(
-            !f.iter().any(|x| x.kind == "dutch_bsn"),
-            "invalid BSN must be rejected: {f:?}"
-        );
+        assert!(!f.iter().any(|x| x.kind == "dutch_bsn"), "invalid BSN must be rejected: {f:?}");
     }
 
     // ── Ported validators (unit-level) ──

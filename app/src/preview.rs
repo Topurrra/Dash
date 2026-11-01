@@ -8,9 +8,8 @@ use std::sync::Arc;
 use gpui::SharedString;
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tif", "tiff"];
-const MEDIA_EXTS: &[&str] = &[
-    "mp4", "mkv", "webm", "mov", "avi", "wmv", "m4v", "mp3", "flac", "wav", "ogg", "m4a", "aac", "opus", "wma",
-];
+const MEDIA_EXTS: &[&str] =
+    &["mp4", "mkv", "webm", "mov", "avi", "wmv", "m4v", "mp3", "flac", "wav", "ogg", "m4a", "aac", "opus", "wma"];
 /// Documents whose text is extracted (shown without line numbers).
 const DOC_EXTS: &[&str] = &["pdf", "docx", "xlsx", "pptx", "odt", "ods", "odp", "rtf"];
 const MAX_LINES: usize = 2000;
@@ -31,7 +30,10 @@ pub enum Body {
     Note(SharedString),
     /// A folder: what's in it (folders first, then by name; at most
     /// `FOLDER_ITEMS`) and how many items it has in all.
-    Folder { items: Vec<FolderItem>, total: usize },
+    Folder {
+        items: Vec<FolderItem>,
+        total: usize,
+    },
 }
 
 pub struct FolderItem {
@@ -76,7 +78,9 @@ fn music(path: &Path, details: &mut Vec<(&'static str, SharedString)>) -> Option
         details.push(("Sample rate", format!("{:.1} kHz", hz as f32 / 1000.).into()));
     }
     let tag = file.primary_tag().or_else(|| file.first_tag());
-    let text = |value: Option<std::borrow::Cow<str>>| value.map(|v| SharedString::from(v.trim().to_string())).filter(|v| !v.is_empty());
+    let text = |value: Option<std::borrow::Cow<str>>| {
+        value.map(|v| SharedString::from(v.trim().to_string())).filter(|v| !v.is_empty())
+    };
     let (title, artist, album) = match tag {
         Some(t) => (text(t.title()), text(t.artist()), text(t.album())),
         None => (None, None, None),
@@ -114,15 +118,20 @@ pub fn load(path: String, query: &str) -> Preview {
         Err(e) => Body::Note(format!("Can't read it: {e}").into()),
         Ok(m) if m.is_dir() => {
             let (items, total) = folder_items(p);
-            details.push(("Contains", if total == 1 { "1 item".into() } else { format!("{} items", thousands(total)).into() }));
+            details.push((
+                "Contains",
+                if total == 1 { "1 item".into() } else { format!("{} items", thousands(total)).into() },
+            ));
             Body::Folder { items, total }
         }
         Ok(_) if IMAGE_EXTS.contains(&ext.as_str()) => Body::Image(p.to_path_buf()),
         Ok(_) if MEDIA_EXTS.contains(&ext.as_str()) => Body::Media(p.to_path_buf()),
-        Ok(_) => match dash_search::search::read_file_preview(path.clone(), Some(PREVIEW_BYTES)).or_else(|| sniff_text(p)) {
-            Some(text) if !text.trim().is_empty() => text_body(&text, !DOC_EXTS.contains(&ext.as_str()), query),
-            _ => Body::Note("No preview for this kind of file.".into()),
-        },
+        Ok(_) => {
+            match dash_search::search::read_file_preview(path.clone(), Some(PREVIEW_BYTES)).or_else(|| sniff_text(p)) {
+                Some(text) if !text.trim().is_empty() => text_body(&text, !DOC_EXTS.contains(&ext.as_str()), query),
+                _ => Body::Note("No preview for this kind of file.".into()),
+            }
+        }
     };
     if let Ok(m) = &meta {
         if m.is_file() {
@@ -138,7 +147,11 @@ pub fn load(path: String, query: &str) -> Preview {
             details.push(("Created", when(t).into()));
         }
     }
-    let music = if AUDIO_EXTS.contains(&ext.as_str()) && matches!(body, Body::Media(_)) { music(p, &mut details) } else { None };
+    let music = if AUDIO_EXTS.contains(&ext.as_str()) && matches!(body, Body::Media(_)) {
+        music(p, &mut details)
+    } else {
+        None
+    };
     Preview { path, name: name.into(), details, body, music }
 }
 
@@ -209,12 +222,15 @@ fn text_body(text: &str, code: bool, query: &str) -> Body {
     let truncated = all.len() > MAX_LINES;
     let lines: Vec<SharedString> =
         all.iter().take(MAX_LINES).map(|l| SharedString::from(l.replace('\t', "    "))).collect();
-    let words: Vec<String> = query.split_whitespace().filter(|w| w.chars().count() >= 2).map(str::to_lowercase).collect();
+    let words: Vec<String> =
+        query.split_whitespace().filter(|w| w.chars().count() >= 2).map(str::to_lowercase).collect();
     let hit = (!words.is_empty())
-        .then(|| lines.iter().position(|l| {
-            let l = l.to_lowercase();
-            words.iter().any(|w| l.contains(w))
-        }))
+        .then(|| {
+            lines.iter().position(|l| {
+                let l = l.to_lowercase();
+                words.iter().any(|w| l.contains(w))
+            })
+        })
         .flatten();
     Body::Text { lines, code, hit, truncated, full: text.to_string().into() }
 }
@@ -224,7 +240,7 @@ pub fn thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);

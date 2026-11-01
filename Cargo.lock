@@ -1752,15 +1752,18 @@ dependencies = [
  "dash-search",
  "global-hotkey",
  "gpui",
+ "hex",
  "image",
  "lofty",
  "open",
  "raw-window-handle",
  "rodio",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tray-icon",
  "unicode-segmentation",
+ "ureq",
  "windows 0.54.0",
 ]
 

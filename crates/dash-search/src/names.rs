@@ -57,7 +57,12 @@ fn search_names_blocking(app: Arc<dyn Host>, options: NameQueryOptions) -> Resul
         return Err(SUPERSEDED.into());
     }
     let rows = ids.into_iter().map(|id| table.row(id)).collect();
-    Ok(NameSearchResult { total, rows, took_ms: started.elapsed().as_millis() as u64, error: None })
+    Ok(NameSearchResult {
+        total,
+        rows,
+        took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        error: None,
+    })
 }
 
 /// Typing fast starts a search per keystroke; a scan for a query that's no
@@ -230,7 +235,8 @@ impl TableBuilder {
         self.names.push_str(name);
         self.items.push(Item {
             name_start,
-            name_len: name.len() as u16,
+            // `name` was cut to `u16::MAX` bytes above.
+            name_len: u16::try_from(name.len()).unwrap_or(u16::MAX),
             is_dir,
             folder,
             child_count: 0,
@@ -278,7 +284,7 @@ impl TableBuilder {
             seg_start: self.fit(self.segments.len())?,
             seg_len: self.fit(segment.len())?,
             parent_len: self.fit(parent_len)?,
-            depth: prefix.chars().filter(|&c| is_sep(c)).count().min(u16::MAX as usize) as u16,
+            depth: u16::try_from(prefix.chars().filter(|&c| is_sep(c)).count()).unwrap_or(u16::MAX),
         });
         self.segments.push_str(segment);
         self.folder_ids.insert(prefix.into(), id);
@@ -453,8 +459,8 @@ impl Table {
         self.name_rank.get_or_init(|| {
             let order = self.order(ORDER_NAME);
             let mut rank = vec![0u32; order.len()];
-            for (position, &id) in order.iter().enumerate() {
-                rank[id as usize] = position as u32;
+            for (position, &id) in (0u32..).zip(order) {
+                rank[id as usize] = position;
             }
             rank
         })
@@ -466,7 +472,8 @@ impl Table {
     }
 
     fn build_order(&self, slot: usize) -> Vec<u32> {
-        let mut ids: Vec<u32> = (0..self.items.len() as u32).collect();
+        let item_count = u32::try_from(self.items.len()).expect("TableBuilder::fit keeps item ids within u32");
+        let mut ids: Vec<u32> = (0..item_count).collect();
         if slot == ORDER_NAME {
             ids.par_sort_unstable_by(|&a, &b| cmp_ci(self.name(a as usize), self.name(b as usize)).then(a.cmp(&b)));
             return ids;
@@ -477,15 +484,16 @@ impl Table {
             ORDER_PATH => {
                 // Folder, then name (like Everything's Path column).
                 // Parent strings exist only while this order is built.
-                let parents: Vec<String> = (0..self.folders.len() as u32).into_par_iter().map(|f| self.parent_string(f)).collect();
-                let mut folders: Vec<u32> = (0..self.folders.len() as u32).collect();
-                folders.par_sort_unstable_by(|&a, &b| {
-                    cmp_ci(&parents[a as usize], &parents[b as usize]).then(a.cmp(&b))
-                });
+                let folder_count =
+                    u32::try_from(self.folders.len()).expect("TableBuilder::fit keeps folder ids within u32");
+                let parents: Vec<String> = (0..folder_count).into_par_iter().map(|f| self.parent_string(f)).collect();
+                let mut folders: Vec<u32> = (0..folder_count).collect();
+                folders
+                    .par_sort_unstable_by(|&a, &b| cmp_ci(&parents[a as usize], &parents[b as usize]).then(a.cmp(&b)));
                 drop(parents);
                 let mut folder_rank = vec![0u32; folders.len()];
-                for (position, &f) in folders.iter().enumerate() {
-                    folder_rank[f as usize] = position as u32;
+                for (position, &f) in (0u32..).zip(&folders) {
+                    folder_rank[f as usize] = position;
                 }
                 ids.par_sort_unstable_by_key(|&id| {
                     ((folder_rank[items[id as usize].folder as usize] as u64) << 32) | rank[id as usize] as u64
@@ -500,7 +508,10 @@ impl Table {
                     ib.is_dir
                         .cmp(&ia.is_dir)
                         .then_with(|| {
-                            cmp_ci(extension_of(self.name(a as usize), ia.is_dir), extension_of(self.name(b as usize), ib.is_dir))
+                            cmp_ci(
+                                extension_of(self.name(a as usize), ia.is_dir),
+                                extension_of(self.name(b as usize), ib.is_dir),
+                            )
                         })
                         .then(rank[a as usize].cmp(&rank[b as usize]))
                 });
@@ -560,7 +571,9 @@ impl Table {
         hide: Option<&[u64]>,
         cancel: &Cancel,
     ) -> (usize, Vec<u32>) {
-        let (bits, total) = if match_all { (None, self.items.len()) } else {
+        let (bits, total) = if match_all {
+            (None, self.items.len())
+        } else {
             let (bits, total) = self.match_bits(matcher, cancel);
             (Some(bits), total)
         };
@@ -608,7 +621,8 @@ impl Table {
         for (w, &word) in bits.iter().enumerate() {
             let mut word = word;
             while word != 0 {
-                ids.push((w * 64) as u32 + word.trailing_zeros());
+                let id = w * 64 + word.trailing_zeros() as usize;
+                ids.push(u32::try_from(id).expect("a set bit is an item id, which fits in u32"));
                 word &= word - 1;
             }
         }
@@ -620,7 +634,10 @@ impl Table {
                 lower.extend(name.chars().flat_map(char::to_lowercase));
                 let tier = needles.iter().map(|n| match_tier(lower, n)).min().unwrap_or(4) as u64;
                 let item = &self.items[id as usize];
-                (tier << 60) | ((item.name_len.min(0xFFF) as u64) << 48) | ((!item.is_dir as u64) << 32) | rank[id as usize] as u64
+                (tier << 60)
+                    | ((item.name_len.min(0xFFF) as u64) << 48)
+                    | ((!item.is_dir as u64) << 32)
+                    | rank[id as usize] as u64
             })
             .collect();
         keys.par_sort_unstable();
@@ -637,7 +654,7 @@ impl Table {
 /// A bitset with the first `n` bits set.
 fn all_bits(n: usize) -> Vec<u64> {
     let mut bits = vec![u64::MAX; n.div_ceil(64)];
-    if n % 64 != 0 {
+    if !n.is_multiple_of(64) {
         if let Some(last) = bits.last_mut() {
             *last = (1u64 << (n % 64)) - 1;
         }
@@ -667,7 +684,8 @@ static GONE: LazyLock<Mutex<Gone>> = LazyLock::new(Mutex::default);
 /// follows).
 pub fn forget_paths(paths: Vec<String>) {
     if dash_core::link::is_follower() {
-        let forwarded: Option<Result<(), String>> = dash_core::link::forward("forget_paths", serde_json::json!({ "paths": paths }));
+        let forwarded: Option<Result<(), String>> =
+            dash_core::link::forward("forget_paths", serde_json::json!({ "paths": paths }));
         if forwarded.is_some() {
             return;
         }
@@ -686,7 +704,11 @@ fn gone_key(path: &str) -> String {
 
 /// Windows paths ignore case; elsewhere they don't.
 fn fold_case(path: &str) -> String {
-    if cfg!(windows) { path.to_lowercase() } else { path.to_string() }
+    if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    }
 }
 
 /// Matches entries that are, or are inside, a forgotten path; notes which
@@ -810,8 +832,11 @@ struct State {
     last_build: Mutex<Option<(Instant, Duration)>>,
 }
 
-static STATE: LazyLock<State> =
-    LazyLock::new(|| State { table: RwLock::new(None), building: AtomicBool::new(false), last_build: Mutex::new(None) });
+static STATE: LazyLock<State> = LazyLock::new(|| State {
+    table: RwLock::new(None),
+    building: AtomicBool::new(false),
+    last_build: Mutex::new(None),
+});
 
 /// Builds are spaced by at least 4× the last build's time so a busy
 /// watcher can't keep a core rebuilding.
@@ -935,7 +960,8 @@ fn fallback_search(
             extension: r.extension.to_lowercase(),
         })
         .filter(|row| {
-            let parent = std::path::Path::new(&row.path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            let parent =
+                std::path::Path::new(&row.path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
             query.matches(&Entry {
                 name: &row.name,
                 path: &row.path,
@@ -944,7 +970,7 @@ fn fallback_search(
                 size: row.size,
                 modified_ms: row.modified_ms,
                 created_ms: row.created_ms,
-                depth: row.path.matches(['\\', '/']).count().saturating_sub(1) as u16,
+                depth: u16::try_from(row.path.matches(['\\', '/']).count().saturating_sub(1)).unwrap_or(u16::MAX),
                 child_count: None,
             })
         })
@@ -952,7 +978,12 @@ fn fallback_search(
     sort_rows(&mut rows, options.sort, options.descending);
     let total = rows.len();
     let rows = rows.into_iter().skip(options.offset).take(options.limit).collect();
-    Ok(NameSearchResult { total, rows, took_ms: started.elapsed().as_millis() as u64, error: None })
+    Ok(NameSearchResult {
+        total,
+        rows,
+        took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        error: None,
+    })
 }
 
 fn sort_rows(rows: &mut [NameRow], key: SortKey, descending: bool) {
@@ -1030,8 +1061,8 @@ mod tests {
         let mut buf = PathScratch::new();
         let e = t.entry(find(&t, r"C:\"), &mut buf);
         assert_eq!((e.path, e.parent, e.depth), (r"C:\", "", 0));
-        assert_eq!(t.row(find(&t, "reports") as u32).size, 0, "folders have no size");
-        assert_eq!(t.row(find(&t, "Report Final.docx") as u32).extension, "docx");
+        assert_eq!(t.row(u32::try_from(find(&t, "reports")).unwrap()).size, 0, "folders have no size");
+        assert_eq!(t.row(u32::try_from(find(&t, "Report Final.docx")).unwrap()).extension, "docx");
     }
 
     #[test]
@@ -1077,20 +1108,29 @@ mod tests {
     #[test]
     fn forgotten_paths_are_left_out() {
         let mut b = TableBuilder::default();
-        for (path, dir) in [(r"C:\a", true), (r"C:\a\x.txt", false), (r"C:\a\sub\y.txt", false), (r"C:\b.txt", false), (r"C:\ab.txt", false)] {
+        for (path, dir) in [
+            (r"C:\a", true),
+            (r"C:\a\x.txt", false),
+            (r"C:\a\sub\y.txt", false),
+            (r"C:\b.txt", false),
+            (r"C:\ab.txt", false),
+        ] {
             b.push(path, dir, 0, 0, 0);
         }
         let t = b.finish(0);
-        let paths: std::collections::HashSet<String> = [gone_key(r"C:\A\"), gone_key(r"C:\missing.txt")].into_iter().collect();
+        let paths: std::collections::HashSet<String> =
+            [gone_key(r"C:\A\"), gone_key(r"C:\missing.txt")].into_iter().collect();
         let matcher = UnderGone { paths: &paths, found: Mutex::default() };
         let (hide, hidden) = t.match_bits(&matcher, &Cancel::NEVER);
         // C:\a, both files inside it; not C:\ab.txt (same prefix, other name).
         assert_eq!(hidden, 3);
         assert_eq!(matcher.found.into_inner().unwrap().len(), 1);
-        let (total, ids) = t.search(&Everything, true, &opts("", SortKey::Name, false, 0, 10), Some(&hide), &Cancel::NEVER);
+        let (total, ids) =
+            t.search(&Everything, true, &opts("", SortKey::Name, false, 0, 10), Some(&hide), &Cancel::NEVER);
         assert_eq!(total, 2);
         assert_eq!(names(&t, &ids), ["ab.txt", "b.txt"]);
-        let (total, _) = t.search(&Contains("txt"), false, &opts("txt", SortKey::Name, false, 0, 10), Some(&hide), &Cancel::NEVER);
+        let (total, _) =
+            t.search(&Contains("txt"), false, &opts("txt", SortKey::Name, false, 0, 10), Some(&hide), &Cancel::NEVER);
         assert_eq!(total, 2);
         assert_eq!(all_bits(70).iter().map(|w| w.count_ones()).sum::<u32>(), 70);
     }
@@ -1106,7 +1146,10 @@ mod tests {
         assert!(total > 0);
         let _newer = Cancel::newest("rep");
         assert!(older.is_set());
-        assert_eq!(t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 0, 10), None, &older), (0, Vec::new()));
+        assert_eq!(
+            t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 0, 10), None, &older),
+            (0, Vec::new())
+        );
     }
 
     #[test]
@@ -1125,7 +1168,9 @@ mod tests {
     #[test]
     fn sorts_by_every_column() {
         let t = sample();
-        let run = |sort, desc| names(&t, &t.search(&Contains("re"), false, &opts("", sort, desc, 0, 100), None, &Cancel::NEVER).1);
+        let run = |sort, desc| {
+            names(&t, &t.search(&Contains("re"), false, &opts("", sort, desc, 0, 100), None, &Cancel::NEVER).1)
+        };
         assert_eq!(run(SortKey::Name, false), ["q1 report.pdf", "Report Final.docx", "report.pdf", "reports"]);
         assert_eq!(run(SortKey::Name, true), ["reports", "report.pdf", "Report Final.docx", "q1 report.pdf"]);
         assert_eq!(run(SortKey::Size, false), ["reports", "q1 report.pdf", "Report Final.docx", "report.pdf"]);
@@ -1138,19 +1183,23 @@ mod tests {
     #[test]
     fn pages_with_offset_and_limit() {
         let t = sample();
-        let (total, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 1, 2), None, &Cancel::NEVER);
+        let (total, ids) =
+            t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 1, 2), None, &Cancel::NEVER);
         assert_eq!(total, 4);
         assert_eq!(names(&t, &ids), ["Report Final.docx", "report.pdf"]);
-        let (total, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 3, 10), None, &Cancel::NEVER);
+        let (total, ids) =
+            t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 3, 10), None, &Cancel::NEVER);
         assert_eq!((total, names(&t, &ids)), (4, vec!["reports".to_string()]));
-        let (_, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 50, 10), None, &Cancel::NEVER);
+        let (_, ids) =
+            t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 50, 10), None, &Cancel::NEVER);
         assert!(ids.is_empty());
     }
 
     #[test]
     fn empty_query_lists_everything() {
         let t = sample();
-        let (total, ids) = t.search(&Everything, true, &opts("", SortKey::Relevance, false, 0, 3), None, &Cancel::NEVER);
+        let (total, ids) =
+            t.search(&Everything, true, &opts("", SortKey::Relevance, false, 0, 3), None, &Cancel::NEVER);
         assert_eq!(total, 8);
         assert_eq!(names(&t, &ids), [r"C:\", "me", "notes.txt"]);
         let (_, ids) = t.search(&Everything, true, &opts("", SortKey::Name, true, 0, 2), None, &Cancel::NEVER);
@@ -1164,13 +1213,29 @@ mod tests {
     #[test]
     fn relevance_ranks_exact_then_prefix_then_word_then_contains() {
         let mut b = TableBuilder::default();
-        for path in [r"C:\a\misreport.txt", r"C:\a\q1 report.pdf", r"C:\a\reports", r"C:\a\report.pdf", r"C:\a\Report", r"C:\a\reporting.md"] {
+        for path in [
+            r"C:\a\misreport.txt",
+            r"C:\a\q1 report.pdf",
+            r"C:\a\reports",
+            r"C:\a\report.pdf",
+            r"C:\a\Report",
+            r"C:\a\reporting.md",
+        ] {
             b.push(path, !path.contains('.'), 1, 0, 0);
         }
         let t = b.finish(0);
-        let (total, ids) = t.search(&Contains("report"), false, &opts("report", SortKey::Relevance, false, 0, 10), None, &Cancel::NEVER);
+        let (total, ids) = t.search(
+            &Contains("report"),
+            false,
+            &opts("report", SortKey::Relevance, false, 0, 10),
+            None,
+            &Cancel::NEVER,
+        );
         assert_eq!(total, 6);
-        assert_eq!(names(&t, &ids), ["Report", "report.pdf", "reports", "reporting.md", "q1 report.pdf", "misreport.txt"]);
+        assert_eq!(
+            names(&t, &ids),
+            ["Report", "report.pdf", "reports", "reporting.md", "q1 report.pdf", "misreport.txt"]
+        );
         assert_eq!(match_tier("ext:pdf", "pdf"), 2);
         assert_eq!(relevance_needles("q1 report ext:pdf -old"), ["q1 report", "q1", "report"]);
     }
@@ -1192,7 +1257,7 @@ mod tests {
         assert!(b.names.len() <= 40 && b.segments.len() <= 40);
         let t = b.finish(0);
         assert_eq!(t.len(), taken);
-        let rows: Vec<String> = (0..taken as u32).map(|i| t.row(i).path).collect();
+        let rows: Vec<String> = (0..u32::try_from(taken).unwrap()).map(|i| t.row(i).path).collect();
         assert_eq!(rows[0], r"C:\d\f00.txt");
         assert_eq!(rows[taken - 1], format!(r"C:\d\f{:02}.txt", taken - 1));
 
@@ -1249,7 +1314,12 @@ mod tests {
                     path.clear();
                     path.push_str(&folder);
                     path.push('\\');
-                    path.push_str(&format!("{} {} {f}.{}", words[(f * 7 + sub) % words.len()], n % 997, exts[f % exts.len()]));
+                    path.push_str(&format!(
+                        "{} {} {f}.{}",
+                        words[(f * 7 + sub) % words.len()],
+                        n % 997,
+                        exts[f % exts.len()]
+                    ));
                     b.push(&path, false, n * 37 % 100_000, n * 7919 % 1_000_000, n);
                     n += 1;
                     if n >= 1_000_000 {
@@ -1270,16 +1340,23 @@ mod tests {
             base as f64 / entries as f64,
             table.heap_bytes() as f64 / entries as f64
         );
-        for (label, query) in [("rare 'budget 42'", "budget 42"), ("common 'report'", "report"), ("'e' (most)", "e"), ("'zzz' (none)", "zzz")] {
+        for (label, query) in [
+            ("rare 'budget 42'", "budget 42"),
+            ("common 'report'", "report"),
+            ("'e' (most)", "e"),
+            ("'zzz' (none)", "zzz"),
+        ] {
             let parsed = crate::query::parse(query).unwrap();
             for sort in [SortKey::Relevance, SortKey::Name, SortKey::Size] {
                 let t = Instant::now();
-                let (total, ids) = table.search(&parsed, false, &opts(query, sort, false, 0, 100), None, &Cancel::NEVER);
+                let (total, ids) =
+                    table.search(&parsed, false, &opts(query, sort, false, 0, 100), None, &Cancel::NEVER);
                 println!("{label:>18} {sort:?}: {total} hits, {} rows, {:?}", ids.len(), t.elapsed());
             }
         }
         let t = Instant::now();
-        let (total, _) = table.search(&Everything, true, &opts("", SortKey::Path, true, 500_000, 100), None, &Cancel::NEVER);
+        let (total, _) =
+            table.search(&Everything, true, &opts("", SortKey::Path, true, 500_000, 100), None, &Cancel::NEVER);
         println!("empty query, Path desc page @500k: {total} total, {:?}", t.elapsed());
         /// Allocation-free ASCII case-insensitive substring test.
         struct AsciiContains(&'static [u8]);
@@ -1312,7 +1389,13 @@ mod tests {
         });
         let read = started.elapsed();
         let table = b.finish(fp.expect("index opens"));
-        println!("real: {} entries, {} folders; read {:?}, total build {:?}", table.len(), table.folders.len(), read, started.elapsed());
+        println!(
+            "real: {} entries, {} folders; read {:?}, total build {:?}",
+            table.len(),
+            table.folders.len(),
+            read,
+            started.elapsed()
+        );
         let base = table.heap_bytes();
         let t = Instant::now();
         table.warm_orders();

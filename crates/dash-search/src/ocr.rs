@@ -39,24 +39,17 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 // pipes are read, so a cancel or timeout can always kill it. Locks are
 // taken OCR_CHILDREN first, then CANCELLED_OCR.
 
-static OCR_CHILDREN: LazyLock<Mutex<HashMap<String, Option<Child>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static CANCELLED_OCR: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static OCR_CHILDREN: LazyLock<Mutex<HashMap<String, Option<Child>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static CANCELLED_OCR: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Cancels a running OCR operation (kills its tesseract). An id that isn't
 /// running is ignored, so nothing is left behind in the cancel set.
 pub fn cancel_ocr_operation(operation_id: String) -> Result<(), String> {
-    let mut map = OCR_CHILDREN
-        .lock()
-        .map_err(|_| "Cancel registry lock failed".to_string())?;
+    let mut map = OCR_CHILDREN.lock().map_err(|_| "Cancel registry lock failed".to_string())?;
     let Some(slot) = map.get_mut(&operation_id) else {
         return Ok(());
     };
-    CANCELLED_OCR
-        .lock()
-        .map_err(|_| "Cancel registry lock failed".to_string())?
-        .insert(operation_id);
+    CANCELLED_OCR.lock().map_err(|_| "Cancel registry lock failed".to_string())?.insert(operation_id);
     // Best-effort kill; the owner sees the closed pipes, reaps the
     // child and returns "Cancelled".
     if let Some(child) = slot.as_mut() {
@@ -66,10 +59,7 @@ pub fn cancel_ocr_operation(operation_id: String) -> Result<(), String> {
 }
 
 fn is_ocr_cancelled(op_id: &Option<String>) -> bool {
-    op_id
-        .as_ref()
-        .and_then(|id| CANCELLED_OCR.lock().ok().map(|s| s.contains(id)))
-        .unwrap_or(false)
+    op_id.as_ref().and_then(|id| CANCELLED_OCR.lock().ok().map(|s| s.contains(id))).unwrap_or(false)
 }
 
 fn clear_ocr_cancel(op_id: &Option<String>) {
@@ -134,11 +124,7 @@ fn wait_registered(id: &str, mut child: Child) -> std::io::Result<std::process::
         Some(mut pipe) => pipe.read_to_end(&mut out).map(|_| ()),
         None => Ok(()),
     };
-    let child = OCR_CHILDREN
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get_mut(id)
-        .and_then(Option::take);
+    let child = OCR_CHILDREN.lock().unwrap_or_else(|p| p.into_inner()).get_mut(id).and_then(Option::take);
     let status = match child {
         Some(mut child) => {
             if read.is_err() {
@@ -146,7 +132,7 @@ fn wait_registered(id: &str, mut child: Child) -> std::io::Result<std::process::
             }
             child.wait()
         }
-        None => Err(std::io::Error::new(std::io::ErrorKind::Other, "OCR child went missing")),
+        None => Err(std::io::Error::other("OCR child went missing")),
     };
     let err = stderr_reader.and_then(|t| t.join().ok()).unwrap_or_default();
     read?;
@@ -164,11 +150,7 @@ fn tesseract_command(program: &str) -> Command {
 
 /// Does `program` run as a working tesseract (`--version` exits 0)?
 fn tesseract_runs(program: &str) -> bool {
-    tesseract_command(program)
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    tesseract_command(program).arg("--version").output().map(|output| output.status.success()).unwrap_or(false)
 }
 
 /// Resolve the tesseract executable. Wave 8.4 (2026-05-29) order:
@@ -211,10 +193,7 @@ fn resolve_tesseract() -> Option<String> {
             }
         }
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            for sub in [
-                r"Tesseract-OCR\tesseract.exe",
-                r"Programs\Tesseract-OCR\tesseract.exe",
-            ] {
+            for sub in [r"Tesseract-OCR\tesseract.exe", r"Programs\Tesseract-OCR\tesseract.exe"] {
                 let path = Path::new(&local).join(sub);
                 if path.exists() {
                     return path.to_str().map(str::to_string);
@@ -275,6 +254,11 @@ pub fn ocr_languages() -> Vec<String> {
 /// contrast WITHOUT the stroke loss of hard binarization — mid-tone strokes keep
 /// their anti-aliasing. Returns whether it changed anything (false on a flat
 /// histogram). Stroke-safe, unlike the Otsu threshold we removed.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the targets are fractions of a u64 pixel count, and a stretched pixel (lo < v < hi) rounds within 0..=255"
+)]
 fn normalize_contrast(gray: &mut image::GrayImage) -> bool {
     let mut histogram = [0u32; 256];
     for pixel in gray.pixels() {
@@ -288,19 +272,19 @@ fn normalize_contrast(gray: &mut image::GrayImage) -> bool {
     let hi_target = (total as f64 * 0.98) as u64;
     let mut acc = 0u64;
     let mut lo = 0u8;
-    for (i, &count) in histogram.iter().enumerate() {
+    for (i, &count) in (0u8..=255).zip(&histogram) {
         acc += count as u64;
         if acc >= lo_target {
-            lo = i as u8;
+            lo = i;
             break;
         }
     }
     acc = 0;
     let mut hi = 255u8;
-    for (i, &count) in histogram.iter().enumerate() {
+    for (i, &count) in (0u8..=255).zip(&histogram) {
         acc += count as u64;
         if acc >= hi_target {
-            hi = i as u8;
+            hi = i;
             break;
         }
     }
@@ -328,6 +312,7 @@ fn normalize_contrast(gray: &mut image::GrayImage) -> bool {
 ///      single biggest OCR-accuracy lever), capped at 4×, when not already large.
 ///   2. Gentle percentile contrast-stretch so text/background separate cleanly
 ///      while strokes keep their anti-aliasing.
+///
 /// Uses the already-bundled `image` crate.
 fn preprocess_for_ocr(src: &Path) -> Result<Option<PathBuf>, String> {
     use image::imageops::FilterType;
@@ -341,7 +326,17 @@ fn preprocess_for_ocr(src: &Path) -> Result<Option<PathBuf>, String> {
     let mut changed = false;
     if longest < 2600 {
         let scale = (3200.0 / longest as f32).min(4.0);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "scale keeps the long side at 3200 or less, and both sides at 1 or more"
+        )]
         let nw = ((w as f32) * scale).round().max(1.0) as u32;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "scale keeps the long side at 3200 or less, and both sides at 1 or more"
+        )]
         let nh = ((h as f32) * scale).round().max(1.0) as u32;
         gray = image::imageops::resize(&gray, nw, nh, FilterType::Lanczos3);
         changed = true;
@@ -352,13 +347,9 @@ fn preprocess_for_ocr(src: &Path) -> Result<Option<PathBuf>, String> {
     if !changed {
         return Ok(None);
     }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let temp = std::env::temp_dir().join(format!("kil-ocr-{stamp}.png"));
-    gray.save(&temp)
-        .map_err(|error| format!("Cannot write preprocessed image: {error}"))?;
+    gray.save(&temp).map_err(|error| format!("Cannot write preprocessed image: {error}"))?;
     Ok(Some(temp))
 }
 
@@ -409,18 +400,15 @@ mod leptess_ocr {
                 None => true,
             };
             if needs_init {
-                let tessdata = super::bundled_tessdata_dir()
-                    .map(|p| p.to_string_lossy().into_owned());
+                let tessdata = super::bundled_tessdata_dir().map(|p| p.to_string_lossy().into_owned());
                 let lt = LepTess::new(tessdata.as_deref(), langs)
                     .map_err(|e| format!("LepTess init failed (langs={langs}): {e}"))?;
                 *guard = Some((langs.to_string(), lt));
             }
             let (_, lt) = guard.as_mut().expect("initialized just above");
-            lt.set_image(image_path)
-                .map_err(|e| format!("LepTess set_image failed: {e}"))?;
+            lt.set_image(image_path).map_err(|e| format!("LepTess set_image failed: {e}"))?;
             lt.set_source_resolution(300);
-            lt.get_utf8_text()
-                .map_err(|e| format!("LepTess get_utf8_text failed: {e}"))
+            lt.get_utf8_text().map_err(|e| format!("LepTess get_utf8_text failed: {e}"))
         })
     }
 }
@@ -453,9 +441,8 @@ pub fn ocr_image_file(
     }
     // Registered from here on so a cancel during setup is recorded.
     let _registration = OcrRegistration::new(operation_id);
-    let exe = resolve_tesseract().ok_or_else(|| {
-        "Tesseract OCR was not found. Install Tesseract (5.x) and ensure it is on PATH.".to_string()
-    })?;
+    let exe = resolve_tesseract()
+        .ok_or_else(|| "Tesseract OCR was not found. Install Tesseract (5.x) and ensure it is on PATH.".to_string())?;
     let langs = langs.trim();
     let langs = if langs.is_empty() { "eng" } else { langs };
 
@@ -464,11 +451,7 @@ pub fn ocr_image_file(
         return Err("Cancelled".to_string());
     }
 
-    let prepared = if preprocess {
-        preprocess_for_ocr(image_path).ok().flatten()
-    } else {
-        None
-    };
+    let prepared = if preprocess { preprocess_for_ocr(image_path).ok().flatten() } else { None };
     let ocr_target: &Path = prepared.as_deref().unwrap_or(image_path);
 
     // `tesseract <image> stdout -l <langs> --dpi 300 [--psm N]` → recognized
@@ -477,13 +460,7 @@ pub fn ocr_image_file(
     // uniform block) overrides the auto page-segmentation that can split numbered
     // lists on upscaled pages.
     let mut command = tesseract_command(&exe);
-    command
-        .arg(ocr_target)
-        .arg("stdout")
-        .arg("-l")
-        .arg(langs)
-        .arg("--dpi")
-        .arg("300");
+    command.arg(ocr_target).arg("stdout").arg("-l").arg(langs).arg("--dpi").arg("300");
     // Prefer our bundled best models (kat/eng) when they cover every requested
     // language; otherwise leave Tesseract on its system tessdata so other
     // languages (used by all-language indexing) still resolve.
@@ -524,9 +501,7 @@ pub fn ocr_image_file(
     // `wait_registered`); without one (internal callers that don't need
     // cancel) we just wait.
     let Some(id) = operation_id else {
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("Tesseract wait failed: {error}"))?;
+        let output = child.wait_with_output().map_err(|error| format!("Tesseract wait failed: {error}"))?;
         return finish_tesseract_output(output);
     };
 
@@ -624,4 +599,3 @@ mod tests {
         assert!(is_ocr_cancelled(&id));
     }
 }
-

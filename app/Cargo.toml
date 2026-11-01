@@ -29,6 +29,11 @@ rodio = { version = "=0.21.1", default-features = false, features = ["playback"]
 # Music tags and cover art. Pinned (2026-11-01).
 lofty = "=0.22.4"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+# Updates (update.rs): GitHub Releases over the system's TLS, and the
+# installer's SHA-256. Versions already in the lock file (2026-11-02).
+ureq = { version = "=3.5.0", default-features = false, features = ["native-tls"] }
+sha2 = "=0.10.9"
+hex = "=0.4.3"
 
 [target.'cfg(windows)'.dependencies]
 # Shell / Ole / KeyboardAndMouse: the Files table's Recycle Bin, "show in
@@ -50,3 +55,6 @@ tray-icon = "=0.26.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tray-icon = { version = "=0.26.1", default-features = false, features = ["ksni"] }
+
+[lints]
+workspace = true

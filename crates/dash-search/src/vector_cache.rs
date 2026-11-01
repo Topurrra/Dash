@@ -57,8 +57,8 @@ static VECTOR_CACHE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()))
 /// `top_k` reuses this whenever the redb file hasn't changed since the last
 /// load, so repeated queries don't re-read/re-decode the store.
 type ChunkSet = (String, Vec<Vec<i8>>);
-static DECODE_CACHE: LazyLock<Mutex<Option<(SystemTime, Vec<ChunkSet>)>>> =
-    LazyLock::new(|| Mutex::new(None));
+type DecodeCache = Option<(SystemTime, Vec<ChunkSet>)>;
+static DECODE_CACHE: LazyLock<Mutex<DecodeCache>> = LazyLock::new(|| Mutex::new(None));
 
 pub fn cache_path_for_dir(dir: &Path) -> PathBuf {
     dir.join(VECTOR_CACHE_FILE)
@@ -68,32 +68,34 @@ pub fn cache_path_for_dir(dir: &Path) -> PathBuf {
 /// full [-127, 127] range is used regardless of the vector's magnitude. The
 /// scale is deliberately NOT stored: cosine is invariant to positive scaling
 /// of each argument, so `cosine(q, i8)` ≈ `cosine(q, f32)`.
+#[expect(clippy::cast_possible_truncation, reason = "each value is rounded and clamped to -127..=127 before the cast")]
 fn quantize(vec: &[f32]) -> Vec<i8> {
     let maxabs = vec.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     if maxabs <= 0.0 {
         return vec![0i8; vec.len()];
     }
     let scale = 127.0 / maxabs;
-    vec.iter()
-        .map(|&v| (v * scale).round().clamp(-127.0, 127.0) as i8)
-        .collect()
+    vec.iter().map(|&v| (v * scale).round().clamp(-127.0, 127.0) as i8).collect()
 }
 
 /// `[u16 dim][u16 chunk_count][i8; dim]…`, little-endian. All chunks must
 /// share one dimension (they do — same model). Empty input → empty output.
 fn pack(chunks: &[Vec<i8>]) -> Vec<u8> {
     let dim = chunks.first().map(|c| c.len()).unwrap_or(0);
-    if dim == 0 || dim > u16::MAX as usize || chunks.len() > u16::MAX as usize {
+    let (Ok(dim_header), Ok(count_header)) = (u16::try_from(dim), u16::try_from(chunks.len())) else {
+        return Vec::new();
+    };
+    if dim == 0 {
         return Vec::new();
     }
     let mut out = Vec::with_capacity(4 + dim * chunks.len());
-    out.extend_from_slice(&(dim as u16).to_le_bytes());
-    out.extend_from_slice(&(chunks.len() as u16).to_le_bytes());
+    out.extend_from_slice(&dim_header.to_le_bytes());
+    out.extend_from_slice(&count_header.to_le_bytes());
     for chunk in chunks {
         if chunk.len() != dim {
             return Vec::new(); // ragged input — refuse rather than misalign
         }
-        out.extend(chunk.iter().map(|&q| q as u8));
+        out.extend(chunk.iter().map(|&q| q.cast_unsigned()));
     }
     out
 }
@@ -119,16 +121,13 @@ fn unpack(bytes: &[u8]) -> Option<Vec<Vec<i8>>> {
 
 fn open_db(path: &Path) -> Result<Database, String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Cannot create vector cache directory: {e}"))?;
+        fs::create_dir_all(parent).map_err(|e| format!("Cannot create vector cache directory: {e}"))?;
     }
     let db = if path.exists() {
         match Database::open(path) {
             Ok(db) => db,
             Err(error) => {
-                eprintln!(
-                    "vector_cache: cannot open existing store ({error}); quarantining and starting fresh."
-                );
+                eprintln!("vector_cache: cannot open existing store ({error}); quarantining and starting fresh.");
                 let quarantined = path.with_extension("corrupt.redb");
                 let _ = fs::rename(path, quarantined);
                 Database::create(path).map_err(|e| format!("Cannot create vector cache: {e}"))?
@@ -137,17 +136,11 @@ fn open_db(path: &Path) -> Result<Database, String> {
     } else {
         Database::create(path).map_err(|e| format!("Cannot create vector cache: {e}"))?
     };
-    let write_txn = db
-        .begin_write()
-        .map_err(|e| format!("Cannot initialize vector cache: {e}"))?;
+    let write_txn = db.begin_write().map_err(|e| format!("Cannot initialize vector cache: {e}"))?;
     {
-        let _ = write_txn
-            .open_table(VECTOR_TABLE)
-            .map_err(|e| format!("Cannot initialize vector table: {e}"))?;
+        let _ = write_txn.open_table(VECTOR_TABLE).map_err(|e| format!("Cannot initialize vector table: {e}"))?;
     }
-    write_txn
-        .commit()
-        .map_err(|e| format!("Cannot commit vector cache init: {e}"))?;
+    write_txn.commit().map_err(|e| format!("Cannot commit vector cache init: {e}"))?;
     Ok(db)
 }
 
@@ -159,11 +152,7 @@ pub fn store(db_path: &Path, path: &str, chunks: &[Vec<f32>]) {
     if chunks.is_empty() {
         return;
     }
-    let quantized: Vec<Vec<i8>> = chunks
-        .iter()
-        .filter(|c| !c.is_empty())
-        .map(|c| quantize(c))
-        .collect();
+    let quantized: Vec<Vec<i8>> = chunks.iter().filter(|c| !c.is_empty()).map(|c| quantize(c)).collect();
     let packed = pack(&quantized);
     if packed.is_empty() {
         return;
@@ -281,10 +270,7 @@ pub fn top_k(db_path: &Path, query: &[f32], k: usize) -> Vec<(String, f32)> {
     let mut scored: Vec<(String, f32)> = sets
         .iter()
         .filter_map(|(path, chunks)| {
-            let best = chunks
-                .iter()
-                .map(|chunk| cosine_f32_i8(query, chunk))
-                .fold(0.0f32, f32::max);
+            let best = chunks.iter().map(|chunk| cosine_f32_i8(query, chunk)).fold(0.0f32, f32::max);
             (best > 0.0).then(|| (path.clone(), best))
         })
         .collect();

@@ -17,6 +17,11 @@ if (-not (Test-Path $makensis)) { throw "NSIS not found: install it or put maken
 
 $out = "$dash\target\release\bundle"
 New-Item -ItemType Directory -Force $out | Out-Null
-& $makensis /V2 "/DVERSION=$version" "/DOUTFILE=$out\Dash_${version}_x64-setup.exe" "$here\dash.nsi"
+$setup = "$out\Dash_${version}_x64-setup.exe"
+& $makensis /V2 "/DVERSION=$version" "/DOUTFILE=$setup" "$here\dash.nsi"
 if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
-Get-Item "$out\Dash_${version}_x64-setup.exe"
+# Published beside the installer on a GitHub Release: Dash's updater only
+# installs a download whose SHA-256 matches this file (app/src/update.rs).
+$hash = (Get-FileHash -Algorithm SHA256 $setup).Hash.ToLower()
+Set-Content -NoNewline -Encoding ascii "$setup.sha256" "$hash  Dash_${version}_x64-setup.exe"
+Get-Item $setup, "$setup.sha256"

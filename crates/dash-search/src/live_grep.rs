@@ -24,7 +24,7 @@
 
 use grep_matcher::Matcher;
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{Searcher, sinks::UTF8};
+use grep_searcher::{sinks::UTF8, Searcher};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -35,23 +35,15 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 // ── Cancel registry ────────────────────────────────────────────────────
 
-static CANCELLED_LIVE_GREP: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static CANCELLED_LIVE_GREP: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 pub fn cancel_live_grep(operation_id: String) -> Result<(), String> {
-    CANCELLED_LIVE_GREP
-        .lock()
-        .map_err(|_| "Cancel registry lock failed".to_string())?
-        .insert(operation_id);
+    CANCELLED_LIVE_GREP.lock().map_err(|_| "Cancel registry lock failed".to_string())?.insert(operation_id);
     Ok(())
 }
 
 fn is_live_grep_cancelled(op_id: &str) -> bool {
-    CANCELLED_LIVE_GREP
-        .lock()
-        .ok()
-        .map(|s| s.contains(op_id))
-        .unwrap_or(false)
+    CANCELLED_LIVE_GREP.lock().ok().map(|s| s.contains(op_id)).unwrap_or(false)
 }
 
 fn clear_live_grep_cancel(op_id: &str) {
@@ -159,18 +151,9 @@ pub async fn live_grep_in_folders(
         // an empty result rather than matching everything.
         let trimmed = options.query.trim();
         if trimmed.is_empty() || options.folders.is_empty() {
-            return Ok(LiveGrepSummary {
-                matches: 0,
-                files_scanned: 0,
-                cancelled: false,
-                truncated: false,
-            });
+            return Ok(LiveGrepSummary { matches: 0, files_scanned: 0, cancelled: false, truncated: false });
         }
-        let pattern = if options.literal {
-            regex_escape(trimmed)
-        } else {
-            trimmed.to_string()
-        };
+        let pattern = if options.literal { regex_escape(trimmed) } else { trimmed.to_string() };
         let matcher = RegexMatcherBuilder::new()
             .case_insensitive(!options.case_sensitive)
             // Multi-line is OFF: each hit is a single-line match. The
@@ -203,12 +186,7 @@ pub async fn live_grep_in_folders(
 
         // Skip non-existent / non-folder entries up front so the
         // parallel iter doesn't fan out workers that immediately exit.
-        let valid_folders: Vec<PathBuf> = options
-            .folders
-            .iter()
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir())
-            .collect();
+        let valid_folders: Vec<PathBuf> = options.folders.iter().map(PathBuf::from).filter(|p| p.is_dir()).collect();
 
         valid_folders.par_iter().for_each(|folder| {
             let walker = WalkBuilder::new(folder).build();
@@ -296,9 +274,7 @@ pub async fn live_grep_in_folders(
 /// it directly (only transitively); doing the small subset by hand
 /// keeps the dependency surface tight. Mirrors `regex::escape`.
 fn regex_escape(s: &str) -> String {
-    const META: &[char] = &[
-        '\\', '.', '+', '*', '?', '(', ')', '|', '[', ']', '{', '}', '^', '$', '#', '&', '-', '~',
-    ];
+    const META: &[char] = &['\\', '.', '+', '*', '?', '(', ')', '|', '[', ']', '{', '}', '^', '$', '#', '&', '-', '~'];
     let mut out = String::with_capacity(s.len() + 4);
     for c in s.chars() {
         if META.contains(&c) {

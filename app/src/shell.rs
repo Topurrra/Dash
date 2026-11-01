@@ -75,18 +75,16 @@ fn save(search: HotKey, clipboard: HotKey) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, json!({ "search": search.to_string(), "clipboard": clipboard.to_string() }).to_string());
+    let _ =
+        std::fs::write(path, json!({ "search": search.to_string(), "clipboard": clipboard.to_string() }).to_string());
 }
 
 /// "Ctrl+Alt+F".
 pub fn label(hotkey: HotKey) -> String {
     let mut parts = Vec::new();
-    for (flag, name) in [
-        (Modifiers::CONTROL, "Ctrl"),
-        (Modifiers::ALT, "Alt"),
-        (Modifiers::SHIFT, "Shift"),
-        (Modifiers::META, "Win"),
-    ] {
+    for (flag, name) in
+        [(Modifiers::CONTROL, "Ctrl"), (Modifiers::ALT, "Alt"), (Modifiers::SHIFT, "Shift"), (Modifiers::META, "Win")]
+    {
         if hotkey.mods.contains(flag) {
             parts.push(name.to_string());
         }
@@ -212,7 +210,13 @@ pub fn init(cx: &mut App) {
     let settings_item = MenuItem::new("Settings", true, None);
     let quit_item = MenuItem::new("Quit Dash", true, None);
     let menu = Menu::new();
-    let _ = menu.append_items(&[&search_item, &clipboard_item, &settings_item, &PredefinedMenuItem::separator(), &quit_item]);
+    let _ = menu.append_items(&[
+        &search_item,
+        &clipboard_item,
+        &settings_item,
+        &PredefinedMenuItem::separator(),
+        &quit_item,
+    ]);
     let tray = TrayIconBuilder::new()
         .with_icon(icon())
         .with_menu(Box::new(menu))
@@ -221,7 +225,8 @@ pub fn init(cx: &mut App) {
         .map_err(|e| eprintln!("dash: no tray icon: {e}"))
         .ok();
 
-    let (search_id, clipboard_id, quit_id) = (search_item.id().clone(), clipboard_item.id().clone(), quit_item.id().clone());
+    let (search_id, clipboard_id, quit_id) =
+        (search_item.id().clone(), clipboard_item.id().clone(), quit_item.id().clone());
     let settings_id = settings_item.id().clone();
     let shell = Shell { hotkeys, search, clipboard, suspended: false, search_item, clipboard_item, tray };
     shell.relabel();
@@ -257,7 +262,12 @@ pub fn init(cx: &mut App) {
             }
         }
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: tray_icon::MouseButtonState::Up, .. } = event {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: tray_icon::MouseButtonState::Up,
+                ..
+            } = event
+            {
                 wanted = Some(Some(Mode::Search));
             }
         }

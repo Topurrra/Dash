@@ -1,4 +1,5 @@
-//! Dash's colours, light or dark as Windows (or the system) is set. The
+//! Dash's colours, light or dark as chosen in Settings (by default as
+//! Windows, or the system, is set). The
 //! window is acrylic (blurred) on Windows, so the surfaces are slightly
 //! see-through; the rest are layers of white (dark) or black (light) over
 //! them.
@@ -37,10 +38,76 @@ pub fn load_fonts(cx: &mut gpui::App) {
 
 static LIGHT: AtomicBool = AtomicBool::new(false);
 
-/// Follows the system's light / dark setting. Returns whether it changed.
+/// Light, dark, or as the system is set (Settings › General › Appearance).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    System,
+    Light,
+    Dark,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 3] = [Mode::System, Mode::Light, Mode::Dark];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::System => "System",
+            Mode::Light => "Light",
+            Mode::Dark => "Dark",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Mode::System => "system",
+            Mode::Light => "light",
+            Mode::Dark => "dark",
+        }
+    }
+}
+
+fn mode_path() -> std::path::PathBuf {
+    dash_core::shared::shared_data_dir().join("preferences").join("dash-theme.json")
+}
+
+static MODE: std::sync::Mutex<Option<Mode>> = std::sync::Mutex::new(None);
+
+/// The chosen mode (read from disk the first time).
+pub fn mode() -> Mode {
+    let mut slot = MODE.lock().unwrap_or_else(|p| p.into_inner());
+    *slot.get_or_insert_with(|| {
+        let saved = std::fs::read(mode_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(str::to_string));
+        Mode::ALL.into_iter().find(|m| Some(m.key()) == saved.as_deref()).unwrap_or(Mode::System)
+    })
+}
+
+/// Chooses `mode` (saved) and applies it with the system's `appearance`.
+pub fn set_mode(mode: Mode, appearance: WindowAppearance) {
+    *MODE.lock().unwrap_or_else(|p| p.into_inner()) = Some(mode);
+    let path = mode_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, serde_json::json!({ "mode": mode.key() }).to_string());
+    follow(appearance);
+}
+
+/// Applies the chosen mode; with System, the system's light / dark setting.
+/// Returns whether the colours changed.
 pub fn follow(appearance: WindowAppearance) -> bool {
-    let light = matches!(appearance, WindowAppearance::Light | WindowAppearance::VibrantLight);
+    let light = match mode() {
+        Mode::Light => true,
+        Mode::Dark => false,
+        Mode::System => matches!(appearance, WindowAppearance::Light | WindowAppearance::VibrantLight),
+    };
     LIGHT.swap(light, Ordering::Relaxed) != light
+}
+
+pub fn is_light() -> bool {
+    LIGHT.load(Ordering::Relaxed)
 }
 
 /// `dash --shots` draws both themes, whatever the system is set to.
@@ -103,10 +170,18 @@ pub fn success() -> Rgba {
 pub fn danger() -> Rgba {
     pick(0xf85149ff, 0xcf222eff)
 }
+/// Selected text (the preview pane).
+pub fn selection() -> Rgba {
+    pick(0x5b8def55, 0x2f6fe040)
+}
 pub fn accent_soft() -> Rgba {
     pick(0x5b8def33, 0x2f6fe024)
 }
 /// The window's outline, drawn by Windows (`0x00BBGGRR`).
 pub fn window_border() -> u32 {
-    if LIGHT.load(Ordering::Relaxed) { 0x00cfcfcf } else { 0x00403a3a }
+    if LIGHT.load(Ordering::Relaxed) {
+        0x00cfcfcf
+    } else {
+        0x00403a3a
+    }
 }

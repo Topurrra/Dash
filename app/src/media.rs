@@ -15,6 +15,11 @@ const HNS_PER_SEC: u64 = 10_000_000;
 /// Largest frame kept for the pane; bigger videos are scaled down while decoding.
 const MAX_FRAME: (u32, u32) = (1280, 720);
 
+/// A duration in 100 ns units (saturating; real ones are far smaller).
+fn hns(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos() / 100).unwrap_or(u64::MAX)
+}
+
 const UNKNOWN: u8 = 0;
 const YES: u8 = 1;
 const NO: u8 = 2;
@@ -67,7 +72,7 @@ impl Player {
                             let flag = if video { &shared.has_video } else { &shared.has_audio };
                             flag.store(NO, Ordering::SeqCst);
                             if video && shared.has_audio.load(Ordering::SeqCst) == NO {
-                                *shared.error.lock().unwrap() = Some(e);
+                                *shared.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
                             }
                         }
                     });
@@ -83,7 +88,7 @@ impl Player {
             let spawned = std::thread::Builder::new().name("dash-audio".into()).spawn(move || {
                 if let Err(e) = sound::run(&path, &shared) {
                     shared.has_audio.store(NO, Ordering::SeqCst);
-                    *shared.error.lock().unwrap() = Some(e);
+                    *shared.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
                 }
             });
             threads.extend(spawned.ok());
@@ -127,8 +132,7 @@ impl Player {
 
     /// Moves by `seconds` (negative: back).
     pub fn skip(&self, seconds: i64) {
-        let now = self.position() as i64;
-        self.seek((now + seconds * HNS_PER_SEC as i64).max(0) as u64);
+        self.seek(self.position().saturating_add_signed(seconds.saturating_mul(HNS_PER_SEC as i64)));
     }
 
     pub fn position(&self) -> u64 {
@@ -148,11 +152,11 @@ impl Player {
     }
 
     pub fn frame(&self) -> Option<Arc<RenderImage>> {
-        self.shared.frame.lock().unwrap().clone()
+        self.shared.frame.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub fn error(&self) -> Option<String> {
-        self.shared.error.lock().unwrap().clone()
+        self.shared.error.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 }
 
@@ -166,6 +170,11 @@ pub fn clock(hns: u64) -> String {
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the fraction is clamped to 0..=1, so the product is between 0 and `duration`"
+)]
 pub fn hns_from_fraction(fraction: f32, duration: u64) -> u64 {
     (fraction.clamp(0., 1.) as f64 * duration as f64) as u64
 }
@@ -185,7 +194,7 @@ mod sound {
         };
         let source = open()?;
         if let Some(total) = source.total_duration() {
-            shared.duration.store(total.as_nanos() as u64 / 100, Ordering::SeqCst);
+            shared.duration.store(hns(total), Ordering::SeqCst);
         }
         let mut output = OutputStreamBuilder::open_default_stream().map_err(|e| e.to_string())?;
         output.log_on_drop(false);
@@ -207,10 +216,14 @@ mod sound {
             }
             let paused = shared.paused.load(Ordering::SeqCst) || shared.ended.load(Ordering::SeqCst);
             if paused != sink.is_paused() {
-                if paused { sink.pause() } else { sink.play() }
+                if paused {
+                    sink.pause()
+                } else {
+                    sink.play()
+                }
             }
             sink.set_volume(f32::from_bits(shared.volume.load(Ordering::SeqCst)));
-            shared.position.store(sink.get_pos().as_nanos() as u64 / 100, Ordering::SeqCst);
+            shared.position.store(hns(sink.get_pos()), Ordering::SeqCst);
             if sink.empty() && !paused {
                 shared.ended.store(true, Ordering::SeqCst);
             }
@@ -233,9 +246,13 @@ mod mf {
 
     fn start() {
         static ONCE: Once = Once::new();
+        // SAFETY: no pointers are passed; Media Foundation starts once per
+        // process and is never shut down, so it outlives every reader.
         ONCE.call_once(|| unsafe {
             let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
         });
+        // SAFETY: no reserved pointer is passed; this worker thread keeps COM
+        // (MTA) until it exits.
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
@@ -248,22 +265,26 @@ mod mf {
     /// A reader with only the first `stream` (audio or video) selected.
     fn reader(path: &str, stream: MF_SOURCE_READER_CONSTANTS) -> Result<IMFSourceReader, String> {
         start();
+        // SAFETY: COM is initialized on this thread (`start`); `attributes`
+        // is an out-param local, the HSTRING outlives the call, and every
+        // interface is an owned, reference-counted wrapper.
         unsafe {
             let mut attributes: Option<IMFAttributes> = None;
             MFCreateAttributes(&mut attributes, 1).map_err(err)?;
             let attributes = attributes.ok_or("attributes")?;
             attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1).map_err(err)?;
             let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path), &attributes).map_err(err)?;
-            reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false).map_err(err)?;
-            reader.SetStreamSelection(stream.0 as u32, true).map_err(err)?;
+            reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0.cast_unsigned(), false).map_err(err)?;
+            reader.SetStreamSelection(stream.0.cast_unsigned(), true).map_err(err)?;
             Ok(reader)
         }
     }
 
     fn duration(reader: &IMFSourceReader) -> u64 {
+        // SAFETY: `reader` is a live source reader borrowed for the call.
         unsafe {
             reader
-                .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
+                .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0.cast_unsigned(), &MF_PD_DURATION)
                 .ok()
                 .and_then(|v| u64::try_from(&v).ok())
                 .unwrap_or(0)
@@ -271,6 +292,8 @@ mod mf {
     }
 
     fn seek(reader: &IMFSourceReader, to: u64) {
+        // SAFETY: `reader` is live; the GUID and PROPVARIANT are temporaries
+        // that outlive the call (GUID_NULL means 100 ns units).
         unsafe {
             let _ = reader.SetCurrentPosition(&windows::core::GUID::zeroed(), &PROPVARIANT::from(to as i64));
         }
@@ -292,7 +315,7 @@ mod mf {
                 }
                 let (mut flags, mut time, mut sample) = (0u32, 0i64, None);
                 reader
-                    .ReadSample(stream.0 as u32, 0, None, Some(&mut flags), Some(&mut time), Some(&mut sample))
+                    .ReadSample(stream.0.cast_unsigned(), 0, None, Some(&mut flags), Some(&mut time), Some(&mut sample))
                     .map_err(err)?;
                 if flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
                     return Err("This file couldn't be decoded.".into());
@@ -306,7 +329,7 @@ mod mf {
                 buffer.Lock(&mut data, None, Some(&mut len)).map_err(err)?;
                 let bytes = std::slice::from_raw_parts(data, len as usize).to_vec();
                 let _ = buffer.Unlock();
-                return Ok(Some((bytes, time.max(0) as u64)));
+                return Ok(Some((bytes, u64::try_from(time).unwrap_or(0))));
             }
         }
     }
@@ -314,14 +337,17 @@ mod mf {
     pub fn run_audio(path: &str, shared: &Shared) -> Result<(), String> {
         let stream = MF_SOURCE_READER_FIRST_AUDIO_STREAM;
         let reader = reader(path, stream)?;
+        // SAFETY: COM is initialized on this thread (`reader` called
+        // `start`); the media types are owned wrappers and `reader` is live.
         let (channels, rate) = unsafe {
             let wanted = MFCreateMediaType().map_err(err)?;
             wanted.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).map_err(err)?;
             wanted.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float).map_err(err)?;
-            reader.SetCurrentMediaType(stream.0 as u32, None, &wanted).map_err(err)?;
-            let actual = reader.GetCurrentMediaType(stream.0 as u32).map_err(err)?;
+            reader.SetCurrentMediaType(stream.0.cast_unsigned(), None, &wanted).map_err(err)?;
+            let actual = reader.GetCurrentMediaType(stream.0.cast_unsigned()).map_err(err)?;
             (
-                actual.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).map_err(err)? as u16,
+                u16::try_from(actual.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).map_err(err)?)
+                    .map_err(|_| "This file's sound has too many channels.")?,
                 actual.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).map_err(err)?,
             )
         };
@@ -352,13 +378,17 @@ mod mf {
             }
             let paused = shared.paused.load(Ordering::SeqCst) || shared.ended.load(Ordering::SeqCst);
             if paused != sink.is_paused() {
-                if paused { sink.pause() } else { sink.play() }
+                if paused {
+                    sink.pause()
+                } else {
+                    sink.play()
+                }
             }
             sink.set_volume(f32::from_bits(shared.volume.load(Ordering::SeqCst)));
             while queued.len() > sink.len() {
                 played += queued.pop_front().unwrap_or(0);
             }
-            let current = if queued.is_empty() { 0 } else { sink.get_pos().as_nanos() as u64 / 100 };
+            let current = if queued.is_empty() { 0 } else { hns(sink.get_pos()) };
             shared.position.store(base + played + current, Ordering::SeqCst);
             // Keep about a second queued.
             if at_end || sink.len() >= 24 {
@@ -388,26 +418,33 @@ mod mf {
     pub fn run_video(path: &str, shared: &Shared) -> Result<(), String> {
         let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM;
         let reader = reader(path, stream)?;
+        // SAFETY: COM is initialized on this thread (`reader` called
+        // `start`); the media types are owned wrappers and `reader` is live.
         let (width, height, stride) = unsafe {
-            let native = reader.GetNativeMediaType(stream.0 as u32, 0).map_err(err)?;
+            let native = reader.GetNativeMediaType(stream.0.cast_unsigned(), 0).map_err(err)?;
             let size = native.GetUINT64(&MF_MT_FRAME_SIZE).map_err(err)?;
-            let (w, h) = ((size >> 32) as u32, size as u32);
+            let (w, h) = ((size >> 32) as u32, (size & 0xFFFF_FFFF) as u32);
             let scale = (MAX_FRAME.0 as f32 / w as f32).min(MAX_FRAME.1 as f32 / h as f32).min(1.);
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "scale is in 0..=1, so each side is between 0 and the native size"
+            )]
             let fit = (((w as f32 * scale) as u32) & !1, ((h as f32 * scale) as u32) & !1);
             let wanted = MFCreateMediaType().map_err(err)?;
             wanted.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(err)?;
             wanted.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32).map_err(err)?;
             wanted.SetUINT64(&MF_MT_FRAME_SIZE, ((fit.0 as u64) << 32) | fit.1 as u64).map_err(err)?;
-            if reader.SetCurrentMediaType(stream.0 as u32, None, &wanted).is_err() {
+            if reader.SetCurrentMediaType(stream.0.cast_unsigned(), None, &wanted).is_err() {
                 // No scaling available: take it at its own size.
                 let _ = wanted.DeleteItem(&MF_MT_FRAME_SIZE);
-                reader.SetCurrentMediaType(stream.0 as u32, None, &wanted).map_err(err)?;
+                reader.SetCurrentMediaType(stream.0.cast_unsigned(), None, &wanted).map_err(err)?;
             }
-            let actual = reader.GetCurrentMediaType(stream.0 as u32).map_err(err)?;
+            let actual = reader.GetCurrentMediaType(stream.0.cast_unsigned()).map_err(err)?;
             let size = actual.GetUINT64(&MF_MT_FRAME_SIZE).map_err(err)?;
             // Bytes per row, negative for bottom-up; not every decoder says.
             let stride = actual.GetUINT32(&MF_MT_DEFAULT_STRIDE).ok().map(|s| s as i32);
-            ((size >> 32) as u32, size as u32, stride)
+            ((size >> 32) as u32, (size & 0xFFFF_FFFF) as u32, stride)
         };
         shared.duration.fetch_max(duration(&reader), Ordering::SeqCst);
         shared.has_video.store(YES, Ordering::SeqCst);
@@ -435,13 +472,13 @@ mod mf {
             let now = if silent {
                 match (paused, wall_started) {
                     (true, Some(t)) => {
-                        wall_base += t.elapsed().as_nanos() as u64 / 100;
+                        wall_base += hns(t.elapsed());
                         wall_started = None;
                     }
                     (false, None) => wall_started = Some(Instant::now()),
                     _ => {}
                 }
-                let now = wall_base + wall_started.map(|t| t.elapsed().as_nanos() as u64 / 100).unwrap_or(0);
+                let now = wall_base + wall_started.map(|t| hns(t.elapsed())).unwrap_or(0);
                 shared.position.store(now, Ordering::SeqCst);
                 now
             } else {
@@ -465,8 +502,8 @@ mod mf {
             }
             if let Some((time, _)) = &pending {
                 if show_next || (!paused && *time <= now) {
-                    let (_, image) = pending.take().unwrap();
-                    *shared.frame.lock().unwrap() = Some(image);
+                    let (_, image) = pending.take().expect("`pending` was just matched as Some");
+                    *shared.frame.lock().unwrap_or_else(|p| p.into_inner()) = Some(image);
                     show_next = false;
                 } else {
                     let wait = if paused { 15 } else { ((*time - now) / 10_000).clamp(1, 15) };

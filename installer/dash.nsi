@@ -85,6 +85,13 @@ Section "Dash" Main
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoRepair" 1
 SectionEnd
 
+; A silent install is Dash updating itself (app/src/update.rs, `/S`): it
+; closed Dash, so start it again, in the tray.
+Function .onInstSuccess
+  IfSilent 0 +2
+    Exec '"$INSTDIR\dash.exe" --background'
+FunctionEnd
+
 Section "Uninstall"
   !insertmacro StopDash
   Delete "$INSTDIR\dash.exe"

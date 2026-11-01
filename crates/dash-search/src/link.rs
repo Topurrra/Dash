@@ -25,7 +25,9 @@ pub fn link_handler(host: Arc<dyn Host>, runtime: tokio::runtime::Handle) -> Han
             "stop_file_search_index_watcher" => done(s::stop_file_search_index_watcher(h)),
             "get_file_search_status" => done(s::get_file_search_status(h)),
             "get_file_search_index_options" => done(s::get_file_search_index_options(h)),
-            "save_file_search_index_options" => done(arg(&a, "options").and_then(|o| s::save_file_search_index_options(h, o))),
+            "save_file_search_index_options" => {
+                done(arg(&a, "options").and_then(|o| s::save_file_search_index_options(h, o)))
+            }
             "save_file_search_rebuild_schedule" => {
                 done(arg(&a, "schedule").and_then(|o| s::save_file_search_rebuild_schedule(h, o)))
             }
@@ -55,7 +57,9 @@ pub fn link_handler(host: Arc<dyn Host>, runtime: tokio::runtime::Handle) -> Han
                 Err(e) => Err(e),
             },
             "update_notes_index" => done((|| s::update_notes_index(h, arg(&a, "upserts")?, arg(&a, "deletes")?))()),
-            "record_frecency_launch" => done((|| frecency::record_frecency_launch(h, arg(&a, "kind")?, arg(&a, "path")?))()),
+            "record_frecency_launch" => {
+                done((|| frecency::record_frecency_launch(h, arg(&a, "kind")?, arg(&a, "path")?))())
+            }
             "get_recent_items" => done(arg(&a, "limit_per_kind").map(|l| frecency::get_recent_items(h, l))),
             "get_frecency_boosts" => done(arg(&a, "kind").map(|k| frecency::get_frecency_boosts(h, k))),
             _ => return None,

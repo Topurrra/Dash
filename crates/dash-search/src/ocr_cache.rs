@@ -96,10 +96,7 @@ pub fn is_cache_eligible_path(path: &Path) -> bool {
         return false;
     };
     let ext = ext.to_ascii_lowercase();
-    matches!(
-        ext.as_str(),
-        "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "webp" | "gif" | "pdf"
-    )
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "webp" | "gif" | "pdf")
 }
 
 /// Context handed to the extractor pool when OCR is enabled. The pool
@@ -114,10 +111,7 @@ pub struct OcrCacheCtx {
 
 impl OcrCacheCtx {
     pub fn new(state_dir: &Path, lang: &str) -> Self {
-        Self {
-            db_path: cache_path_for_dir(state_dir),
-            lang: lang.to_string(),
-        }
+        Self { db_path: cache_path_for_dir(state_dir), lang: lang.to_string() }
     }
 }
 
@@ -136,7 +130,8 @@ fn pack_value(text: &str, last_used_at: u64, created_at: u64) -> Vec<u8> {
     let mut value = Vec::with_capacity(8 + 8 + 4 + text_bytes.len());
     value.extend_from_slice(&last_used_at.to_le_bytes());
     value.extend_from_slice(&created_at.to_le_bytes());
-    value.extend_from_slice(&(text_bytes.len() as u32).to_le_bytes());
+    // Over 4 GB the length can't match, so `unpack_value` reads it as a miss.
+    value.extend_from_slice(&u32::try_from(text_bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
     value.extend_from_slice(text_bytes);
     value
 }
@@ -191,16 +186,12 @@ fn decrypt_value(stored: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn open_db(path: &Path) -> Result<Database, String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Cannot create OCR cache directory: {e}"))?;
+        fs::create_dir_all(parent).map_err(|e| format!("Cannot create OCR cache directory: {e}"))?;
     }
 
     // Graceful corruption recovery mirrors local_db.rs. A partially
@@ -212,9 +203,7 @@ fn open_db(path: &Path) -> Result<Database, String> {
         match Database::open(path) {
             Ok(db) => db,
             Err(error) => {
-                eprintln!(
-                    "ocr_cache: cannot open existing cache ({error}); quarantining and starting fresh."
-                );
+                eprintln!("ocr_cache: cannot open existing cache ({error}); quarantining and starting fresh.");
                 quarantine(path);
                 Database::create(path).map_err(|e| format!("Cannot create OCR cache: {e}"))?
             }
@@ -223,26 +212,17 @@ fn open_db(path: &Path) -> Result<Database, String> {
         Database::create(path).map_err(|e| format!("Cannot create OCR cache: {e}"))?
     };
 
-    let write_txn = db
-        .begin_write()
-        .map_err(|e| format!("Cannot initialize OCR cache: {e}"))?;
+    let write_txn = db.begin_write().map_err(|e| format!("Cannot initialize OCR cache: {e}"))?;
     {
-        let _ = write_txn
-            .open_table(OCR_CACHE_TABLE)
-            .map_err(|e| format!("Cannot initialize OCR cache table: {e}"))?;
+        let _ = write_txn.open_table(OCR_CACHE_TABLE).map_err(|e| format!("Cannot initialize OCR cache table: {e}"))?;
     }
-    write_txn
-        .commit()
-        .map_err(|e| format!("Cannot commit OCR cache init: {e}"))?;
+    write_txn.commit().map_err(|e| format!("Cannot commit OCR cache init: {e}"))?;
 
     Ok(db)
 }
 
 fn quarantine(path: &Path) {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     let quarantined = path.with_extension(format!("corrupt-{ts}.redb"));
     let _ = fs::rename(path, quarantined);
 }
@@ -341,9 +321,7 @@ pub struct GcStats {
 /// rebuild from `search.rs::build_index_in_worker`. Safe to call when
 /// the cache file doesn't exist (returns default stats).
 pub fn gc(db_path: &Path, ttl_days: u64, max_bytes: u64) -> Result<GcStats, String> {
-    let _guard = OCR_CACHE_LOCK
-        .lock()
-        .map_err(|_| "OCR cache lock was poisoned".to_string())?;
+    let _guard = OCR_CACHE_LOCK.lock().map_err(|_| "OCR cache lock was poisoned".to_string())?;
     if !db_path.exists() {
         return Ok(GcStats::default());
     }
@@ -359,16 +337,9 @@ pub fn gc(db_path: &Path, ttl_days: u64, max_bytes: u64) -> Result<GcStats, Stri
     let mut bytes_before = 0u64;
 
     {
-        let read_txn = db
-            .begin_read()
-            .map_err(|e| format!("Cannot begin GC read: {e}"))?;
-        let table = read_txn
-            .open_table(OCR_CACHE_TABLE)
-            .map_err(|e| format!("Cannot open table for GC: {e}"))?;
-        for entry in table
-            .iter()
-            .map_err(|e| format!("Cannot iterate table for GC: {e}"))?
-        {
+        let read_txn = db.begin_read().map_err(|e| format!("Cannot begin GC read: {e}"))?;
+        let table = read_txn.open_table(OCR_CACHE_TABLE).map_err(|e| format!("Cannot open table for GC: {e}"))?;
+        for entry in table.iter().map_err(|e| format!("Cannot iterate table for GC: {e}"))? {
             let entry = entry.map_err(|e| format!("Cannot read entry for GC: {e}"))?;
             entries_before += 1;
             let key = entry.0.value().to_vec();
@@ -390,20 +361,15 @@ pub fn gc(db_path: &Path, ttl_days: u64, max_bytes: u64) -> Result<GcStats, Stri
     // Pass 2: TTL drops in a single write txn.
     let ttl_dropped = ttl_drops.len();
     if !ttl_drops.is_empty() {
-        let write_txn = db
-            .begin_write()
-            .map_err(|e| format!("Cannot begin TTL drop write: {e}"))?;
+        let write_txn = db.begin_write().map_err(|e| format!("Cannot begin TTL drop write: {e}"))?;
         {
-            let mut table = write_txn
-                .open_table(OCR_CACHE_TABLE)
-                .map_err(|e| format!("Cannot open table for TTL drop: {e}"))?;
+            let mut table =
+                write_txn.open_table(OCR_CACHE_TABLE).map_err(|e| format!("Cannot open table for TTL drop: {e}"))?;
             for key in &ttl_drops {
                 let _ = table.remove(key.as_slice());
             }
         }
-        write_txn
-            .commit()
-            .map_err(|e| format!("Cannot commit TTL drop: {e}"))?;
+        write_txn.commit().map_err(|e| format!("Cannot commit TTL drop: {e}"))?;
     }
 
     // Pass 3: LRU trim if still over cap.
@@ -421,31 +387,17 @@ pub fn gc(db_path: &Path, ttl_days: u64, max_bytes: u64) -> Result<GcStats, Stri
             bytes_to_drop = bytes_to_drop.saturating_sub(*len);
             bytes_after = bytes_after.saturating_sub(*len);
         }
-        let write_txn = db
-            .begin_write()
-            .map_err(|e| format!("Cannot begin LRU drop write: {e}"))?;
+        let write_txn = db.begin_write().map_err(|e| format!("Cannot begin LRU drop write: {e}"))?;
         {
-            let mut table = write_txn
-                .open_table(OCR_CACHE_TABLE)
-                .map_err(|e| format!("Cannot open table for LRU drop: {e}"))?;
+            let mut table =
+                write_txn.open_table(OCR_CACHE_TABLE).map_err(|e| format!("Cannot open table for LRU drop: {e}"))?;
             for key in &lru_drops {
                 let _ = table.remove(key.as_slice());
             }
         }
-        write_txn
-            .commit()
-            .map_err(|e| format!("Cannot commit LRU drop: {e}"))?;
+        write_txn.commit().map_err(|e| format!("Cannot commit LRU drop: {e}"))?;
     }
 
-    let entries_after = entries_before
-        .saturating_sub(ttl_dropped)
-        .saturating_sub(lru_drops.len());
-    Ok(GcStats {
-        entries_before,
-        entries_after,
-        bytes_before,
-        bytes_after,
-        ttl_dropped,
-        lru_dropped: lru_drops.len(),
-    })
+    let entries_after = entries_before.saturating_sub(ttl_dropped).saturating_sub(lru_drops.len());
+    Ok(GcStats { entries_before, entries_after, bytes_before, bytes_after, ttl_dropped, lru_dropped: lru_drops.len() })
 }

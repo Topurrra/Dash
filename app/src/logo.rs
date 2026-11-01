@@ -3,6 +3,11 @@
 //! `installer/dash.ico` is written from it (the ignored test below).
 
 /// The logo as RGBA pixels, `size` × `size`.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "mark <= tile <= samples, so both 255 * ratio values are in 0..=255"
+)]
 pub fn rgba(size: u32) -> Vec<u8> {
     // Each pixel averages 4×4 samples, for smooth edges at small sizes.
     const SUB: u32 = 4;
@@ -64,6 +69,11 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "constant, positive pixel coordinates inside the 64 px image"
+    )]
     fn corners_are_clear_and_middle_is_drawn() {
         let n = 64;
         let px = |x: u32, y: u32| {

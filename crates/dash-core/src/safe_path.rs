@@ -35,19 +35,19 @@ use std::path::{Path, PathBuf};
 /// otherwise bypass a case-sensitive check). Stored lowercase.
 ///
 /// Patterns:
-///   - `C:\Windows\*`      — OS binaries + DLLs. Tampering = malware.
+///   - `C:\Windows\*` — OS binaries + DLLs. Tampering = malware.
 ///   - `C:\Program Files\*` / `C:\Program Files (x86)\*` — installed apps.
-///   - `C:\ProgramData\*`  — per-machine app data; writes there persist
-///                           across users + survive reinstall.
+///   - `C:\ProgramData\*` — per-machine app data; writes there persist
+///     across users + survive reinstall.
 ///   - `*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\*`
-///                         — classic Windows persistence vector. Writes
-///                           here = auto-execute on next login.
+///     — classic Windows persistence vector. Writes here = auto-execute on
+///     next login.
 ///   - `*\AppData\Local\Microsoft\Windows\Start Menu\Programs\Startup\*`
-///                         — same threat, local variant.
-///   - `C:\$Recycle.Bin\*` / `C:\System Volume Information\*` — OS-
-///                           managed, no legitimate user reason to write.
+///     — same threat, local variant.
+///   - `C:\$Recycle.Bin\*` / `C:\System Volume Information\*` — OS-managed,
+///     no legitimate user reason to write.
 ///   - `C:\boot*`, `C:\pagefile.sys`, `C:\hiberfil.sys`, `C:\swapfile.sys`
-///                         — boot/swap files, modifying = brick the OS.
+///     — boot/swap files, modifying = brick the OS.
 const FORBIDDEN_PATH_SUBSTRINGS: &[&str] = &[
     r"\windows\",
     r"\program files\",
@@ -61,12 +61,7 @@ const FORBIDDEN_PATH_SUBSTRINGS: &[&str] = &[
 
 /// Also forbid these as exact filenames (relative to a drive root), since
 /// they're single-file targets, not directory prefixes.
-const FORBIDDEN_DRIVE_ROOT_FILES: &[&str] = &[
-    "pagefile.sys",
-    "hiberfil.sys",
-    "swapfile.sys",
-    "bootmgr",
-];
+const FORBIDDEN_DRIVE_ROOT_FILES: &[&str] = &["pagefile.sys", "hiberfil.sys", "swapfile.sys", "bootmgr"];
 
 /// Reject paths that target OS-critical locations. Returns Ok(()) for
 /// safe paths; returns Err with a generic message for forbidden ones.
@@ -85,13 +80,9 @@ pub fn forbid_system_path<P: AsRef<Path>>(input: P) -> Result<PathBuf, String> {
     // parent and re-append. This still catches Startup folder writes,
     // which is the main threat for not-yet-existing files.
     let candidate = if input.exists() {
-        input
-            .canonicalize()
-            .map_err(|_| "Invalid or inaccessible path".to_string())?
+        input.canonicalize().map_err(|_| "Invalid or inaccessible path".to_string())?
     } else if let Some(parent) = input.parent() {
-        let canon_parent = parent
-            .canonicalize()
-            .map_err(|_| "Invalid or inaccessible parent directory".to_string())?;
+        let canon_parent = parent.canonicalize().map_err(|_| "Invalid or inaccessible parent directory".to_string())?;
         match input.file_name() {
             Some(name) => canon_parent.join(name),
             None => canon_parent,
@@ -160,10 +151,7 @@ pub fn without_verbatim_prefix(path: &Path) -> PathBuf {
 }
 
 pub fn validate_user_path<P: AsRef<Path>>(input: P) -> Result<PathBuf, String> {
-    let canonical = input
-        .as_ref()
-        .canonicalize()
-        .map_err(|_| "Invalid or inaccessible path".to_string())?;
+    let canonical = input.as_ref().canonicalize().map_err(|_| "Invalid or inaccessible path".to_string())?;
     forbid_system_path(&canonical)
 }
 
@@ -172,15 +160,9 @@ pub fn validate_user_path<P: AsRef<Path>>(input: P) -> Result<PathBuf, String> {
 /// after both forbid_system_path passes.
 pub fn validate_user_write_target<P: AsRef<Path>>(input: P) -> Result<PathBuf, String> {
     let input = input.as_ref();
-    let parent = input
-        .parent()
-        .ok_or_else(|| "Path has no parent directory".to_string())?;
-    let file_name = input
-        .file_name()
-        .ok_or_else(|| "Path has no file name".to_string())?;
-    let canon_parent = parent
-        .canonicalize()
-        .map_err(|_| "Invalid or inaccessible parent directory".to_string())?;
+    let parent = input.parent().ok_or_else(|| "Path has no parent directory".to_string())?;
+    let file_name = input.file_name().ok_or_else(|| "Path has no file name".to_string())?;
+    let canon_parent = parent.canonicalize().map_err(|_| "Invalid or inaccessible parent directory".to_string())?;
     let candidate = canon_parent.join(file_name);
     // Run the canonical candidate through the substring check directly,
     // skipping the .canonicalize() inside forbid_system_path which would
@@ -240,12 +222,9 @@ mod tests {
         // canonicalization for not-yet-existing targets. If even that
         // fails (parent doesn't exist either), we still want the test
         // to verify the substring path; construct one that exists.
-        let user_profile = std::env::var("USERPROFILE")
-            .unwrap_or_else(|_| String::from(r"C:\Users\Default"));
-        let startup = format!(
-            r"{}\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\malicious.bat",
-            user_profile
-        );
+        let user_profile = std::env::var("USERPROFILE").unwrap_or_else(|_| String::from(r"C:\Users\Default"));
+        let startup =
+            format!(r"{}\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\malicious.bat", user_profile);
         let result = forbid_system_path(PathBuf::from(&startup));
         // If the path doesn't exist and the parent doesn't either, we
         // get "Invalid or inaccessible parent" — also a rejection.

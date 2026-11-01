@@ -287,7 +287,8 @@ fn guard_ownership(dir: PathBuf, mine: OwnerInfo) {
                 }
             }
             Check::Lost(other) => {
-                let other = other.map(|o| format!("{} pid {}", o.app, o.pid)).unwrap_or_else(|| "another process".into());
+                let other =
+                    other.map(|o| format!("{} pid {}", o.app, o.pid)).unwrap_or_else(|| "another process".into());
                 log(&dir, &format!("{other} holds the owner lock; this one steps down"));
                 // From now on engine calls go to that owner, and this
                 // process takes over only once it's gone.
@@ -460,7 +461,7 @@ impl Client {
             *conn = Some(BufReader::new(stream));
         }
         let result = (|| {
-            let reader = conn.as_mut().unwrap();
+            let reader = conn.as_mut().ok_or_else(|| "closed".to_string())?;
             let request = Request { token: self.info.token.clone(), op: op.to_string(), args };
             writeln!(reader.get_mut(), "{}", serde_json::to_string(&request).unwrap_or_default())
                 .map_err(|e| e.to_string())?;
@@ -509,7 +510,7 @@ fn attach(stale: Option<&Arc<Client>>) -> Option<Arc<Client>> {
         }
         // Another thread attached first: use its client.
         if let Some(current) = &st.client {
-            if stale.map_or(true, |s| !Arc::ptr_eq(current, s)) {
+            if stale.is_none_or(|s| !Arc::ptr_eq(current, s)) {
                 return Some(current.clone());
             }
         }
@@ -601,12 +602,16 @@ mod tests {
 
         // Our handle lost the lock and nobody holds it: taken again.
         held.unlock().unwrap();
-        let Check::Retaken(again) = check_ownership(&dir, me, Some(&held)) else { panic!("a free lock is taken again") };
+        let Check::Retaken(again) = check_ownership(&dir, me, Some(&held)) else {
+            panic!("a free lock is taken again")
+        };
         assert!(try_lock(&dir).is_none(), "and stays held");
 
         // Another owner holds it (here: `again`) and owner.json names it.
         write_owner_file(&dir, &info(222));
-        let Check::Lost(Some(other)) = check_ownership(&dir, me, Some(&held)) else { panic!("another owner is noticed") };
+        let Check::Lost(Some(other)) = check_ownership(&dir, me, Some(&held)) else {
+            panic!("another owner is noticed")
+        };
         assert_eq!(other.pid, 222);
 
         drop((held, again));
@@ -671,18 +676,28 @@ mod tests {
             .env("DASH_LINK_OWNER_DIR", &dir)
             .spawn()
             .unwrap();
-        let wait = |what: &dyn Fn() -> bool| (0..100).any(|_| what() || { std::thread::sleep(Duration::from_millis(100)); false });
+        let wait = |what: &dyn Fn() -> bool| {
+            (0..100).any(|_| {
+                what() || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    false
+                }
+            })
+        };
         assert!(wait(&|| owner(&dir).is_some()), "owner started");
 
         static TICKED: AtomicBool = AtomicBool::new(false);
         static TOOK_OVER: AtomicBool = AtomicBool::new(false);
-        let first = claim(&dir, "follower", || {}, Arc::new(|event: &str, _: Value| {
-            match event {
+        let first = claim(
+            &dir,
+            "follower",
+            || {},
+            Arc::new(|event: &str, _: Value| match event {
                 "tick" => TICKED.store(true, Ordering::SeqCst),
                 BECAME_OWNER_EVENT => TOOK_OVER.store(true, Ordering::SeqCst),
                 _ => {}
-            }
-        }));
+            }),
+        );
         assert_eq!(first, Role::Follower);
         assert_eq!(owner(&dir).map(|o| o.app).as_deref(), Some("owner"));
         assert_eq!(forward::<i64>("add", json!({ "a": 2, "b": 3 })), Some(Ok(5)));

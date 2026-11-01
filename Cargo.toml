@@ -11,6 +11,20 @@ edition = "2021"
 publish = false
 license = "GPL-3.0-or-later"
 
+# Correctness first (from BeautifulRust's set): what can panic, lose data in a
+# cast, or hide an unsafe assumption. Style and pedantic lints come later.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
 [workspace.dependencies]
 dash-core = { path = "crates/dash-core" }
 serde = { version = "1", features = ["derive"] }

@@ -44,14 +44,10 @@ const ICON_CACHE_DIR: &str = "launcher_icons_v3";
 
 /// Paths we already tried and failed to extract. Avoids hammering the shell
 /// for the same broken path across many overlay queries within a session.
-static FAILED_KEYS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static FAILED_KEYS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 fn icon_cache_dir(app: &dyn Host) -> Result<PathBuf, String> {
-    let dir = app
-        .data_dir()
-        .map_err(|e| format!("Cannot resolve app data directory: {e}"))?
-        .join(ICON_CACHE_DIR);
+    let dir = app.data_dir().map_err(|e| format!("Cannot resolve app data directory: {e}"))?.join(ICON_CACHE_DIR);
     fs::create_dir_all(&dir).map_err(|e| format!("Cannot create icon cache directory: {e}"))?;
     Ok(dir)
 }
@@ -70,51 +66,33 @@ fn hash_path(path: &str) -> String {
 /// Sanitize an extension for use as a filename component. Keeps it ASCII
 /// alphanumeric and bounded — defense against weird/long extensions.
 fn sanitize_extension(ext: &str) -> String {
-    ext.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(8)
-        .collect::<String>()
-        .to_lowercase()
+    ext.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect::<String>().to_lowercase()
 }
 
 /// Decide cache filename + classify how to extract.
 fn cache_classification(path: &str, kind: Option<&str>) -> Classification {
     let lower = path.to_lowercase();
-    let ext = std::path::Path::new(&lower)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(sanitize_extension)
-        .unwrap_or_default();
+    let ext =
+        std::path::Path::new(&lower).extension().and_then(|e| e.to_str()).map(sanitize_extension).unwrap_or_default();
 
     // Packaged (MSIX / Store) apps are checked FIRST: the frontend sends them
     // with kind="app" like any other launch target, but their "path" is a
     // `shell:AppsFolder\<AUMID>` handle that no filesystem-based extractor can
     // resolve. Unique cache key per app, same as a real exe.
     if crate::packaged_apps::is_packaged_launch_path(path) {
-        return Classification {
-            cache_key: hash_path(&lower),
-            mode: ExtractMode::Packaged,
-        };
+        return Classification { cache_key: hash_path(&lower), mode: ExtractMode::Packaged };
     }
 
     match kind {
-        Some("folder") => Classification {
-            cache_key: "_folder".to_string(),
-            mode: ExtractMode::Folder,
-        },
-        Some("file") if !ext.is_empty() => Classification {
-            cache_key: format!("_ext_{ext}"),
-            mode: ExtractMode::Extension(ext),
-        },
-        Some("file") => Classification {
-            cache_key: "_file_noext".to_string(),
-            mode: ExtractMode::Extension("dat".to_string()),
-        },
+        Some("folder") => Classification { cache_key: "_folder".to_string(), mode: ExtractMode::Folder },
+        Some("file") if !ext.is_empty() => {
+            Classification { cache_key: format!("_ext_{ext}"), mode: ExtractMode::Extension(ext) }
+        }
+        Some("file") => {
+            Classification { cache_key: "_file_noext".to_string(), mode: ExtractMode::Extension("dat".to_string()) }
+        }
         // "app" or unknown — treat as unique per path.
-        _ => Classification {
-            cache_key: hash_path(&lower),
-            mode: ExtractMode::RealPath,
-        },
+        _ => Classification { cache_key: hash_path(&lower), mode: ExtractMode::RealPath },
     }
 }
 
@@ -148,11 +126,7 @@ enum ExtractMode {
 // while SHGetFileInfoW did its work. Off-thread, the bounded blocking pool
 // resolves them in the background and icons fade in. (COM is initialized per
 // worker thread inside extract_icon_png, since SHGetFileInfoW requires it.)
-pub fn ensure_launcher_icon(
-    app: Arc<dyn Host>,
-    path: String,
-    kind: Option<String>,
-) -> Result<Option<String>, String> {
+pub fn ensure_launcher_icon(app: Arc<dyn Host>, path: String, kind: Option<String>) -> Result<Option<String>, String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -200,11 +174,7 @@ pub fn ensure_launcher_icon(
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
-    let tmp = path.with_extension(format!(
-        "{}-{}.tmp",
-        std::process::id(),
-        NEXT_TMP.fetch_add(1, Ordering::Relaxed)
-    ));
+    let tmp = path.with_extension(format!("{}-{}.tmp", std::process::id(), NEXT_TMP.fetch_add(1, Ordering::Relaxed)));
     let result = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -314,10 +284,10 @@ fn extract_icon_png(path: &str, mode: &ExtractMode) -> Option<Vec<u8>> {
     use windows::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES,
     };
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::Shell::{
         SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
     };
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 
     // SHGetFileInfoW requires COM on the calling thread. Now that
@@ -338,9 +308,7 @@ fn extract_icon_png(path: &str, mode: &ExtractMode) -> Option<Vec<u8>> {
     // the exe can't be resolved — the tile is a Start-menu asset with safe-area
     // padding, so it renders as a small mark in a 32px row.
     if matches!(mode, ExtractMode::Packaged) {
-        if let Some(exe) = crate::packaged_apps::resolve_packaged_exe(
-            path.trim_start_matches("shell:AppsFolder\\"),
-        ) {
+        if let Some(exe) = crate::packaged_apps::resolve_packaged_exe(path.trim_start_matches("shell:AppsFolder\\")) {
             if let Some(png) = extract_icon_png(&exe.to_string_lossy(), &ExtractMode::RealPath) {
                 return Some(png);
             }
@@ -359,11 +327,9 @@ fn extract_icon_png(path: &str, mode: &ExtractMode) -> Option<Vec<u8>> {
 
     // Build the input path string and the attribute/flag combination based on mode.
     let (query_string, attrs, flags) = match mode {
-        ExtractMode::RealPath => (
-            effective_path.to_string(),
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            SHGFI_ICON | SHGFI_LARGEICON,
-        ),
+        ExtractMode::RealPath => {
+            (effective_path.to_string(), FILE_FLAGS_AND_ATTRIBUTES(0), SHGFI_ICON | SHGFI_LARGEICON)
+        }
         ExtractMode::Folder => (
             // Dummy non-empty path — flag below tells Windows to ignore disk state.
             "folder".to_string(),
@@ -381,10 +347,7 @@ fn extract_icon_png(path: &str, mode: &ExtractMode) -> Option<Vec<u8>> {
         ExtractMode::Packaged => return None,
     };
 
-    let wide: Vec<u16> = query_string
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let wide: Vec<u16> = query_string.encode_utf16().chain(std::iter::once(0)).collect();
 
     // SAFETY: SHGetFileInfoW writes into our zeroed SHFILEINFOW; we DestroyIcon
     // the resulting hIcon before returning regardless of conversion success.
@@ -394,7 +357,7 @@ fn extract_icon_png(path: &str, mode: &ExtractMode) -> Option<Vec<u8>> {
             PCWSTR(wide.as_ptr()),
             attrs,
             Some(&mut info),
-            std::mem::size_of::<SHFILEINFOW>() as u32,
+            u32::try_from(std::mem::size_of::<SHFILEINFOW>()).expect("SHFILEINFOW is under 1 KB"),
             flags,
         );
         if result == 0 || info.hIcon.is_invalid() {
@@ -419,9 +382,7 @@ fn extract_icon_png(path: &str, mode: &ExtractMode) -> Option<Vec<u8>> {
 }
 
 #[cfg(windows)]
-fn extract_icon_pixels(
-    icon: windows::Win32::UI::WindowsAndMessaging::HICON,
-) -> Option<(Vec<u8>, u32, u32)> {
+fn extract_icon_pixels(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<(Vec<u8>, u32, u32)> {
     // The GDI pixel read moved to `hbitmap_to_rgba` (shared with the packaged
     // path), so this function only unpacks the icon's bitmaps and frees them.
     use windows::Win32::Graphics::Gdi::DeleteObject;
@@ -458,37 +419,32 @@ fn extract_icon_pixels(
 /// fringe. Classic HICONs pass `false` — that path predates this and its
 /// behavior is deliberately unchanged.
 #[cfg(windows)]
-fn hbitmap_to_rgba(
-    hbm: windows::Win32::Graphics::Gdi::HBITMAP,
-    unpremultiply: bool,
-) -> Option<(Vec<u8>, u32, u32)> {
+fn hbitmap_to_rgba(hbm: windows::Win32::Graphics::Gdi::HBITMAP, unpremultiply: bool) -> Option<(Vec<u8>, u32, u32)> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Gdi::{
-        GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-        DIB_RGB_COLORS,
+        GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
     };
 
     // SAFETY: GDI reads below are paired (DC acquired then released); we never
     // take ownership of `hbm`.
     unsafe {
         let mut bitmap: BITMAP = std::mem::zeroed();
-        let got = GetObjectW(
-            hbm,
-            std::mem::size_of::<BITMAP>() as i32,
-            Some(&mut bitmap as *mut _ as *mut _),
-        );
+        let bitmap_size = i32::try_from(std::mem::size_of::<BITMAP>()).expect("BITMAP is a few dozen bytes");
+        let got = GetObjectW(hbm, bitmap_size, Some(&mut bitmap as *mut _ as *mut _));
         if got == 0 {
             return None;
         }
 
-        let width = bitmap.bmWidth as u32;
-        let height = bitmap.bmHeight as u32;
+        // A negative size would turn into a huge buffer below; skip the icon.
+        let width = u32::try_from(bitmap.bmWidth).ok()?;
+        let height = u32::try_from(bitmap.bmHeight).ok()?;
         if width == 0 || height == 0 {
             return None;
         }
 
         let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biSize =
+            u32::try_from(std::mem::size_of::<BITMAPINFOHEADER>()).expect("BITMAPINFOHEADER is 40 bytes");
         bmi.bmiHeader.biWidth = width as i32;
         // Negative biHeight to get top-down rows — matches PNG's row order.
         bmi.bmiHeader.biHeight = -(height as i32);
@@ -500,15 +456,7 @@ fn hbitmap_to_rgba(
         let mut pixels = vec![0u8; row_bytes * (height as usize)];
 
         let hdc = GetDC(HWND(0));
-        let lines = GetDIBits(
-            hdc,
-            hbm,
-            0,
-            height,
-            Some(pixels.as_mut_ptr() as *mut _),
-            &mut bmi,
-            DIB_RGB_COLORS,
-        );
+        let lines = GetDIBits(hdc, hbm, 0, height, Some(pixels.as_mut_ptr() as *mut _), &mut bmi, DIB_RGB_COLORS);
         ReleaseDC(HWND(0), hdc);
 
         if lines == 0 {
@@ -533,8 +481,8 @@ fn hbitmap_to_rgba(
             for chunk in pixels.chunks_exact_mut(4) {
                 let a = chunk[3] as u32;
                 if a > 0 && a < 255 {
-                    for c in 0..3 {
-                        chunk[c] = ((chunk[c] as u32 * 255 + a / 2) / a).min(255) as u8;
+                    for channel in &mut chunk[..3] {
+                        *channel = ((*channel as u32 * 255 + a / 2) / a).min(255) as u8;
                     }
                 }
             }
@@ -570,15 +518,12 @@ fn extract_packaged_icon_png(path: &str) -> Option<Vec<u8>> {
     // SAFETY: read-only shell COM. The HBITMAP from GetImage is owned by us and
     // deleted below in every path.
     unsafe {
-        let factory: IShellItemImageFactory =
-            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+        let factory: IShellItemImageFactory = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
         // 256px, not 64: this path only runs for tiles that will then be CROPPED
         // to their safe area (see `trim_tile_safe_area`). A 64px tile whose mark
         // is 25% wide crops to ~17px, which upscales into mush at a 20px row.
         // Asking for 256 leaves ~68px after the crop — sharp at any row size.
-        let hbm = factory
-            .GetImage(SIZE { cx: 256, cy: 256 }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK)
-            .ok()?;
+        let hbm = factory.GetImage(SIZE { cx: 256, cy: 256 }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK).ok()?;
 
         let pixels = hbitmap_to_rgba(hbm, true);
         let _ = DeleteObject(hbm);
@@ -658,12 +603,7 @@ fn glyph_bounds(img: &image::RgbaImage) -> Option<(u32, u32, u32, u32)> {
     }
     // Border colour = the four corners, if they agree. Transparent counts as a
     // colour here (alpha 0), which covers the classic padded-transparent case.
-    let corners = [
-        img.get_pixel(0, 0),
-        img.get_pixel(w - 1, 0),
-        img.get_pixel(0, h - 1),
-        img.get_pixel(w - 1, h - 1),
-    ];
+    let corners = [img.get_pixel(0, 0), img.get_pixel(w - 1, 0), img.get_pixel(0, h - 1), img.get_pixel(w - 1, h - 1)];
     let bg = *corners[0];
     let uniform = corners.iter().all(|p| similar(p.0, bg.0));
     if !uniform {
@@ -694,9 +634,7 @@ fn similar(a: [u8; 4], b: [u8; 4]) -> bool {
     if a[3] < 8 && b[3] < 8 {
         return true;
     }
-    a.iter()
-        .zip(b.iter())
-        .all(|(p, q)| (*p as i16 - *q as i16).abs() <= 12)
+    a.iter().zip(b.iter()).all(|(p, q)| (*p as i16 - *q as i16).abs() <= 12)
 }
 
 #[cfg(all(windows, test))]
@@ -738,25 +676,15 @@ mod tests {
         let c = cache_classification("shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App", Some("app"));
         assert!(matches!(c.mode, ExtractMode::Packaged));
         // Unique per app, so two Store apps can't share a cached icon.
-        let other =
-            cache_classification("shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude", Some("app"));
+        let other = cache_classification("shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude", Some("app"));
         assert_ne!(c.cache_key, other.cache_key);
     }
 
     #[test]
     fn classic_paths_are_unaffected_by_the_packaged_branch() {
-        assert!(matches!(
-            cache_classification(r"C:\Windows\notepad.exe", Some("app")).mode,
-            ExtractMode::RealPath
-        ));
-        assert!(matches!(
-            cache_classification("anything", Some("folder")).mode,
-            ExtractMode::Folder
-        ));
-        assert!(matches!(
-            cache_classification("report.docx", Some("file")).mode,
-            ExtractMode::Extension(_)
-        ));
+        assert!(matches!(cache_classification(r"C:\Windows\notepad.exe", Some("app")).mode, ExtractMode::RealPath));
+        assert!(matches!(cache_classification("anything", Some("folder")).mode, ExtractMode::Folder));
+        assert!(matches!(cache_classification("report.docx", Some("file")).mode, ExtractMode::Extension(_)));
     }
 
     /// Extracts real artwork for every packaged app installed on this machine.
@@ -798,17 +726,11 @@ mod tests {
                     // `glyph_bounds` (not `opaque_bounds`) is the number that
                     // matters: a tile with an opaque plate is 100% "opaque" while
                     // its actual mark fills a fraction of the canvas.
-                    let (x0, y0, x1, y1) =
-                        glyph_bounds(&rgba).unwrap_or((0, 0, img.width() - 1, img.height() - 1));
+                    let (x0, y0, x1, y1) = glyph_bounds(&rgba).unwrap_or((0, 0, img.width() - 1, img.height() - 1));
                     let _ = opaque_bounds(&rgba);
                     let fill = ((x1 - x0 + 1) * 100) / img.width();
-                    let via = if crate::packaged_apps::resolve_packaged_exe(&app.aumid)
-                        .is_some()
-                    {
-                        "exe"
-                    } else {
-                        "tile"
-                    };
+                    let via =
+                        if crate::packaged_apps::resolve_packaged_exe(&app.aumid).is_some() { "exe" } else { "tile" };
                     println!(
                         "  OK  {:<24} {}x{}  glyph {}x{} = {}% of width   [via {}]",
                         app.name,
@@ -846,10 +768,7 @@ mod tests {
         assert_eq!(&png[..4], b"\x89PNG");
         let img = image::load_from_memory(&png).expect("undecodable classic icon PNG");
         assert!(img.width() >= 16 && img.height() >= 16);
-        assert!(
-            img.to_rgba8().pixels().any(|p| p.0[3] != 0),
-            "classic icon came out fully transparent"
-        );
+        assert!(img.to_rgba8().pixels().any(|p| p.0[3] != 0), "classic icon came out fully transparent");
         println!("classic icon OK: {}x{}", img.width(), img.height());
     }
 }

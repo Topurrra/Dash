@@ -68,15 +68,13 @@ pub fn set_model_dir(dir: PathBuf) {
 /// the program. The fallback matters for the index workers — separate
 /// processes that never run the app's setup, yet embed every document.
 fn model_dir() -> Option<PathBuf> {
-    MODEL_DIR
-        .get()
-        .cloned()
-        .or_else(|| Some(std::env::current_exe().ok()?.parent()?.join("embedding-runtime")))
+    MODEL_DIR.get().cloned().or_else(|| Some(std::env::current_exe().ok()?.parent()?.join("embedding-runtime")))
 }
 
 /// Whether the model files are there (cheap; doesn't load the model).
 pub fn model_files_present() -> bool {
-    model_dir().is_some_and(|dir| dir.join("tokenizer.json").is_file() && dir.join("onnx").join("model_q4.onnx").is_file())
+    model_dir()
+        .is_some_and(|dir| dir.join("tokenizer.json").is_file() && dir.join("onnx").join("model_q4.onnx").is_file())
 }
 
 /// Split a document into overlapping word-window passages for per-chunk
@@ -96,17 +94,14 @@ pub fn chunk_text(text: &str, target_words: usize, overlap: usize, max_chunks: u
     }
     let step = target_words.saturating_sub(overlap).max(1);
     let mut starts: Vec<usize> = (0..words.len()).step_by(step).collect();
-    if starts.len() >= 2 {
-        let last = *starts.last().unwrap();
+    if let [_, .., last] = starts[..] {
         if words.len().saturating_sub(last) <= overlap {
             starts.pop();
         }
     }
     if starts.len() > max_chunks {
         let n = starts.len();
-        let picked: Vec<usize> = (0..max_chunks)
-            .map(|i| starts[i * (n - 1) / (max_chunks - 1).max(1)])
-            .collect();
+        let picked: Vec<usize> = (0..max_chunks).map(|i| starts[i * (n - 1) / (max_chunks - 1).max(1)]).collect();
         starts = picked;
         starts.dedup();
     }
@@ -135,8 +130,7 @@ mod imp {
         tokenizer: Tokenizer,
     }
 
-    static MODEL: LazyLock<Mutex<Option<EmbedModel>>> =
-        LazyLock::new(|| Mutex::new(load_model()));
+    static MODEL: LazyLock<Mutex<Option<EmbedModel>>> = LazyLock::new(|| Mutex::new(load_model()));
 
     fn load_model() -> Option<EmbedModel> {
         let dir = model_dir()?;
@@ -154,18 +148,14 @@ mod imp {
                 return None;
             }
         };
-        tokenizer
-            .with_padding(Some(tokenizers::PaddingParams::default()));
-        if let Err(e) = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
-            max_length: 2048,
-            ..Default::default()
-        })) {
+        tokenizer.with_padding(Some(tokenizers::PaddingParams::default()));
+        if let Err(e) =
+            tokenizer.with_truncation(Some(tokenizers::TruncationParams { max_length: 2048, ..Default::default() }))
+        {
             eprintln!("embedding: failed to set truncation ({e}); continuing anyway.");
         }
 
-        let Some(env) = super::ort_environment() else {
-            return None;
-        };
+        let env = super::ort_environment()?;
         let session = match Session::builder(env).and_then(|mut b| b.commit_from_file(&model_path)) {
             Ok(s) => s,
             Err(e) => {
@@ -204,30 +194,25 @@ mod imp {
                 mask_flat.extend(enc.get_attention_mask().iter().map(|&m| m as i64));
             }
 
-            let input_ids = Tensor::<i64>::from_array((
-                [batch_size, seq_len],
-                ids_flat.into_boxed_slice(),
-            )).ok()?;
-            let attention_mask = Tensor::<i64>::from_array((
-                [batch_size, seq_len],
-                mask_flat.into_boxed_slice(),
-            )).ok()?;
+            let input_ids = Tensor::<i64>::from_array(([batch_size, seq_len], ids_flat.into_boxed_slice())).ok()?;
+            let attention_mask =
+                Tensor::<i64>::from_array(([batch_size, seq_len], mask_flat.into_boxed_slice())).ok()?;
 
-            let outputs = model.session.run(
-                ort::inputs![
+            let outputs = model
+                .session
+                .run(ort::inputs![
                     "input_ids" => input_ids,
                     "attention_mask" => attention_mask,
                     "image_features" => make_empty_features().ok()?,
                     "video_features" => make_empty_features().ok()?,
                     "audio_features" => make_empty_features().ok()?
-                ]
-            ).ok()?;
-
-            let (shape, data) = outputs["sentence_embedding"]
-                .try_extract_tensor::<f32>()
+                ])
                 .ok()?;
 
-            let out_dim = if shape.len() == 2 { shape[1] as usize } else { 0 };
+            let (shape, data) = outputs["sentence_embedding"].try_extract_tensor::<f32>().ok()?;
+
+            // A negative or huge dimension is just "not the expected one".
+            let out_dim = if shape.len() == 2 { usize::try_from(shape[1]).unwrap_or(0) } else { 0 };
             if out_dim != EMBED_DIM {
                 eprintln!("embedding: unexpected output dim {out_dim}, expected {EMBED_DIM}");
                 return None;
@@ -306,11 +291,7 @@ pub fn embed(text: &str) -> Option<Vec<f32>> {
 /// be shorter than the input — callers pair vectors with chunks by filtering
 /// the same way.
 pub fn embed_batch(texts: &[String]) -> Option<Vec<Vec<f32>>> {
-    let trimmed: Vec<&str> = texts
-        .iter()
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .collect();
+    let trimmed: Vec<&str> = texts.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
     if trimmed.is_empty() {
         return Some(Vec::new());
     }
@@ -392,9 +373,6 @@ mod tests {
         };
         let related = cos(&vecs[0], &vecs[1]);
         let unrelated = cos(&vecs[0], &vecs[2]);
-        assert!(
-            related > unrelated + 0.10,
-            "embedding quality too low: related={related:.3} unrelated={unrelated:.3}"
-        );
+        assert!(related > unrelated + 0.10, "embedding quality too low: related={related:.3} unrelated={unrelated:.3}");
     }
 }

@@ -26,7 +26,6 @@ use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-
 use super::local_db;
 
 /// Follower: run this call on the owner instead (see `dash_core::link`).
@@ -80,32 +79,21 @@ pub struct FrecencyData {
 
 impl Default for FrecencyData {
     fn default() -> Self {
-        Self {
-            version: 1,
-            entries: HashMap::new(),
-        }
+        Self { version: 1, entries: HashMap::new() }
     }
 }
 
 /// In-memory mirror of the on-disk data. Loaded lazily on first access; every
 /// write keeps both the memory copy and the disk copy in sync.
-static FRECENCY_CACHE: LazyLock<Mutex<Option<FrecencyData>>> =
-    LazyLock::new(|| Mutex::new(None));
+static FRECENCY_CACHE: LazyLock<Mutex<Option<FrecencyData>>> = LazyLock::new(|| Mutex::new(None));
 
 fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
 }
 
 fn frecency_paths(app: &dyn dash_core::Host) -> Result<(PathBuf, PathBuf, String), String> {
-    let dir = app
-        .data_dir()
-        .map_err(|e| format!("Cannot resolve app data directory: {e}"))?
-        .join(PREFERENCES_DIR);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Cannot create preferences directory: {e}"))?;
+    let dir = app.data_dir().map_err(|e| format!("Cannot resolve app data directory: {e}"))?.join(PREFERENCES_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create preferences directory: {e}"))?;
     let json_path = dir.join(FRECENCY_FILE);
     let db_path = local_db::database_path_for_dir(&dir);
     Ok((json_path, db_path, FRECENCY_FILE.to_string()))
@@ -139,8 +127,7 @@ fn load(app: &dyn dash_core::Host) -> FrecencyData {
 fn read_stored(app: &dyn dash_core::Host) -> FrecencyData {
     match frecency_paths(app) {
         Ok((_json_path, db_path, key)) => {
-            local_db::read_json_or_default(&db_path, &key, FrecencyData::default())
-                .unwrap_or_default()
+            local_db::read_json_or_default(&db_path, &key, FrecencyData::default()).unwrap_or_default()
         }
         Err(_) => FrecencyData::default(),
     }
@@ -148,15 +135,18 @@ fn read_stored(app: &dyn dash_core::Host) -> FrecencyData {
 
 fn persist(app: &dyn dash_core::Host, data: &FrecencyData) -> Result<(), String> {
     let (_json_path, db_path, key) = frecency_paths(app)?;
-    let bytes = serde_json::to_vec(data)
-        .map_err(|e| format!("Cannot serialize frecency data: {e}"))?;
+    let bytes = serde_json::to_vec(data).map_err(|e| format!("Cannot serialize frecency data: {e}"))?;
     local_db::write_json_bytes(&db_path, &key, &bytes)
 }
 
 /// Record a single activation. Called from the same place we launch/open
 /// the underlying entry. Persists synchronously so a crash before the next
 /// boot doesn't lose the data — writes are cheap (~1ms via redb).
-pub fn record_frecency_launch(app: std::sync::Arc<dyn dash_core::Host>, kind: String, path: String) -> Result<(), String> {
+pub fn record_frecency_launch(
+    app: std::sync::Arc<dyn dash_core::Host>,
+    kind: String,
+    path: String,
+) -> Result<(), String> {
     on_owner!("record_frecency_launch", { "kind": kind, "path": path });
     if path.trim().is_empty() {
         return Ok(());
@@ -167,9 +157,7 @@ pub fn record_frecency_launch(app: std::sync::Arc<dyn dash_core::Host>, kind: St
 
     // One lock across read-modify-persist, so two launches at once can't
     // drop each other's update.
-    let mut guard = FRECENCY_CACHE
-        .lock()
-        .map_err(|_| "Frecency cache lock failed".to_string())?;
+    let mut guard = FRECENCY_CACHE.lock().map_err(|_| "Frecency cache lock failed".to_string())?;
     let mut data = match guard.as_ref() {
         Some(data) => data.clone(),
         None => read_stored(app.as_ref()),
@@ -187,11 +175,8 @@ pub fn record_frecency_launch(app: std::sync::Arc<dyn dash_core::Host>, kind: St
 
     // Bound the table size — drop the oldest-by-last-launch entries when over cap.
     if data.entries.len() > MAX_ENTRIES {
-        let mut sorted: Vec<(String, u128)> = data
-            .entries
-            .iter()
-            .map(|(k, v)| (k.clone(), v.last_launched_ms))
-            .collect();
+        let mut sorted: Vec<(String, u128)> =
+            data.entries.iter().map(|(k, v)| (k.clone(), v.last_launched_ms)).collect();
         sorted.sort_by_key(|&(_, ms)| ms);
         let to_drop = data.entries.len() - MAX_ENTRIES;
         for (k, _) in sorted.into_iter().take(to_drop) {
@@ -206,6 +191,10 @@ pub fn record_frecency_launch(app: std::sync::Arc<dyn dash_core::Host>, kind: St
 
 /// Compute the boost an individual entry contributes to a base score.
 /// Public so search.rs can apply it when ranking results.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "ln(count + 1) * a 0..=1 decay * 2 stays under 100, so f64 to f32 only drops precision"
+)]
 pub fn compute_boost(entry: &FrecencyEntry, now: u128) -> f32 {
     let age_ms = now.saturating_sub(entry.last_launched_ms) as f64;
     let age_days = age_ms / (1000.0 * 60.0 * 60.0 * 24.0);
@@ -218,10 +207,7 @@ pub fn compute_boost(entry: &FrecencyEntry, now: u128) -> f32 {
 /// Returns 0.0 if the path has never been activated.
 pub fn boost_for(data: &FrecencyData, kind: &str, path: &str, now: u128) -> f32 {
     let key = make_key(kind, path);
-    data.entries
-        .get(&key)
-        .map(|entry| compute_boost(entry, now))
-        .unwrap_or(0.0)
+    data.entries.get(&key).map(|entry| compute_boost(entry, now)).unwrap_or(0.0)
 }
 
 /// Snapshot of the current data + a reference timestamp — passed to per-result
@@ -239,10 +225,7 @@ impl FrecencySnapshot {
 
 /// Helper used by search code — load once, boost many results.
 pub fn snapshot(app: &dyn dash_core::Host) -> FrecencySnapshot {
-    FrecencySnapshot {
-        data: load(app),
-        now_ms: now_ms(),
-    }
+    FrecencySnapshot { data: load(app), now_ms: now_ms() }
 }
 
 /// An item returned by `get_recent_items`. Sorted client-side, presented
@@ -298,35 +281,25 @@ pub fn get_recent_items(app: std::sync::Arc<dyn dash_core::Host>, limit_per_kind
         };
         // Use the original-case path for display when available, falling back
         // to the lowercase key path for entries written before that field existed.
-        let display_path = if entry.original_path.is_empty() {
-            lowercase_path.to_string()
-        } else {
-            entry.original_path.clone()
-        };
+        let display_path =
+            if entry.original_path.is_empty() { lowercase_path.to_string() } else { entry.original_path.clone() };
         let display_name = derive_display_name(kind, &display_path);
         let score = compute_boost(entry, now);
-        by_kind
-            .entry(kind.to_string())
-            .or_default()
-            .push(RecentItem {
-                kind: kind.to_string(),
-                path: display_path,
-                display_name,
-                launch_count: entry.launch_count,
-                last_launched_ms: entry.last_launched_ms,
-                score,
-                size_bytes: None,
-                modified_ms: None,
-            });
+        by_kind.entry(kind.to_string()).or_default().push(RecentItem {
+            kind: kind.to_string(),
+            path: display_path,
+            display_name,
+            launch_count: entry.launch_count,
+            last_launched_ms: entry.last_launched_ms,
+            score,
+            size_bytes: None,
+            modified_ms: None,
+        });
     }
 
     // Sort each bucket by score (frecency) descending, then truncate.
     for items in by_kind.values_mut() {
-        items.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        items.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         items.truncate(limit);
     }
 
@@ -344,9 +317,7 @@ pub fn get_recent_items(app: std::sync::Arc<dyn dash_core::Host>, limit_per_kind
                 Ok(metadata) => {
                     item.size_bytes = Some(metadata.len());
                     if let Ok(modified) = metadata.modified() {
-                        if let Ok(duration) =
-                            modified.duration_since(std::time::UNIX_EPOCH)
-                        {
+                        if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
                             item.modified_ms = Some(duration.as_millis());
                         }
                     }
@@ -381,15 +352,9 @@ fn derive_display_name(kind: &str, path: &str) -> String {
     }
     let path_buf = std::path::Path::new(path);
     let stem_or_name = if kind == "app" {
-        path_buf
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
+        path_buf.file_stem().and_then(|s| s.to_str()).map(str::to_string)
     } else {
-        path_buf
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
+        path_buf.file_name().and_then(|s| s.to_str()).map(str::to_string)
     };
     stem_or_name.unwrap_or_else(|| path.to_string())
 }
@@ -407,10 +372,7 @@ pub fn get_frecency_boosts(app: std::sync::Arc<dyn dash_core::Host>, kind: Strin
     let prefix = format!("{}:", kind.to_lowercase());
     data.entries
         .iter()
-        .filter_map(|(k, entry)| {
-            k.strip_prefix(&prefix)
-                .map(|path| (path.to_string(), compute_boost(entry, now)))
-        })
+        .filter_map(|(k, entry)| k.strip_prefix(&prefix).map(|path| (path.to_string(), compute_boost(entry, now))))
         .collect()
 }
 

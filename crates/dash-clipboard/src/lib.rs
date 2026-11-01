@@ -116,7 +116,7 @@ const MAX_ENTRY_BYTES: usize = 256 * 1024; // 256 KB
 
 /// How long we wait after a mutation before actually writing the JSON file.
 /// Coalesces rapid changes (e.g. paste-loop workflows) into one disk write.
-const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+const SAVE_DEBOUNCE_MS: i64 = 500;
 
 /// Tauri event name. Emitted whenever the history changes for any reason —
 /// new capture, pin/unpin, delete, clear, exclusion edit, pause/resume.
@@ -366,10 +366,7 @@ impl Default for State {
             next_id: 0,
             // Lowercased copies of DEFAULT_EXCLUSIONS — overwritten on
             // load_exclusions_from_disk() if the user has saved custom list.
-            exclusions: DEFAULT_EXCLUSIONS
-                .iter()
-                .map(|s| s.to_lowercase())
-                .collect(),
+            exclusions: DEFAULT_EXCLUSIONS.iter().map(|s| s.to_lowercase()).collect(),
             paused: false,
             suppress_next: false,
             retention_days: DEFAULT_RETENTION_DAYS,
@@ -424,7 +421,10 @@ static HISTORY_SAVE_BLOCKED: AtomicBool = AtomicBool::new(false);
 /// documented v1 "every image copy is its own entry" decision. If we ever do
 /// want true image dedup, the upgrade path is a hash field on ClipboardEntry
 /// (schema bump + migration) rather than widening this window.
-static LAST_IMAGE: OnceLock<Mutex<Option<([u8; 32], i64)>>> = OnceLock::new();
+static LAST_IMAGE: OnceLock<Mutex<Option<ImageStamp>>> = OnceLock::new();
+
+/// BLAKE3 digest of an image + the `now_ms()` it was captured at.
+type ImageStamp = ([u8; 32], i64);
 
 /// How close together two identical images must land to count as one copy.
 /// The real bursts are milliseconds apart; 2s is slack for a slow machine
@@ -439,7 +439,7 @@ fn recovery_notice() -> &'static Mutex<Option<String>> {
     RECOVERY_NOTICE.get_or_init(|| Mutex::new(None))
 }
 
-fn last_image() -> &'static Mutex<Option<([u8; 32], i64)>> {
+fn last_image() -> &'static Mutex<Option<ImageStamp>> {
     LAST_IMAGE.get_or_init(|| Mutex::new(None))
 }
 
@@ -451,9 +451,7 @@ fn last_image() -> &'static Mutex<Option<([u8; 32], i64)>> {
 fn is_duplicate_image_burst(bytes: &[u8]) -> bool {
     let digest = *blake3::hash(bytes).as_bytes();
     let now = now_ms();
-    let mut guard = last_image()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = last_image().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let dup = matches!(*guard, Some((prev, ts)) if prev == digest && now - ts < IMAGE_BURST_WINDOW_MS);
     *guard = Some((digest, now));
     dup
@@ -468,9 +466,7 @@ fn is_duplicate_image_burst(bytes: &[u8]) -> bool {
 /// one rare panic permanently breaks every clipboard command for the
 /// rest of the session.
 fn locked_state() -> std::sync::MutexGuard<'static, State> {
-    state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    state().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Largest index <= `max` that is a UTF-8 char boundary in `s`.
@@ -496,10 +492,9 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    // i64 milliseconds last ~290 million years; saturate rather than wrap
+    // if the clock is ever absurd.
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)).unwrap_or(0)
 }
 
 fn emit_history_updated() {
@@ -541,20 +536,16 @@ fn categorize(text: &str) -> Category {
     }
 
     // Single-line single-token email — strict-ish: must have @ and a TLD.
-    if !trimmed.contains(char::is_whitespace) && trimmed.contains('@') {
-        if looks_like_email(trimmed) {
-            return Category::Email;
-        }
+    if !trimmed.contains(char::is_whitespace) && trimmed.contains('@') && looks_like_email(trimmed) {
+        return Category::Email;
     }
 
     // JSON — wraps the whole content in {} or []. Doesn't fully parse but
     // checks structural balance to avoid false positives on `{not json}`.
-    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
-        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    if ((trimmed.starts_with('{') && trimmed.ends_with('}')) || (trimmed.starts_with('[') && trimmed.ends_with(']')))
+        && looks_like_json(trimmed)
     {
-        if looks_like_json(trimmed) {
-            return Category::Json;
-        }
+        return Category::Json;
     }
 
     // CSS color — hex shorthand/full, rgb/rgba/hsl/hsla functions.
@@ -682,10 +673,7 @@ fn looks_like_file_path(s: &str) -> bool {
     }
     let bytes = s.as_bytes();
     // Windows drive letter: C:\ or D:/
-    if bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/')
     {
         return true;
     }
@@ -745,9 +733,29 @@ fn looks_like_code(s: &str) -> bool {
         return false;
     }
     let signals: &[&str] = &[
-        "{", "}", "();", "();\n", "fn ", "def ", "function ", "class ", "import ",
-        "const ", "let ", "var ", "return ", "if (", "if(", "for (", "for(", "//", "/*",
-        "#include", "package ", "public ", "private ",
+        "{",
+        "}",
+        "();",
+        "();\n",
+        "fn ",
+        "def ",
+        "function ",
+        "class ",
+        "import ",
+        "const ",
+        "let ",
+        "var ",
+        "return ",
+        "if (",
+        "if(",
+        "for (",
+        "for(",
+        "//",
+        "/*",
+        "#include",
+        "package ",
+        "public ",
+        "private ",
     ];
     signals.iter().filter(|sig| s.contains(*sig)).count() >= 1
 }
@@ -755,10 +763,7 @@ fn looks_like_code(s: &str) -> bool {
 // ─── Persistence ─────────────────────────────────────────────────────────
 
 fn preferences_dir(app: &dyn Host) -> Result<PathBuf, String> {
-    let dir = app
-        .data_dir()
-        .map_err(|e| format!("app_data_dir lookup failed: {e}"))?
-        .join(PREFERENCES_SUBDIR);
+    let dir = app.data_dir().map_err(|e| format!("app_data_dir lookup failed: {e}"))?.join(PREFERENCES_SUBDIR);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create preferences dir: {e}"))?;
     Ok(dir)
 }
@@ -775,10 +780,7 @@ fn exclusions_path(app: &dyn Host) -> Result<PathBuf, String> {
 /// Distinct from preferences/ so the user (or an "Erase clipboard images"
 /// command in the future) can wipe just images without losing config.
 fn image_storage_dir(app: &dyn Host) -> Result<PathBuf, String> {
-    let dir = app
-        .data_dir()
-        .map_err(|e| format!("app_data_dir lookup failed: {e}"))?
-        .join(IMAGE_STORAGE_SUBDIR);
+    let dir = app.data_dir().map_err(|e| format!("app_data_dir lookup failed: {e}"))?.join(IMAGE_STORAGE_SUBDIR);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create image dir: {e}"))?;
     Ok(dir)
 }
@@ -792,16 +794,10 @@ fn delete_image_file_for_entry(entry: &ClipboardEntry) {
     if !matches!(entry.kind, EntryKind::Image) {
         return;
     }
-    for path in [entry.image_path.as_ref(), entry.thumbnail_path.as_ref()]
-        .into_iter()
-        .flatten()
-    {
+    for path in [entry.image_path.as_ref(), entry.thumbnail_path.as_ref()].into_iter().flatten() {
         if let Err(error) = std::fs::remove_file(path) {
             if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "clipboard_history: could not delete image file {:?}: {error}",
-                    path
-                );
+                eprintln!("clipboard_history: could not delete image file {:?}: {error}", path);
             }
         }
     }
@@ -811,7 +807,7 @@ fn delete_image_file_for_entry(entry: &ClipboardEntry) {
 /// window collapse into a single write — important for rapid-copy workflows
 /// that would otherwise hammer the filesystem.
 fn schedule_save() {
-    let deadline = now_ms() + SAVE_DEBOUNCE.as_millis() as i64;
+    let deadline = now_ms() + SAVE_DEBOUNCE_MS;
     SAVE_DEADLINE.store(deadline, Ordering::SeqCst);
 }
 
@@ -826,9 +822,7 @@ fn run_save_thread(app: Arc<dyn Host>) {
 
         // Time-based retention sweep — independent of any save deadline so
         // a mostly-idle app still trims old entries on schedule.
-        if u128::try_from(now_ms() - last_sweep_at_ms).unwrap_or(0)
-            >= RETENTION_SWEEP_INTERVAL.as_millis()
-        {
+        if u128::try_from(now_ms() - last_sweep_at_ms).unwrap_or(0) >= RETENTION_SWEEP_INTERVAL.as_millis() {
             last_sweep_at_ms = now_ms();
             if run_retention_sweep() {
                 // Sweep removed something → flush soon. Don't block here.
@@ -847,10 +841,7 @@ fn run_save_thread(app: Arc<dyn Host>) {
         // Race: another mutation may bump the deadline between our load and
         // the swap. CompareExchange ensures we only consume *this* deadline;
         // a fresh mutation re-sets it and we'll handle that on the next tick.
-        if SAVE_DEADLINE
-            .compare_exchange(deadline, 0, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+        if SAVE_DEADLINE.compare_exchange(deadline, 0, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             continue;
         }
         flush_to_disk(&app);
@@ -895,16 +886,10 @@ fn run_retention_sweep() -> bool {
         let image_retention = guard.image_retention_days;
 
         let now = now_ms();
-        let text_cutoff = if text_retention > 0 {
-            Some(now - (text_retention as i64) * 24 * 60 * 60 * 1000)
-        } else {
-            None
-        };
-        let image_cutoff = if image_retention > 0 {
-            Some(now - (image_retention as i64) * 24 * 60 * 60 * 1000)
-        } else {
-            None
-        };
+        let text_cutoff =
+            if text_retention > 0 { Some(now - (text_retention as i64) * 24 * 60 * 60 * 1000) } else { None };
+        let image_cutoff =
+            if image_retention > 0 { Some(now - (image_retention as i64) * 24 * 60 * 60 * 1000) } else { None };
         // Entries the scanner flagged as sensitive expire on a short window
         // regardless of the general retention setting — long enough to paste
         // a copied secret, short enough not to hoard credentials.
@@ -1100,9 +1085,7 @@ fn load_from_disk(app: &dyn Host) {
                     drop(guard);
                     schedule_save();
                 }
-            } else if let Ok(entries) =
-                serde_json::from_slice::<Vec<ClipboardEntry>>(&bytes)
-            {
+            } else if let Ok(entries) = serde_json::from_slice::<Vec<ClipboardEntry>>(&bytes) {
                 // Legacy bare-array file from Phase 1 — keep the entries,
                 // leave retention at the default.
                 let mut guard = locked_state();
@@ -1116,8 +1099,7 @@ fn load_from_disk(app: &dyn Host) {
                 // overwrite it: the bytes are preserved for inspection / manual
                 // recovery, the daemon does not crash, and clipboard history
                 // simply starts empty.
-                let quarantine =
-                    path.with_file_name(format!("history.corrupt-{}.json", now_ms()));
+                let quarantine = path.with_file_name(format!("history.corrupt-{}.json", now_ms()));
                 match std::fs::rename(&path, &quarantine) {
                     Ok(()) => {
                         eprintln!(
@@ -1131,9 +1113,7 @@ fn load_from_disk(app: &dyn Host) {
                             .and_then(|n| n.to_str())
                             .unwrap_or("history.corrupt.json")
                             .to_string();
-                        *recovery_notice()
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name);
+                        *recovery_notice().lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name);
                     }
                     Err(error) => {
                         eprintln!(
@@ -1247,10 +1227,7 @@ fn sweep_orphan_image_files(app: &dyn Host) {
         // because the disk-budget enforcer counts referenced entries and an
         // orphan is by definition unreferenced. Keep in sync with the `ext`
         // mapping in push_image_entry.
-        let is_ours = matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("png" | "jpg" | "gif" | "webp" | "bmp")
-        );
+        let is_ours = matches!(path.extension().and_then(|e| e.to_str()), Some("png" | "jpg" | "gif" | "webp" | "bmp"));
         if !is_ours {
             continue;
         }
@@ -1258,10 +1235,8 @@ fn sweep_orphan_image_files(app: &dyn Host) {
             Ok(p) => p,
             Err(_) => continue,
         };
-        if !referenced.contains(&canonical) {
-            if std::fs::remove_file(&canonical).is_ok() {
-                deleted += 1;
-            }
+        if !referenced.contains(&canonical) && std::fs::remove_file(&canonical).is_ok() {
+            deleted += 1;
         }
     }
 
@@ -1314,10 +1289,8 @@ fn on_clipboard_change() {
             if text.len() > MAX_ENTRY_BYTES {
                 text.truncate(floor_char_boundary(&text, MAX_ENTRY_BYTES));
             }
-            let sensitive_kinds: Vec<String> = sensitive_scan::scan_text(&text)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect();
+            let sensitive_kinds: Vec<String> =
+                sensitive_scan::scan_text(&text).into_iter().map(|s| s.to_string()).collect();
             let category = categorize(&text);
             push_text_entry(text, source_app, source_app_path, sensitive_kinds, category);
             schedule_save();
@@ -1350,12 +1323,7 @@ fn on_clipboard_change() {
             let jpeg_id = registered_format(&FORMAT_JPEG, "image/jpeg");
             let webp_id = registered_format(&FORMAT_WEBP, "image/webp");
 
-            let candidates: &[(u32, &str)] = &[
-                (gif_id, "gif"),
-                (png_id, "png"),
-                (jpeg_id, "jpeg"),
-                (webp_id, "webp"),
-            ];
+            let candidates: &[(u32, &str)] = &[(gif_id, "gif"), (png_id, "png"), (jpeg_id, "jpeg"), (webp_id, "webp")];
 
             for &(fmt_id, ext) in candidates {
                 if let Some(bytes) = read_clipboard_raw_bytes(fmt_id) {
@@ -1388,16 +1356,12 @@ fn on_clipboard_change() {
                             return;
                         }
                         Err(error) => {
-                            eprintln!(
-                                "clipboard_history: failed to read dropped file {:?}: {error}",
-                                path
-                            );
+                            eprintln!("clipboard_history: failed to read dropped file {:?}: {error}", path);
                             // Try the next path (multi-file copy).
                         }
                     }
                 }
             }
-
         }
 
         // Final fallback: CF_DIB (BMP-style bitmap → transcoded to PNG).
@@ -1454,15 +1418,13 @@ fn is_excluded(app_name: Option<&str>) -> bool {
 #[cfg(windows)]
 fn clipboard_marked_no_capture() -> bool {
     use windows::Win32::System::DataExchange::IsClipboardFormatAvailable;
-    let format_id = registered_format(
-        &FORMAT_EXCLUDE_MONITOR,
-        "ExcludeClipboardContentFromMonitorProcessing",
-    );
+    let format_id = registered_format(&FORMAT_EXCLUDE_MONITOR, "ExcludeClipboardContentFromMonitorProcessing");
     if format_id == 0 {
         return false;
     }
     // IsClipboardFormatAvailable is a presence check — it needs no
     // OpenClipboard and races nothing the readers below do.
+    // SAFETY: takes a plain format ID and touches no memory of ours.
     unsafe { IsClipboardFormatAvailable(format_id) }.is_ok()
 }
 
@@ -1479,11 +1441,7 @@ fn push_text_entry(
     // it to the front and refresh metadata rather than create a duplicate.
     // Phase 1 only deduped against the immediate front; this catches the
     // common "I copied X, copied Y, copied X again" pattern too.
-    if let Some(pos) = guard
-        .entries
-        .iter()
-        .position(|e| matches!(e.kind, EntryKind::Text) && e.text == text)
-    {
+    if let Some(pos) = guard.entries.iter().position(|e| matches!(e.kind, EntryKind::Text) && e.text == text) {
         // We just got `pos` from `position()` on this exact deque, so the
         // index is valid by construction. The defensive `if let Some(...)`
         // instead of `.expect()` means a future refactor that decouples
@@ -1539,12 +1497,7 @@ fn downscale_static_image(bytes: &[u8]) -> Option<Vec<u8>> {
     for max_dim in [3840u32, 2560, 1920, 1280, 1024, 800] {
         let resized = img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle);
         let mut encoded = Vec::new();
-        let encoded_ok = resized
-            .write_to(
-                &mut std::io::Cursor::new(&mut encoded),
-                image::ImageFormat::Png,
-            )
-            .is_ok();
+        let encoded_ok = resized.write_to(&mut std::io::Cursor::new(&mut encoded), image::ImageFormat::Png).is_ok();
         if encoded_ok && !encoded.is_empty() && encoded.len() <= MAX_IMAGE_BYTES {
             return Some(encoded);
         }
@@ -1583,18 +1536,9 @@ fn fit_captured_image(bytes: Vec<u8>, format: &str) -> (Vec<u8>, String) {
 /// exactly what a static list row wants; the full-size viewer still animates.
 fn generate_thumbnail(full_bytes: &[u8], id: u64, dir: &std::path::Path) -> Option<PathBuf> {
     let img = image::load_from_memory(full_bytes).ok()?;
-    let thumb = img.resize(
-        THUMBNAIL_MAX_DIM,
-        THUMBNAIL_MAX_DIM,
-        image::imageops::FilterType::Triangle,
-    );
+    let thumb = img.resize(THUMBNAIL_MAX_DIM, THUMBNAIL_MAX_DIM, image::imageops::FilterType::Triangle);
     let mut encoded = Vec::new();
-    thumb
-        .write_to(
-            &mut std::io::Cursor::new(&mut encoded),
-            image::ImageFormat::Png,
-        )
-        .ok()?;
+    thumb.write_to(&mut std::io::Cursor::new(&mut encoded), image::ImageFormat::Png).ok()?;
     let path = dir.join(format!("{id}.thumb.png"));
     std::fs::write(&path, &encoded).ok()?;
     Some(path)
@@ -1616,12 +1560,7 @@ fn generate_thumbnail(full_bytes: &[u8], id: u64, dir: &std::path::Path) -> Opti
 /// complexity for v1. Byte-identical repeats arriving in the same instant are
 /// a different matter: those are one copy that Windows reported more than
 /// once, and `is_duplicate_image_burst` drops them (see LAST_IMAGE).
-fn push_image_entry(
-    bytes: Vec<u8>,
-    source_app: Option<String>,
-    source_app_path: Option<String>,
-    image_format: &str,
-) {
+fn push_image_entry(bytes: Vec<u8>, source_app: Option<String>, source_app_path: Option<String>, image_format: &str) {
     // Checked before the id allocation and the disk write below, so a repeat
     // event costs nothing but a hash — no orphaned file, no id burned.
     if is_duplicate_image_burst(&bytes) {
@@ -1749,11 +1688,7 @@ fn evict_to_cap(state: &mut State) -> Vec<ClipboardEntry> {
 /// releasing the state lock.
 fn evict_to_image_budget(state: &mut State) -> Vec<ClipboardEntry> {
     let mut evicted = Vec::new();
-    let total: u64 = state
-        .entries
-        .iter()
-        .filter_map(|e| e.image_size_bytes)
-        .sum();
+    let total: u64 = state.entries.iter().filter_map(|e| e.image_size_bytes).sum();
     if total <= MAX_IMAGE_DISK_BYTES {
         return evicted;
     }
@@ -1762,9 +1697,10 @@ fn evict_to_image_budget(state: &mut State) -> Vec<ClipboardEntry> {
     while current > MAX_IMAGE_DISK_BYTES {
         // Find the OLDEST non-pinned image entry (rposition because
         // entries are pushed to the front; back of the deque = oldest).
-        let pos = state.entries.iter().rposition(|e| {
-            !e.is_pinned && matches!(e.kind, EntryKind::Image) && e.image_size_bytes.is_some()
-        });
+        let pos = state
+            .entries
+            .iter()
+            .rposition(|e| !e.is_pinned && matches!(e.kind, EntryKind::Image) && e.image_size_bytes.is_some());
         let Some(idx) = pos else { break };
         let Some(removed) = state.entries.remove(idx) else {
             break;
@@ -1777,7 +1713,6 @@ fn evict_to_image_budget(state: &mut State) -> Vec<ClipboardEntry> {
     }
     evicted
 }
-
 
 /// Follower: run this call on the owner instead (see `dash_core::link`).
 macro_rules! on_owner {
@@ -1840,10 +1775,7 @@ pub fn get_clipboard_history() -> Vec<ClipboardEntry> {
 /// time rather than on every mount. Called on page mount.
 pub fn take_clipboard_recovery_notice() -> Option<String> {
     on_owner!("take_clipboard_recovery_notice", {}, or_default);
-    recovery_notice()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
+    recovery_notice().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
 }
 
 pub fn clear_clipboard_history() -> Result<(), String> {
@@ -2004,9 +1936,8 @@ pub fn copy_clipboard_entry_to_clipboard(id: u64) -> Result<(), String> {
             None => Err("Image entry has no on-disk file".to_string()),
         },
     };
-    result.map_err(|error| {
+    result.inspect_err(|_error| {
         clear_self_write_suppression();
-        error
     })
 }
 
@@ -2038,9 +1969,7 @@ pub fn paste_clipboard_entry(id: u64, auto_paste: Option<bool>) -> Result<(), St
             // Overlay was opened from somewhere we didn't capture a target —
             // typically tray-click or a programmatic show. Auto-paste isn't
             // possible; tell the user the text is at least on the clipboard.
-            emit_paste_fallback(
-                "Text is on your clipboard — switch to your target app and press Ctrl+V.",
-            );
+            emit_paste_fallback("Text is on your clipboard — switch to your target app and press Ctrl+V.");
             return Ok(());
         }
         // SetForegroundWindow + SendInput need the overlay to first
@@ -2066,9 +1995,8 @@ pub fn paste_clipboard_entry(id: u64, auto_paste: Option<bool>) -> Result<(), St
 pub fn write_clipboard_text(text: String) -> Result<(), String> {
     on_owner!("write_clipboard_text", { "text": text });
     arm_self_write_suppression();
-    write_text_to_clipboard(&text).map_err(|error| {
+    write_text_to_clipboard(&text).inspect_err(|_error| {
         clear_self_write_suppression();
-        error
     })
 }
 
@@ -2127,11 +2055,8 @@ pub fn paste_snippet_text(
     // (an image / files on the clipboard yield None — the dictated text
     // then stays, the pre-#22 behaviour).
     #[cfg(windows)]
-    let prior_clipboard: Option<String> = if restore_clipboard.unwrap_or(false) {
-        read_clipboard_text().filter(|t| !t.is_empty())
-    } else {
-        None
-    };
+    let prior_clipboard: Option<String> =
+        if restore_clipboard.unwrap_or(false) { read_clipboard_text().filter(|t| !t.is_empty()) } else { None };
     #[cfg(not(windows))]
     let _ = restore_clipboard;
 
@@ -2146,9 +2071,7 @@ pub fn paste_snippet_text(
     {
         let target = PREVIOUS_FOREGROUND_HWND.load(Ordering::SeqCst);
         if target == 0 {
-            emit_paste_fallback(
-                "Snippet is on your clipboard — switch to your target app and press Ctrl+V.",
-            );
+            emit_paste_fallback("Snippet is on your clipboard — switch to your target app and press Ctrl+V.");
             return Ok(());
         }
         std::thread::Builder::new()
@@ -2236,6 +2159,7 @@ pub fn type_out_text(text: String) -> Result<(), String> {
 #[cfg(windows)]
 pub fn remember_foreground_window() {
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    // SAFETY: GetForegroundWindow takes no arguments and returns a handle value.
     unsafe {
         let hwnd = GetForegroundWindow();
         // 0 means "no foreground" (lock screen, UAC, etc.) — stored as-is
@@ -2290,11 +2214,7 @@ pub fn get_clipboard_exclusions() -> Vec<String> {
 
 pub fn set_clipboard_exclusions(apps: Vec<String>) -> Result<(), String> {
     on_owner!("set_clipboard_exclusions", { "apps": apps });
-    let normalized: Vec<String> = apps
-        .into_iter()
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let normalized: Vec<String> = apps.into_iter().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
     {
         let mut guard = locked_state();
         guard.exclusions = normalized;
@@ -2313,10 +2233,7 @@ pub fn reset_clipboard_exclusions_to_defaults() -> Result<(), String> {
     on_owner!("reset_clipboard_exclusions_to_defaults", {});
     {
         let mut guard = locked_state();
-        guard.exclusions = DEFAULT_EXCLUSIONS
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect();
+        guard.exclusions = DEFAULT_EXCLUSIONS.iter().map(|s| s.to_lowercase()).collect();
     }
     if let Some(app) = APP_HANDLE.get() {
         save_exclusions(app);
@@ -2415,20 +2332,14 @@ fn run_listener_thread(_app: Arc<dyn Host>) {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::DataExchange::AddClipboardFormatListener;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassExW,
-        TranslateMessage, HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW,
-        WM_CLIPBOARDUPDATE,
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassExW, TranslateMessage,
+        HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE, WNDCLASSEXW,
     };
 
     // Window procedure — receives messages from Windows. C calling convention,
     // no closures with captures. WindowProc reaches our state via the STATE
     // and APP_HANDLE statics.
-    unsafe extern "system" fn wnd_proc(
-        hwnd: HWND,
-        msg: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
+    unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if msg == WM_CLIPBOARDUPDATE {
             // A panic must not unwind out of the window procedure (that
             // aborts the process): drop this one event instead.
@@ -2437,20 +2348,24 @@ fn run_listener_thread(_app: Arc<dyn Host>) {
             }
             return LRESULT(0);
         }
-        DefWindowProcW(hwnd, msg, wparam, lparam)
+        // SAFETY: forwards, unchanged, the arguments Windows passed this
+        // window procedure.
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 
     // UTF-16 class name, null-terminated.
-    let class_name_wide: Vec<u16> =
-        WINDOW_CLASS_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    let class_name_wide: Vec<u16> = WINDOW_CLASS_NAME.encode_utf16().chain(std::iter::once(0)).collect();
 
+    // SAFETY: WNDCLASSEXW is a plain C struct for which all-zero is a valid
+    // (empty) value, and so is MSG. `class_name_wide` is NUL-terminated and
+    // outlives both RegisterClassExW and CreateWindowExW. `wnd_proc` matches
+    // the WNDPROC signature, and `msg` is a local the pump owns.
     unsafe {
         let mut wc: WNDCLASSEXW = std::mem::zeroed();
-        wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
+        wc.cbSize = u32::try_from(std::mem::size_of::<WNDCLASSEXW>()).expect("WNDCLASSEXW is 80 bytes");
         wc.lpfnWndProc = Some(wnd_proc);
-        wc.hInstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(PCWSTR::null())
-            .unwrap_or_default()
-            .into();
+        wc.hInstance =
+            windows::Win32::System::LibraryLoader::GetModuleHandleW(PCWSTR::null()).unwrap_or_default().into();
         wc.lpszClassName = PCWSTR(class_name_wide.as_ptr());
 
         // Registration can legitimately fail if we're re-entering after the
@@ -2583,6 +2498,8 @@ fn open_clipboard_with_retry() -> bool {
 
     let mut delay_ms = 15u64;
     for attempt in 0..6 {
+        // SAFETY: a null owner window is allowed; callers pair a success with
+        // CloseClipboard on this same thread.
         if unsafe { OpenClipboard(HWND(0)) }.is_ok() {
             return true;
         }
@@ -2605,6 +2522,10 @@ fn read_clipboard_text() -> Option<String> {
         return None;
     }
 
+    // SAFETY: the clipboard is open on this thread (every early return closes
+    // it), so the handle stays valid. GlobalLock's result is null-checked and
+    // the slice covers only the GlobalSize bytes of the locked block, copied
+    // into a String before GlobalUnlock.
     let result = unsafe {
         let handle: HANDLE = match GetClipboardData(CF_UNICODETEXT) {
             Ok(h) => h,
@@ -2636,6 +2557,7 @@ fn read_clipboard_text() -> Option<String> {
         Some(text)
     };
 
+    // SAFETY: balances the successful open_clipboard_with_retry above.
     unsafe {
         let _ = CloseClipboard();
     }
@@ -2676,22 +2598,28 @@ unsafe fn set_clipboard_bytes(format: u32, bytes: &[u8]) -> Result<(), String> {
     use windows::Win32::System::DataExchange::SetClipboardData;
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
-    let hglobal = GlobalAlloc(GMEM_MOVEABLE, bytes.len()).map_err(|e| format!("GlobalAlloc failed: {e}"))?;
-    if hglobal.0.is_null() {
-        return Err("GlobalAlloc returned null".to_string());
+    // SAFETY: the caller guarantees the clipboard is open. The block is
+    // allocated with `bytes.len()` bytes and the lock is null-checked before
+    // the copy, so the copy stays in bounds. The block is freed on every
+    // failure path and given to the system only once SetClipboardData succeeds.
+    unsafe {
+        let hglobal = GlobalAlloc(GMEM_MOVEABLE, bytes.len()).map_err(|e| format!("GlobalAlloc failed: {e}"))?;
+        if hglobal.0.is_null() {
+            return Err("GlobalAlloc returned null".to_string());
+        }
+        let ptr = GlobalLock(hglobal) as *mut u8;
+        if ptr.is_null() {
+            let _ = GlobalFree(hglobal);
+            return Err("GlobalLock failed".to_string());
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+        let _ = GlobalUnlock(hglobal);
+        if SetClipboardData(format, HANDLE(hglobal.0 as isize)).is_err() {
+            let _ = GlobalFree(hglobal);
+            return Err(format!("SetClipboardData({format}) failed"));
+        }
+        Ok(())
     }
-    let ptr = GlobalLock(hglobal) as *mut u8;
-    if ptr.is_null() {
-        let _ = GlobalFree(hglobal);
-        return Err("GlobalLock failed".to_string());
-    }
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
-    let _ = GlobalUnlock(hglobal);
-    if SetClipboardData(format, HANDLE(hglobal.0 as isize)).is_err() {
-        let _ = GlobalFree(hglobal);
-        return Err(format!("SetClipboardData({format}) failed"));
-    }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -2716,13 +2644,12 @@ fn write_text_to_clipboard(text: &str) -> Result<(), String> {
 fn get_foreground_process_name() -> Option<String> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::ProcessStatus::GetModuleBaseNameW;
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
-    };
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ};
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
+    // SAFETY: `pid` and `buf` are locals passed with their real sizes. The
+    // process handle is closed right after the one call that uses it, and
+    // `len` is at most `buf.len()`, so the slice is in bounds.
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0 == 0 {
@@ -2733,12 +2660,7 @@ fn get_foreground_process_name() -> Option<String> {
         if pid == 0 {
             return None;
         }
-        let handle: HANDLE = OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-            false,
-            pid,
-        )
-        .ok()?;
+        let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid).ok()?;
         let mut buf = [0u16; 260];
         let len = GetModuleBaseNameW(handle, None, &mut buf);
         let _ = CloseHandle(handle);
@@ -2752,9 +2674,7 @@ fn get_foreground_process_name() -> Option<String> {
         // variants, leaving raw `WINWORD.EXE` in the history for the frontend
         // to deal with. Doing it here means the rest of the pipeline (mapping
         // to "Microsoft Word", source-color hashing, etc.) sees a clean name.
-        let cleaned = if name.len() >= 4
-            && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".exe")
-        {
+        let cleaned = if name.len() >= 4 && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".exe") {
             name[..name.len() - 4].to_string()
         } else {
             name
@@ -2767,11 +2687,12 @@ fn get_foreground_process_name() -> Option<String> {
 fn get_foreground_process_path() -> Option<String> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::ProcessStatus::GetModuleFileNameExW;
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
-    };
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ};
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
+    // SAFETY: `pid` and `buf` are locals passed with their real sizes. The
+    // process handle is closed right after the one call that uses it, and
+    // `len` is at most `buf.len()`, so the slice is in bounds.
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0 == 0 {
@@ -2782,8 +2703,7 @@ fn get_foreground_process_path() -> Option<String> {
         if pid == 0 {
             return None;
         }
-        let handle: HANDLE =
-            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid).ok()?;
+        let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid).ok()?;
         let mut buf = [0u16; 260];
         let len = GetModuleFileNameExW(handle, None, &mut buf);
         let _ = CloseHandle(handle);
@@ -2802,11 +2722,12 @@ fn get_foreground_process_path() -> Option<String> {
 #[cfg(windows)]
 fn token_is_elevated(process: windows::Win32::Foundation::HANDLE) -> Result<bool, ()> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::Security::{
-        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
-    };
+    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
     use windows::Win32::System::Threading::OpenProcessToken;
 
+    // SAFETY: `process` is a valid handle per this function's contract. The
+    // token is closed right after the query, and `info` is a local
+    // TOKEN_ELEVATION whose exact size is passed as the buffer length.
     unsafe {
         let mut token = HANDLE::default();
         OpenProcessToken(process, TOKEN_QUERY, &mut token).map_err(|_| ())?;
@@ -2816,7 +2737,7 @@ fn token_is_elevated(process: windows::Win32::Foundation::HANDLE) -> Result<bool
             token,
             TokenElevation,
             Some(&mut info as *mut _ as *mut core::ffi::c_void),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            u32::try_from(std::mem::size_of::<TOKEN_ELEVATION>()).expect("TOKEN_ELEVATION is 4 bytes"),
             &mut ret_len,
         );
         let _ = CloseHandle(token);
@@ -2832,6 +2753,7 @@ fn token_is_elevated(process: windows::Win32::Foundation::HANDLE) -> Result<bool
 fn current_process_is_elevated() -> bool {
     use windows::Win32::System::Threading::GetCurrentProcess;
     // GetCurrentProcess hands back a pseudo-handle — never closed.
+    // SAFETY: no arguments; the pseudo-handle is always valid for this process.
     token_is_elevated(unsafe { GetCurrentProcess() }).unwrap_or(false)
 }
 
@@ -2851,27 +2773,23 @@ fn target_blocked_by_elevation(hwnd: windows::Win32::Foundation::HWND) -> bool {
         return false;
     }
     let mut pid = 0u32;
+    // SAFETY: `pid` is a local out-param; a stale HWND just leaves it 0.
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     if pid == 0 {
         return false;
     }
+    // SAFETY: plain value arguments; the returned handle is closed below.
     let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(h) => h,
         // Couldn't get even a limited handle — unknown, don't false-warn.
         Err(_) => return false,
     };
     let verdict = token_is_elevated(handle);
+    // SAFETY: `handle` came from the OpenProcess above and is closed once.
     unsafe {
         let _ = CloseHandle(handle);
     }
-    match verdict {
-        Ok(elevated) => elevated,
-        // The handle opened but the token would not — the classic signature
-        // of a non-elevated process looking at an elevated one. Treat as
-        // blocked: a needless "press Ctrl+V" toast is far cheaper than a
-        // keystroke that silently disappears.
-        Err(()) => true,
-    }
+    verdict.unwrap_or(true)
 }
 
 /// Poll until the OS reports `hwnd` as the foreground window, or give up
@@ -2883,11 +2801,13 @@ fn target_blocked_by_elevation(hwnd: windows::Win32::Foundation::HWND) -> bool {
 fn wait_until_foreground(hwnd: windows::Win32::Foundation::HWND) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     for _ in 0..30 {
+        // SAFETY: GetForegroundWindow takes no arguments.
         if unsafe { GetForegroundWindow() } == hwnd {
             return true;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    // SAFETY: GetForegroundWindow takes no arguments.
     unsafe { GetForegroundWindow() == hwnd }
 }
 
@@ -2902,22 +2822,25 @@ fn wait_until_foreground(hwnd: windows::Win32::Foundation::HWND) -> bool {
 pub fn focus_window_reliably(hwnd: windows::Win32::Foundation::HWND) -> bool {
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowThreadProcessId, SetForegroundWindow,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, SetForegroundWindow};
 
     // Fast path — our overlay just held focus, so we often still qualify to
     // hand it straight back without the attach-input dance.
+    // SAFETY: the HWND is only passed by value; a stale one makes the call fail.
     if unsafe { SetForegroundWindow(hwnd) }.as_bool() && wait_until_foreground(hwnd) {
         return true;
     }
 
+    // SAFETY: no out-param is passed; a stale HWND yields thread id 0.
     let target_thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    // SAFETY: GetCurrentThreadId takes no arguments.
     let our_thread = unsafe { GetCurrentThreadId() };
     if target_thread == 0 || target_thread == our_thread {
         return wait_until_foreground(hwnd);
     }
 
+    // SAFETY: value-only Win32 calls. A successful input attachment is undone
+    // before returning, so our thread is never left attached.
     unsafe {
         let attached = AttachThreadInput(our_thread, target_thread, true).as_bool();
         let _ = SetForegroundWindow(hwnd);
@@ -2941,18 +2864,17 @@ pub fn focus_window_reliably(hwnd: windows::Win32::Foundation::HWND) -> bool {
 fn focus_and_paste(hwnd_value: isize) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-        KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_V,
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+        VK_CONTROL, VK_V,
     };
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
     let hwnd = HWND(hwnd_value);
 
     // The remembered window may have been closed while the overlay was open.
+    // SAFETY: IsWindow is made to be called with possibly-stale handles.
     if !unsafe { IsWindow(hwnd) }.as_bool() {
-        emit_paste_fallback(
-            "The previous window is gone — switch to an app and press Ctrl+V to paste.",
-        );
+        emit_paste_fallback("The previous window is gone — switch to an app and press Ctrl+V to paste.");
         return;
     }
 
@@ -2967,9 +2889,7 @@ fn focus_and_paste(hwnd_value: isize) {
     }
 
     if !focus_window_reliably(hwnd) {
-        emit_paste_fallback(
-            "Couldn't refocus the previous app — press Ctrl+V to paste manually.",
-        );
+        emit_paste_fallback("Couldn't refocus the previous app — press Ctrl+V to paste manually.");
         return;
     }
 
@@ -2980,15 +2900,7 @@ fn focus_and_paste(hwnd_value: isize) {
     fn make_key_event(vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {
         INPUT {
             r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: vk,
-                    wScan: 0,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
+            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
         }
     }
 
@@ -2999,21 +2911,18 @@ fn focus_and_paste(hwnd_value: isize) {
         make_key_event(VK_CONTROL, KEYEVENTF_KEYUP),
     ];
 
+    // SAFETY: `inputs` holds fully initialised keyboard INPUTs, and cbSize is
+    // the real size of INPUT, as SendInput requires.
     unsafe {
-        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        let sent = SendInput(&inputs, i32::try_from(std::mem::size_of::<INPUT>()).expect("INPUT is 40 bytes"));
         if (sent as usize) != inputs.len() {
             // SendInput was blocked or partially dispatched. Most common
             // cause: another process has a low-level keyboard hook with
             // higher privilege (some AV / parental control tools). The text
             // is still on the clipboard so the user can fall back to manual
             // paste; surface a toast so they know what happened.
-            eprintln!(
-                "clipboard_history: SendInput dispatched {sent}/{} events",
-                inputs.len()
-            );
-            emit_paste_fallback(
-                "Auto-paste was blocked — press Ctrl+V to paste manually.",
-            );
+            eprintln!("clipboard_history: SendInput dispatched {sent}/{} events", inputs.len());
+            emit_paste_fallback("Auto-paste was blocked — press Ctrl+V to paste manually.");
         }
     }
 }
@@ -3030,19 +2939,18 @@ fn focus_and_paste(hwnd_value: isize) {
 fn focus_and_type(hwnd_value: isize, text: String) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_RETURN,
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+        VIRTUAL_KEY, VK_RETURN,
     };
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
     let hwnd = HWND(hwnd_value);
 
     // The remembered window may have been closed since the key went down.
+    // SAFETY: IsWindow is made to be called with possibly-stale handles.
     if !unsafe { IsWindow(hwnd) }.as_bool() {
         rescue_text_to_clipboard(&text);
-        emit_paste_fallback(
-            "The previous window is gone — your dictation is on the clipboard, press Ctrl+V to paste.",
-        );
+        emit_paste_fallback("The previous window is gone — your dictation is on the clipboard, press Ctrl+V to paste.");
         return;
     }
 
@@ -3059,9 +2967,7 @@ fn focus_and_type(hwnd_value: isize, text: String) {
 
     if !focus_window_reliably(hwnd) {
         rescue_text_to_clipboard(&text);
-        emit_paste_fallback(
-            "Couldn't refocus the previous app — your dictation is on the clipboard, press Ctrl+V.",
-        );
+        emit_paste_fallback("Couldn't refocus the previous app — your dictation is on the clipboard, press Ctrl+V.");
         return;
     }
 
@@ -3081,33 +2987,15 @@ fn focus_and_type(hwnd_value: isize, text: String) {
         INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0),
-                    wScan: scan,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
+                ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0), wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 },
             },
         }
     }
     fn vk_event(vk: VIRTUAL_KEY, up: bool) -> INPUT {
-        let flags = if up {
-            KEYEVENTF_KEYUP
-        } else {
-            KEYBD_EVENT_FLAGS(0)
-        };
+        let flags = if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) };
         INPUT {
             r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: vk,
-                    wScan: 0,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
+            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
         }
     }
 
@@ -3133,20 +3021,17 @@ fn focus_and_type(hwnd_value: isize, text: String) {
         return;
     }
 
+    // SAFETY: `inputs` holds fully initialised keyboard INPUTs, and cbSize is
+    // the real size of INPUT, as SendInput requires.
     unsafe {
-        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        let sent = SendInput(&inputs, i32::try_from(std::mem::size_of::<INPUT>()).expect("INPUT is 40 bytes"));
         if (sent as usize) != inputs.len() {
             // SendInput was blocked or partially dispatched — most often a
             // higher-privilege low-level keyboard hook (some AV / parental
             // tools). Rescue the full text so nothing is lost.
-            eprintln!(
-                "clipboard_history: type-out SendInput dispatched {sent}/{} events",
-                inputs.len()
-            );
+            eprintln!("clipboard_history: type-out SendInput dispatched {sent}/{} events", inputs.len());
             rescue_text_to_clipboard(&text);
-            emit_paste_fallback(
-                "Typing was blocked — your dictation is on the clipboard, press Ctrl+V to paste.",
-            );
+            emit_paste_fallback("Typing was blocked — your dictation is on the clipboard, press Ctrl+V to paste.");
         }
     }
 }
@@ -3162,6 +3047,7 @@ fn registered_format(slot: &OnceLock<u32>, name: &str) -> u32 {
         use windows::core::PCWSTR;
         use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` is NUL-terminated and lives across the call.
         unsafe { RegisterClipboardFormatW(PCWSTR(wide.as_ptr())) }
     })
 }
@@ -3190,6 +3076,10 @@ fn read_clipboard_raw_bytes(format_id: u32) -> Option<Vec<u8>> {
         return None;
     }
 
+    // SAFETY: the clipboard is open on this thread (every early return closes
+    // it), so the handle stays valid. GlobalLock's result is null-checked and
+    // the slice covers only the GlobalSize bytes of the locked block, copied
+    // out before GlobalUnlock.
     let bytes = unsafe {
         let handle: HANDLE = match GetClipboardData(format_id) {
             Ok(h) => h,
@@ -3214,6 +3104,7 @@ fn read_clipboard_raw_bytes(format_id: u32) -> Option<Vec<u8>> {
         copied
     };
 
+    // SAFETY: balances the successful open_clipboard_with_retry above.
     unsafe {
         let _ = CloseClipboard();
     }
@@ -3245,6 +3136,10 @@ fn read_clipboard_file_paths() -> Vec<PathBuf> {
         return Vec::new();
     }
 
+    // SAFETY: the clipboard is open on this thread (every early return closes
+    // it), so the CF_HDROP handle stays valid for the DragQueryFileW calls.
+    // Each call gets a local buffer it is told the length of and writes at
+    // most that many characters, so the slice is in bounds.
     let paths = unsafe {
         let handle: HANDLE = match GetClipboardData(CF_HDROP) {
             Ok(h) => h,
@@ -3280,6 +3175,7 @@ fn read_clipboard_file_paths() -> Vec<PathBuf> {
         out
     };
 
+    // SAFETY: balances the successful open_clipboard_with_retry above.
     unsafe {
         let _ = CloseClipboard();
     }
@@ -3305,6 +3201,10 @@ fn read_clipboard_image_as_png() -> Option<Vec<u8>> {
         return None;
     }
 
+    // SAFETY: the clipboard is open on this thread (every early return closes
+    // it), so the handle stays valid. GlobalLock's result is null-checked and
+    // the slice covers only the GlobalSize bytes of the locked block, copied
+    // out before GlobalUnlock.
     let dib_bytes = unsafe {
         let handle: HANDLE = match GetClipboardData(CF_DIB) {
             Ok(h) => h,
@@ -3331,6 +3231,7 @@ fn read_clipboard_image_as_png() -> Option<Vec<u8>> {
         copied
     };
 
+    // SAFETY: balances the successful open_clipboard_with_retry above.
     unsafe {
         let _ = CloseClipboard();
     }
@@ -3405,7 +3306,13 @@ fn dib_pixel_offset(dib: &[u8]) -> Option<usize> {
             (40, 6) => 16, // BI_ALPHABITFIELDS
             _ => 0,
         };
-        let colours = if used != 0 { used } else if (1..=8).contains(&bpp) { 1usize << bpp } else { 0 };
+        let colours = if used != 0 {
+            used
+        } else if (1..=8).contains(&bpp) {
+            1usize << bpp
+        } else {
+            0
+        };
         (masks, colours, 4)
     };
     let offset = colours.checked_mul(entry_size)?.checked_add(14 + header + masks)?;
@@ -3430,10 +3337,7 @@ fn dib_pixel_offset(dib: &[u8]) -> Option<usize> {
 /// decode produces the FIRST FRAME — which is what Paint/Word want anyway
 /// (they don't support animation in pastes).
 #[cfg(windows)]
-fn write_image_to_clipboard(
-    image_path: &std::path::Path,
-    image_format: Option<&str>,
-) -> Result<(), String> {
+fn write_image_to_clipboard(image_path: &std::path::Path, image_format: Option<&str>) -> Result<(), String> {
     use windows::Win32::System::DataExchange::EmptyClipboard;
 
     // Step 1: read the raw image bytes off disk. For registered formats
@@ -3447,8 +3351,7 @@ fn write_image_to_clipboard(
     let img = image::open(image_path).map_err(|e| format!("decode image: {e}"))?;
     let mut bmp_buf = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut bmp_buf);
-    img.write_to(&mut cursor, image::ImageFormat::Bmp)
-        .map_err(|e| format!("encode bmp: {e}"))?;
+    img.write_to(&mut cursor, image::ImageFormat::Bmp).map_err(|e| format!("encode bmp: {e}"))?;
     if bmp_buf.len() < 14 {
         return Err("BMP encoding too short".to_string());
     }
@@ -3519,16 +3422,12 @@ fn write_image_to_clipboard(image_path: &std::path::Path, _image_format: Option<
         height: height as usize,
         bytes: std::borrow::Cow::Owned(rgba.into_raw()),
     };
-    arboard::Clipboard::new()
-        .and_then(|mut c| c.set_image(data))
-        .map_err(|e| e.to_string())
+    arboard::Clipboard::new().and_then(|mut c| c.set_image(data)).map_err(|e| e.to_string())
 }
 
 #[cfg(not(windows))]
 fn write_text_to_clipboard(text: &str) -> Result<(), String> {
-    arboard::Clipboard::new()
-        .and_then(|mut c| c.set_text(text.to_string()))
-        .map_err(|e| e.to_string())
+    arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())).map_err(|e| e.to_string())
 }
 
 #[cfg(not(windows))]
@@ -3631,9 +3530,7 @@ mod tests {
         // Backdate the recorded sighting to just outside the burst window,
         // rather than sleeping for two real seconds in a unit test.
         {
-            let mut guard = last_image()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = last_image().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some((_, ts)) = guard.as_mut() {
                 *ts -= IMAGE_BURST_WINDOW_MS + 1;
             }
@@ -3643,18 +3540,14 @@ mod tests {
     }
 
     fn reset_last_image() {
-        *last_image()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *last_image().lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// LAST_IMAGE is process-global, so the two tests above would race under
     /// cargo's default threaded runner.
     fn image_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[test]
@@ -3696,29 +3589,17 @@ mod tests {
         assert_eq!(categorize("C:\\Users\\Alice\\Documents"), Category::FilePath);
         assert_eq!(categorize("D:/projects/foo"), Category::FilePath);
         assert_eq!(categorize("/usr/local/bin/git"), Category::FilePath);
-        assert_eq!(
-            categorize("\\\\server\\share\\file.txt"),
-            Category::FilePath
-        );
+        assert_eq!(categorize("\\\\server\\share\\file.txt"), Category::FilePath);
     }
 
     #[test]
     fn categorizes_hash() {
         // MD5 (32 hex chars).
-        assert_eq!(
-            categorize("d41d8cd98f00b204e9800998ecf8427e"),
-            Category::Hash
-        );
+        assert_eq!(categorize("d41d8cd98f00b204e9800998ecf8427e"), Category::Hash);
         // SHA-1 (40 hex chars).
-        assert_eq!(
-            categorize("da39a3ee5e6b4b0d3255bfef95601890afd80709"),
-            Category::Hash
-        );
+        assert_eq!(categorize("da39a3ee5e6b4b0d3255bfef95601890afd80709"), Category::Hash);
         // UUID with dashes.
-        assert_eq!(
-            categorize("550e8400-e29b-41d4-a716-446655440000"),
-            Category::Hash
-        );
+        assert_eq!(categorize("550e8400-e29b-41d4-a716-446655440000"), Category::Hash);
         // Short string → not a hash.
         assert_eq!(categorize("abc123"), Category::Text);
     }

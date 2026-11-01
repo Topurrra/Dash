@@ -162,6 +162,7 @@ pub fn lexical_quality(hits: &LexicalHits) -> f32 {
 /// epoch). Exponential decay: modified now → ~1.0, modified
 /// `RECENCY_HALF_LIFE_DAYS` ago → 0.5, fading smoothly toward 0. A `0`
 /// timestamp means "unknown" and scores 0.
+#[expect(clippy::cast_possible_truncation, reason = "the decay is in 0..=1, so f64 to f32 only drops precision")]
 pub fn recency_score(modified_ms: u64, now_ms: u128) -> f32 {
     if modified_ms == 0 {
         return 0.0;
@@ -228,14 +229,7 @@ mod tests {
     const NOW_MS: u128 = 1_700_000_000_000;
 
     fn signals(bm25: f32, lexical: f32, frecency_boost: f32, modified_ms: u64) -> RankSignals {
-        RankSignals {
-            bm25,
-            lexical,
-            frecency_boost,
-            modified_ms,
-            filter_bonus: 0.0,
-            semantic: 0.0,
-        }
+        RankSignals { bm25, lexical, frecency_boost, modified_ms, filter_bonus: 0.0, semantic: 0.0 }
     }
 
     fn hits() -> LexicalHits {
@@ -265,10 +259,10 @@ mod tests {
         // A zero timestamp means "unknown" → no recency signal.
         assert_eq!(recency_score(0, NOW_MS), 0.0);
         // Modified just now → ~1.0.
-        assert!(recency_score(NOW_MS as u64, NOW_MS) > 0.99);
+        assert!(recency_score(u64::try_from(NOW_MS).unwrap(), NOW_MS) > 0.99);
         // Modified one half-life (30 days) ago → ~0.5.
         let thirty_days_ms = 30 * 24 * 60 * 60 * 1000u64;
-        let half_life_ago = NOW_MS as u64 - thirty_days_ms;
+        let half_life_ago = u64::try_from(NOW_MS).unwrap() - thirty_days_ms;
         assert!((recency_score(half_life_ago, NOW_MS) - 0.5).abs() < 0.02);
     }
 
@@ -325,65 +319,53 @@ mod tests {
         let frequent = signals(5.0, 0.5, 14.0, 0);
         // ...should beat a slightly better name match the user never opens.
         let never_opened = signals(5.0, 0.7, 0.0, 0);
-        assert!(
-            fuse(&frequent, NOW_MS) > fuse(&never_opened, NOW_MS),
-            "a heavily-used file should win on frecency"
-        );
+        assert!(fuse(&frequent, NOW_MS) > fuse(&never_opened, NOW_MS), "a heavily-used file should win on frecency");
     }
 
     #[test]
     fn fixture_recency_nudges_but_never_dominates() {
         // Same signals, different mtime → the fresher file wins.
-        let fresh = signals(5.0, 0.5, 0.0, NOW_MS as u64);
+        let fresh = signals(5.0, 0.5, 0.0, u64::try_from(NOW_MS).unwrap());
         let stale = signals(5.0, 0.5, 0.0, 0);
         assert!(fuse(&fresh, NOW_MS) > fuse(&stale, NOW_MS));
 
         // But recency must not overturn a real lexical gap.
-        let recent_weak = signals(5.0, 0.2, 0.0, NOW_MS as u64);
+        let recent_weak = signals(5.0, 0.2, 0.0, u64::try_from(NOW_MS).unwrap());
         let stale_strong = signals(5.0, 0.8, 0.0, 0);
-        assert!(
-            fuse(&stale_strong, NOW_MS) > fuse(&recent_weak, NOW_MS),
-            "recency must stay a secondary nudge"
-        );
+        assert!(fuse(&stale_strong, NOW_MS) > fuse(&recent_weak, NOW_MS), "recency must stay a secondary nudge");
     }
 
     #[test]
     fn fixture_filter_bonus_adds_straight_through() {
         let plain = signals(5.0, 0.5, 1.0, 0);
-        let bonused = RankSignals {
-            filter_bonus: FOLDER_FILTER_BONUS,
-            ..signals(5.0, 0.5, 1.0, 0)
-        };
+        let bonused = RankSignals { filter_bonus: FOLDER_FILTER_BONUS, ..signals(5.0, 0.5, 1.0, 0) };
         let diff = fuse(&bonused, NOW_MS) - fuse(&plain, NOW_MS);
         assert!((diff - FOLDER_FILTER_BONUS).abs() < 1e-4);
     }
 
     #[test]
     fn weights_keep_lexical_dominant() {
-        assert!(WEIGHTS.lexical > WEIGHTS.bm25);
-        assert!(WEIGHTS.lexical > WEIGHTS.frecency);
-        assert!(WEIGHTS.frecency > WEIGHTS.recency);
-        // Semantic must never outweigh a literal keyword hit: an exact text
-        // match always beats a merely conceptual one.
-        assert!(WEIGHTS.lexical > WEIGHTS.semantic);
-        assert!(WEIGHTS.bm25 >= WEIGHTS.semantic);
+        // Checked at compile time: the weights are constants.
+        const {
+            assert!(WEIGHTS.lexical > WEIGHTS.bm25);
+            assert!(WEIGHTS.lexical > WEIGHTS.frecency);
+            assert!(WEIGHTS.frecency > WEIGHTS.recency);
+            // Semantic must never outweigh a literal keyword hit: an exact text
+            // match always beats a merely conceptual one.
+            assert!(WEIGHTS.lexical > WEIGHTS.semantic);
+            assert!(WEIGHTS.bm25 >= WEIGHTS.semantic);
+        }
     }
 
     #[test]
     fn semantic_lifts_but_stays_below_a_real_lexical_hit() {
         // Same weak text signals, one with a strong semantic match → it wins.
-        let related = RankSignals {
-            semantic: 0.9,
-            ..signals(0.5, 0.1, 0.0, 0)
-        };
+        let related = RankSignals { semantic: 0.9, ..signals(0.5, 0.1, 0.0, 0) };
         let unrelated = signals(0.5, 0.1, 0.0, 0);
         assert!(fuse(&related, NOW_MS) > fuse(&unrelated, NOW_MS));
 
         // But a pure-semantic hit must not overturn a strong literal match.
-        let semantic_only = RankSignals {
-            semantic: 1.0,
-            ..signals(0.0, 0.0, 0.0, 0)
-        };
+        let semantic_only = RankSignals { semantic: 1.0, ..signals(0.0, 0.0, 0.0, 0) };
         let lexical_hit = signals(5.0, 0.9, 0.0, 0);
         assert!(
             fuse(&lexical_hit, NOW_MS) > fuse(&semantic_only, NOW_MS),

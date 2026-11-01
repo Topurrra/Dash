@@ -59,12 +59,10 @@ pub fn is_packaged_launch_path(path: &str) -> bool {
 #[cfg(windows)]
 pub fn enumerate_packaged_apps() -> Vec<PackagedApp> {
     use windows::core::{w, PWSTR};
-    use windows::Win32::System::Com::{
-        CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED,
-    };
+    use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::Shell::{
-        BHID_EnumItems, IEnumShellItems, IShellItem, SHCreateItemFromParsingName,
-        SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY,
+        BHID_EnumItems, IEnumShellItems, IShellItem, SHCreateItemFromParsingName, SIGDN_DESKTOPABSOLUTEPARSING,
+        SIGDN_NORMALDISPLAY,
     };
 
     let mut out = Vec::new();
@@ -79,26 +77,31 @@ pub fn enumerate_packaged_apps() -> Vec<PackagedApp> {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
         /// Copy a shell-allocated wide string into an owned String and free it.
+        /// `raw` must be null or a NUL-terminated string from CoTaskMemAlloc
+        /// that the caller owns.
         unsafe fn take_pwstr(raw: PWSTR) -> Option<String> {
             if raw.is_null() {
                 return None;
             }
-            let text = raw.to_string().ok();
-            CoTaskMemFree(Some(raw.0 as *const _));
-            text
+            // SAFETY: per the contract above, `raw` is a NUL-terminated string
+            // we own (from GetDisplayName); it is read once, then freed with
+            // the allocator it came from and never touched again.
+            unsafe {
+                let text = raw.to_string().ok();
+                CoTaskMemFree(Some(raw.0 as *const _));
+                text
+            }
         }
 
-        let folder: IShellItem =
-            match SHCreateItemFromParsingName(w!("shell:AppsFolder"), None) {
-                Ok(item) => item,
-                Err(_) => return out,
-            };
+        let folder: IShellItem = match SHCreateItemFromParsingName(w!("shell:AppsFolder"), None) {
+            Ok(item) => item,
+            Err(_) => return out,
+        };
 
-        let items: IEnumShellItems =
-            match folder.BindToHandler(None, &BHID_EnumItems) {
-                Ok(enumerator) => enumerator,
-                Err(_) => return out,
-            };
+        let items: IEnumShellItems = match folder.BindToHandler(None, &BHID_EnumItems) {
+            Ok(enumerator) => enumerator,
+            Err(_) => return out,
+        };
 
         loop {
             let mut fetched = [None; 1];
@@ -256,10 +259,7 @@ mod tests {
     #[test]
     fn packaged_paths_round_trip() {
         let path = packaged_launch_path("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App");
-        assert_eq!(
-            path,
-            "shell:AppsFolder\\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
-        );
+        assert_eq!(path, "shell:AppsFolder\\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App");
         assert!(is_packaged_launch_path(&path));
     }
 
@@ -292,10 +292,7 @@ mod tests {
         for app in apps.iter().take(25) {
             println!("  {}  ->  {}", app.name, app.aumid);
         }
-        assert!(
-            !apps.is_empty(),
-            "no packaged apps found — shell enumeration failed"
-        );
+        assert!(!apps.is_empty(), "no packaged apps found — shell enumeration failed");
         for app in &apps {
             assert!(!app.name.trim().is_empty(), "empty name: {app:?}");
             assert!(app.aumid.contains('!'), "not an AUMID: {app:?}");
