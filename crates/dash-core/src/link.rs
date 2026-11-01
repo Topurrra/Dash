@@ -240,9 +240,12 @@ enum Check {
     Lost(Option<OwnerInfo>),
 }
 
-/// `ours`: the handle this process locked when it became the owner. Only
-/// that handle can release the lock, which tells whether it still holds
-/// it (a second handle can't lock it either way); it's locked again at once.
+/// `ours`: the handle this process locked when it became the owner.
+///
+/// Windows: only that handle can release the lock, which tells whether it
+/// still holds it (a second handle can't lock it either way); it's locked
+/// again at once.
+#[cfg(windows)]
 fn check_ownership(dir: &Path, me: u32, ours: Option<&File>) -> Check {
     let named_other = || read_owner_file(dir).filter(|o| o.pid != me);
     if let Some(ours) = ours {
@@ -257,6 +260,23 @@ fn check_ownership(dir: &Path, me: u32, ours: Option<&File>) -> Check {
     match try_lock(dir) {
         Some(fresh) => Check::Retaken(fresh),
         None => Check::Lost(named_other()),
+    }
+}
+
+/// macOS / Linux (`flock`): releasing a lock one doesn't hold succeeds too,
+/// so instead that handle locks again: that succeeds if it holds the lock
+/// or the lock is free (then it holds it now), and fails only if another
+/// process holds it.
+#[cfg(not(windows))]
+fn check_ownership(dir: &Path, me: u32, ours: Option<&File>) -> Check {
+    let named_other = || read_owner_file(dir).filter(|o| o.pid != me);
+    match ours.map(File::try_lock) {
+        Some(Ok(())) => Check::Held { renamed: named_other().is_some() },
+        Some(Err(_)) => Check::Lost(named_other()),
+        None => match try_lock(dir) {
+            Some(fresh) => Check::Retaken(fresh),
+            None => Check::Lost(named_other()),
+        },
     }
 }
 
@@ -600,10 +620,21 @@ mod tests {
         assert!(matches!(check_ownership(&dir, me, Some(&held)), Check::Held { renamed: true }));
         write_owner_file(&dir, &info(me));
 
-        // Our handle lost the lock and nobody holds it: taken again.
+        // Our handle lost the lock and nobody holds it: taken again (Windows:
+        // by a new handle; macOS / Linux: ours locks again, so it's held).
         held.unlock().unwrap();
-        let Check::Retaken(again) = check_ownership(&dir, me, Some(&held)) else {
-            panic!("a free lock is taken again")
+        #[cfg(windows)]
+        let again = {
+            let Check::Retaken(again) = check_ownership(&dir, me, Some(&held)) else {
+                panic!("a free lock is taken again")
+            };
+            again
+        };
+        #[cfg(not(windows))]
+        let again = {
+            assert!(matches!(check_ownership(&dir, me, Some(&held)), Check::Held { .. }), "a free lock is taken again");
+            held.unlock().unwrap();
+            try_lock(&dir).expect("free again for the next case")
         };
         assert!(try_lock(&dir).is_none(), "and stays held");
 

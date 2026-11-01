@@ -47,6 +47,9 @@ windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Dw
 [target.'cfg(not(windows))'.dependencies]
 open = "5.3.3"
 rodio = { version = "=0.21.1", default-features = false, features = ["playback", "symphonia-all"] }
+# Held at 0.2.189: 0.2.190 dropped `ENOATTR`, which xattr 0.2.3 (in GPUI
+# 0.2.2's HTTP client, zed-async-tar) still uses, so Linux wouldn't build.
+libc = "=0.2.189"
 
 # Tray icon: the usual backend on Windows / macOS; on Linux the D-Bus (KSNI)
 # one, which runs its own thread (no GTK loop needed).
