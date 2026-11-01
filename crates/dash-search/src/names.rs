@@ -41,6 +41,7 @@ fn search_names_blocking(app: Arc<dyn Host>, options: NameQueryOptions) -> Resul
         }
     }
     let started = Instant::now();
+    let cancel = Cancel::newest(&options.query);
     let query = match crate::query::parse(&options.query) {
         Ok(q) => q,
         Err(e) => return Ok(NameSearchResult { error: Some(e), ..Default::default() }),
@@ -51,9 +52,40 @@ fn search_names_blocking(app: Arc<dyn Host>, options: NameQueryOptions) -> Resul
         return fallback_search(app, &query, &options, started);
     };
     let hide = hidden_bits(&table);
-    let (total, ids) = table.search(&query, query.is_empty(), &options, hide.as_deref());
+    let (total, ids) = table.search(&query, query.is_empty(), &options, hide.as_deref(), &cancel);
+    if cancel.is_set() {
+        return Err(SUPERSEDED.into());
+    }
     let rows = ids.into_iter().map(|id| table.row(id)).collect();
     Ok(NameSearchResult { total, rows, took_ms: started.elapsed().as_millis() as u64, error: None })
+}
+
+/// Typing fast starts a search per keystroke; a scan for a query that's no
+/// longer the newest stops early instead of finishing for nothing. Searches
+/// for the same query (more pages of it) don't stop each other.
+static NEWEST_QUERY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What a stopped search returns (its caller has moved on anyway).
+pub const SUPERSEDED: &str = "A newer search replaced this one.";
+
+/// Whether a search's query is still the newest one.
+pub(crate) struct Cancel(Option<u64>);
+
+impl Cancel {
+    /// Never set: for scans that must finish (tests, hidden-path scans).
+    pub(crate) const NEVER: Cancel = Cancel(None);
+
+    /// Makes `query` the newest one.
+    fn newest(query: &str) -> Self {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        let key = BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(query);
+        NEWEST_QUERY.store(key, AtomicOrdering::Relaxed);
+        Cancel(Some(key))
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.is_some_and(|key| NEWEST_QUERY.load(AtomicOrdering::Relaxed) != key)
+    }
 }
 
 // ---- The table ----
@@ -485,8 +517,10 @@ impl Table {
         }
     }
 
-    /// Bitset of matching ids and how many matched (parallel scan).
-    fn match_bits(&self, matcher: &dyn Matcher) -> (Vec<u64>, usize) {
+    /// Bitset of matching ids and how many matched (parallel scan). Chunks
+    /// left once `cancel` is set are skipped (the result is then partial;
+    /// the caller checks `cancel`).
+    fn match_bits(&self, matcher: &dyn Matcher, cancel: &Cancel) -> (Vec<u64>, usize) {
         const WORDS_PER_CHUNK: usize = 64;
         let n = self.items.len();
         let mut bits = vec![0u64; n.div_ceil(64)];
@@ -495,6 +529,9 @@ impl Table {
             .enumerate()
             .map_init(PathScratch::new, |buf, (chunk, words)| {
                 let mut count = 0;
+                if cancel.is_set() {
+                    return 0;
+                }
                 for (w, word) in words.iter_mut().enumerate() {
                     let base = (chunk * WORDS_PER_CHUNK + w) * 64;
                     for bit in 0..64.min(n - base) {
@@ -513,12 +550,23 @@ impl Table {
     /// Runs a search: the match count and one page of ids, in order.
     /// `match_all` skips the scan (empty query); `options.query` is also read
     /// for relevance ranking.
-    /// `hide`: entries left out (see `forget_paths`).
-    pub(crate) fn search(&self, matcher: &dyn Matcher, match_all: bool, options: &NameQueryOptions, hide: Option<&[u64]>) -> (usize, Vec<u32>) {
+    /// `hide`: entries left out (see `forget_paths`). Stops with nothing
+    /// once `cancel` is set (a newer query came).
+    pub(crate) fn search(
+        &self,
+        matcher: &dyn Matcher,
+        match_all: bool,
+        options: &NameQueryOptions,
+        hide: Option<&[u64]>,
+        cancel: &Cancel,
+    ) -> (usize, Vec<u32>) {
         let (bits, total) = if match_all { (None, self.items.len()) } else {
-            let (bits, total) = self.match_bits(matcher);
+            let (bits, total) = self.match_bits(matcher, cancel);
             (Some(bits), total)
         };
+        if cancel.is_set() {
+            return (0, Vec::new());
+        }
         let (bits, total) = match hide {
             None => (bits, total),
             Some(hide) => {
@@ -672,7 +720,7 @@ fn hidden_bits(table: &Arc<Table>) -> Option<Vec<u64>> {
     if gone.table != key {
         gone.paths.retain(|p| !std::path::Path::new(p).exists());
         let matcher = UnderGone { paths: &gone.paths, found: Mutex::default() };
-        let (bits, _) = table.match_bits(&matcher);
+        let (bits, _) = table.match_bits(&matcher, &Cancel::NEVER);
         let found = matcher.found.into_inner().unwrap_or_default();
         gone.paths.retain(|p| found.contains(p));
         gone.bits = bits;
@@ -1018,7 +1066,7 @@ mod tests {
             b.push(path, false, 0, 0, 0);
         }
         let t = b.finish(0);
-        assert_eq!(t.match_bits(&PathIsConsistent).1, 5);
+        assert_eq!(t.match_bits(&PathIsConsistent, &Cancel::NEVER).1, 5);
         let mut rows: Vec<String> = (0..5).map(|i| t.row(i).path).collect();
         rows.sort();
         assert_eq!(rows, [r"C:\a\x.txt", r"C:\a\z.txt", r"C:\b\c\d\w", r"C:\b\c\y.txt", r"D:\q"]);
@@ -1035,16 +1083,30 @@ mod tests {
         let t = b.finish(0);
         let paths: std::collections::HashSet<String> = [gone_key(r"C:\A\"), gone_key(r"C:\missing.txt")].into_iter().collect();
         let matcher = UnderGone { paths: &paths, found: Mutex::default() };
-        let (hide, hidden) = t.match_bits(&matcher);
+        let (hide, hidden) = t.match_bits(&matcher, &Cancel::NEVER);
         // C:\a, both files inside it; not C:\ab.txt (same prefix, other name).
         assert_eq!(hidden, 3);
         assert_eq!(matcher.found.into_inner().unwrap().len(), 1);
-        let (total, ids) = t.search(&Everything, true, &opts("", SortKey::Name, false, 0, 10), Some(&hide));
+        let (total, ids) = t.search(&Everything, true, &opts("", SortKey::Name, false, 0, 10), Some(&hide), &Cancel::NEVER);
         assert_eq!(total, 2);
         assert_eq!(names(&t, &ids), ["ab.txt", "b.txt"]);
-        let (total, _) = t.search(&Contains("txt"), false, &opts("txt", SortKey::Name, false, 0, 10), Some(&hide));
+        let (total, _) = t.search(&Contains("txt"), false, &opts("txt", SortKey::Name, false, 0, 10), Some(&hide), &Cancel::NEVER);
         assert_eq!(total, 2);
         assert_eq!(all_bits(70).iter().map(|w| w.count_ones()).sum::<u32>(), 70);
+    }
+
+    /// A newer query stops an older one's search; the same query doesn't.
+    #[test]
+    fn newer_query_stops_older_search() {
+        let t = sample();
+        let older = Cancel::newest("re");
+        let same = Cancel::newest("re");
+        assert!(!older.is_set() && !same.is_set(), "pages of one query don't stop each other");
+        let (total, _) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 0, 10), None, &older);
+        assert!(total > 0);
+        let _newer = Cancel::newest("rep");
+        assert!(older.is_set());
+        assert_eq!(t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 0, 10), None, &older), (0, Vec::new()));
     }
 
     #[test]
@@ -1063,7 +1125,7 @@ mod tests {
     #[test]
     fn sorts_by_every_column() {
         let t = sample();
-        let run = |sort, desc| names(&t, &t.search(&Contains("re"), false, &opts("", sort, desc, 0, 100), None).1);
+        let run = |sort, desc| names(&t, &t.search(&Contains("re"), false, &opts("", sort, desc, 0, 100), None, &Cancel::NEVER).1);
         assert_eq!(run(SortKey::Name, false), ["q1 report.pdf", "Report Final.docx", "report.pdf", "reports"]);
         assert_eq!(run(SortKey::Name, true), ["reports", "report.pdf", "Report Final.docx", "q1 report.pdf"]);
         assert_eq!(run(SortKey::Size, false), ["reports", "q1 report.pdf", "Report Final.docx", "report.pdf"]);
@@ -1076,24 +1138,24 @@ mod tests {
     #[test]
     fn pages_with_offset_and_limit() {
         let t = sample();
-        let (total, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 1, 2), None);
+        let (total, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 1, 2), None, &Cancel::NEVER);
         assert_eq!(total, 4);
         assert_eq!(names(&t, &ids), ["Report Final.docx", "report.pdf"]);
-        let (total, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 3, 10), None);
+        let (total, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 3, 10), None, &Cancel::NEVER);
         assert_eq!((total, names(&t, &ids)), (4, vec!["reports".to_string()]));
-        let (_, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 50, 10), None);
+        let (_, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 50, 10), None, &Cancel::NEVER);
         assert!(ids.is_empty());
     }
 
     #[test]
     fn empty_query_lists_everything() {
         let t = sample();
-        let (total, ids) = t.search(&Everything, true, &opts("", SortKey::Relevance, false, 0, 3), None);
+        let (total, ids) = t.search(&Everything, true, &opts("", SortKey::Relevance, false, 0, 3), None, &Cancel::NEVER);
         assert_eq!(total, 8);
         assert_eq!(names(&t, &ids), [r"C:\", "me", "notes.txt"]);
-        let (_, ids) = t.search(&Everything, true, &opts("", SortKey::Name, true, 0, 2), None);
+        let (_, ids) = t.search(&Everything, true, &opts("", SortKey::Name, true, 0, 2), None, &Cancel::NEVER);
         assert_eq!(names(&t, &ids), ["Users", "reports"]);
-        let (_, ids) = t.search(&Everything, true, &opts("", SortKey::Name, true, 7, 5), None);
+        let (_, ids) = t.search(&Everything, true, &opts("", SortKey::Name, true, 7, 5), None, &Cancel::NEVER);
         assert_eq!(names(&t, &ids), [r"C:\"]);
         // The real (placeholder or F2) parser treats "" as empty.
         assert!(crate::query::parse("").unwrap().is_empty());
@@ -1106,7 +1168,7 @@ mod tests {
             b.push(path, !path.contains('.'), 1, 0, 0);
         }
         let t = b.finish(0);
-        let (total, ids) = t.search(&Contains("report"), false, &opts("report", SortKey::Relevance, false, 0, 10), None);
+        let (total, ids) = t.search(&Contains("report"), false, &opts("report", SortKey::Relevance, false, 0, 10), None, &Cancel::NEVER);
         assert_eq!(total, 6);
         assert_eq!(names(&t, &ids), ["Report", "report.pdf", "reports", "reporting.md", "q1 report.pdf", "misreport.txt"]);
         assert_eq!(match_tier("ext:pdf", "pdf"), 2);
@@ -1212,12 +1274,12 @@ mod tests {
             let parsed = crate::query::parse(query).unwrap();
             for sort in [SortKey::Relevance, SortKey::Name, SortKey::Size] {
                 let t = Instant::now();
-                let (total, ids) = table.search(&parsed, false, &opts(query, sort, false, 0, 100), None);
+                let (total, ids) = table.search(&parsed, false, &opts(query, sort, false, 0, 100), None, &Cancel::NEVER);
                 println!("{label:>18} {sort:?}: {total} hits, {} rows, {:?}", ids.len(), t.elapsed());
             }
         }
         let t = Instant::now();
-        let (total, _) = table.search(&Everything, true, &opts("", SortKey::Path, true, 500_000, 100), None);
+        let (total, _) = table.search(&Everything, true, &opts("", SortKey::Path, true, 500_000, 100), None, &Cancel::NEVER);
         println!("empty query, Path desc page @500k: {total} total, {:?}", t.elapsed());
         /// Allocation-free ASCII case-insensitive substring test.
         struct AsciiContains(&'static [u8]);
@@ -1227,7 +1289,7 @@ mod tests {
             }
         }
         let t = Instant::now();
-        let (bits, hits) = table.match_bits(&AsciiContains(b"report"));
+        let (bits, hits) = table.match_bits(&AsciiContains(b"report"), &Cancel::NEVER);
         println!("scan only (alloc-free matcher): {hits} hits, {:?}", t.elapsed());
         let t = Instant::now();
         let ids = page_of_order(table.order(ORDER_MODIFIED), Some(&bits), true, 1000, 100);
@@ -1266,7 +1328,7 @@ mod tests {
             let parsed = crate::query::parse(query).unwrap();
             for sort in [SortKey::Relevance, SortKey::Name, SortKey::Modified] {
                 let t = Instant::now();
-                let (total, ids) = table.search(&parsed, false, &opts(query, sort, true, 0, 100), None);
+                let (total, ids) = table.search(&parsed, false, &opts(query, sort, true, 0, 100), None, &Cancel::NEVER);
                 println!("{query:>8} {sort:?}: {total} hits, {} rows, {:?}", ids.len(), t.elapsed());
             }
         }

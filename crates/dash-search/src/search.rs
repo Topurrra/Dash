@@ -3843,6 +3843,10 @@ pub fn start_file_search_scheduler(app: std::sync::Arc<dyn dash_core::Host>) {
 
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(INDEX_REBUILD_SCHEDULER_POLL_SECS));
+        // Stepped down (another process owns the engines): its schedules run.
+        if dash_core::link::is_follower() {
+            continue;
+        }
         if let Err(error) = run_scheduled_file_search_rebuild(&app) {
             update_status(|status| {
                 status.last_error = Some(error);
@@ -4124,6 +4128,7 @@ fn start_isolated_index_worker(
     let child = command
         .spawn()
         .map_err(|error| format!("Cannot start isolated index worker: {error}"))?;
+    assign_to_workers_job(&child);
     let worker = SearchIndexWorkerProcess {
         child: Arc::new(Mutex::new(child)),
         status_path: status_path.clone(),
@@ -4243,8 +4248,10 @@ struct MemoryCappedJob {
 
 #[cfg(windows)]
 impl MemoryCappedJob {
-    /// Create a job object capping every assigned process at `memory_limit_bytes`.
-    fn new(memory_limit_bytes: usize) -> Result<Self, String> {
+    /// Create a job object capping every assigned process at `memory_limit_bytes`
+    /// (`None`: no cap, only ending with the job's owner).
+    fn new(memory_limit_bytes: impl Into<Option<usize>>) -> Result<Self, String> {
+        let memory_limit_bytes = memory_limit_bytes.into();
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::JobObjects::{
@@ -4259,9 +4266,11 @@ impl MemoryCappedJob {
             .map_err(|error| format!("Cannot create extractor job object: {error}"))?;
 
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        info.ProcessMemoryLimit = memory_limit_bytes;
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(limit) = memory_limit_bytes {
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+            info.ProcessMemoryLimit = limit;
+        }
 
         // SAFETY: `info` is a fully-initialized struct of the size declared for
         // the `JobObjectExtendedLimitInformation` class.
@@ -4304,6 +4313,17 @@ impl Drop for MemoryCappedJob {
     }
 }
 
+/// Index workers (content build, filename build, watcher) go in this job,
+/// held open for the app's whole life: when the app ends — quit, crash or
+/// killed — Windows ends them too, so the next owner never finds orphans
+/// still writing the index beside its own workers.
+fn assign_to_workers_job(child: &std::process::Child) {
+    static JOB: std::sync::OnceLock<Option<MemoryCappedJob>> = std::sync::OnceLock::new();
+    if let Some(job) = JOB.get_or_init(|| MemoryCappedJob::new(None).ok()) {
+        let _ = job.assigner().assign(child);
+    }
+}
+
 /// Non-Windows stand-in for `MemoryCappedJob`: there is no Job Object on other
 /// platforms, so extractor children run un-capped (the in-child size guard from
 /// task #1 stays the safety net). Keeps `ExtractorPool` cross-platform.
@@ -4312,7 +4332,7 @@ struct MemoryCappedJob;
 
 #[cfg(not(windows))]
 impl MemoryCappedJob {
-    fn new(_memory_limit_bytes: usize) -> Result<Self, String> {
+    fn new(_memory_limit_bytes: impl Into<Option<usize>>) -> Result<Self, String> {
         Ok(Self)
     }
     fn assigner(&self) -> JobAssigner {
@@ -5084,6 +5104,7 @@ fn start_isolated_filename_index_worker(
     let child = command
         .spawn()
         .map_err(|error| format!("Cannot start filename indexer: {error}"))?;
+    assign_to_workers_job(&child);
     let worker = SearchIndexWorkerProcess {
         child: Arc::new(Mutex::new(child)),
         status_path,
@@ -5387,6 +5408,7 @@ fn start_isolated_watch_worker(
     let child = command
         .spawn()
         .map_err(|error| format!("Cannot start isolated index watcher: {error}"))?;
+    assign_to_workers_job(&child);
     let worker = SearchIndexWorkerProcess {
         child: Arc::new(Mutex::new(child)),
         status_path: status_path.clone(),

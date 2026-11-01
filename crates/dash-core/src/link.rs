@@ -28,6 +28,15 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const EVENT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Sent to the app's own listener when this process becomes the owner.
 pub const BECAME_OWNER_EVENT: &str = "dash-became-owner";
+/// Sent to the app's own listener when another process owns the engines
+/// while this one thought it did: it should stop its engines and follow.
+pub const LOST_OWNERSHIP_EVENT: &str = "dash-lost-ownership";
+/// How often the owner checks that it still holds the owner lock.
+const GUARD_EVERY: Duration = Duration::from_secs(5);
+/// What the link writes down (claims, takeovers, a lost lock), in the
+/// shared folder: `logs\link.log`, kept under this size.
+const LOG_FILE: &str = "link.log";
+const LOG_MAX_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -117,23 +126,43 @@ pub fn when_owner(start: impl FnOnce() + Send + 'static) {
 pub fn claim(dir: &Path, app: &str, prepare: impl Fn() + Send + Sync + 'static, listener: Listener) -> Role {
     let _ = std::fs::create_dir_all(dir);
     let _ = LISTENER.set(listener);
+    let _ = PREPARE.set(Arc::new(prepare));
     {
         let mut st = lock_state();
         st.dir = dir.to_path_buf();
         st.app = app.to_string();
     }
     if let Some(lock) = try_lock(dir) {
-        prepare();
+        log(dir, "claimed the engines (owner)");
+        run_prepare();
         become_owner(lock);
         return Role::Owner;
     }
+    follow(dir);
+    Role::Follower
+}
+
+/// What `claim` was given to run on becoming the owner.
+static PREPARE: OnceLock<Arc<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+fn run_prepare() {
+    if let Some(prepare) = PREPARE.get() {
+        prepare();
+    }
+}
+
+/// Becomes a follower of whoever owns `dir`, and takes over when it's gone.
+fn follow(dir: &Path) {
+    let owner = read_owner_file(dir).map(|o| format!("{} pid {}", o.app, o.pid)).unwrap_or_else(|| "unknown".into());
+    log(dir, &format!("follows {owner}"));
     lock_state().role = Role::Follower;
     connect_follower();
     let dir = dir.to_path_buf();
     let _ = std::thread::Builder::new().name("dash-link-takeover".into()).spawn(move || loop {
         std::thread::sleep(Duration::from_secs(2));
         if let Some(lock) = try_lock(&dir) {
-            prepare();
+            log(&dir, "took over the engines (owner)");
+            run_prepare();
             become_owner(lock);
             let starts = std::mem::take(&mut lock_state().when_owner);
             for start in starts {
@@ -145,7 +174,6 @@ pub fn claim(dir: &Path, app: &str, prepare: impl Fn() + Send + Sync + 'static, 
             break;
         }
     });
-    Role::Follower
 }
 
 /// Who owns the shared folder now, if anyone.
@@ -184,10 +212,7 @@ fn become_owner(lock: File) {
     };
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     let info = OwnerInfo { app, pid: std::process::id(), port, token: token.clone() };
-    let tmp = dir.join(format!("{OWNER_FILE}.tmp"));
-    if std::fs::write(&tmp, serde_json::to_vec(&info).unwrap_or_default()).is_ok() {
-        let _ = std::fs::rename(&tmp, dir.join(OWNER_FILE));
-    }
+    write_owner_file(&dir, &info);
     {
         let mut st = lock_state();
         st.role = Role::Owner;
@@ -200,6 +225,107 @@ fn become_owner(lock: File) {
             let _ = std::thread::Builder::new().name("dash-link-conn".into()).spawn(move || serve(stream, &token));
         }
     });
+    let _ = std::thread::Builder::new().name("dash-link-guard".into()).spawn(move || guard_ownership(dir, info));
+}
+
+/// What a look at the owner lock found.
+enum Check {
+    /// This process holds it. `owner.json` naming another process (one
+    /// without the lock) is to be rewritten.
+    Held { renamed: bool },
+    /// This process's handle didn't hold it and nobody else did: a new
+    /// handle holds it now.
+    Retaken(File),
+    /// Another process holds it.
+    Lost(Option<OwnerInfo>),
+}
+
+/// `ours`: the handle this process locked when it became the owner. Only
+/// that handle can release the lock, which tells whether it still holds
+/// it (a second handle can't lock it either way); it's locked again at once.
+fn check_ownership(dir: &Path, me: u32, ours: Option<&File>) -> Check {
+    let named_other = || read_owner_file(dir).filter(|o| o.pid != me);
+    if let Some(ours) = ours {
+        if ours.unlock().is_ok() {
+            return match ours.try_lock() {
+                Ok(()) => Check::Held { renamed: named_other().is_some() },
+                // Taken in that instant by a process waiting to take over.
+                Err(_) => Check::Lost(named_other()),
+            };
+        }
+    }
+    match try_lock(dir) {
+        Some(fresh) => Check::Retaken(fresh),
+        None => Check::Lost(named_other()),
+    }
+}
+
+/// The owner's watch on its own lock: two processes must never both run
+/// the engines (two writers on one index). A lock found free is taken
+/// again; another owner makes this one step down.
+fn guard_ownership(dir: PathBuf, mine: OwnerInfo) {
+    loop {
+        std::thread::sleep(GUARD_EVERY);
+        if role() != Role::Owner {
+            return;
+        }
+        let check = {
+            let st = lock_state();
+            check_ownership(&dir, mine.pid, st._lock.as_ref())
+        };
+        match check {
+            Check::Held { renamed: false } => {}
+            Check::Held { renamed: true } => {
+                log(&dir, "owner.json named a process without the owner lock; named this owner again");
+                write_owner_file(&dir, &mine);
+            }
+            Check::Retaken(lock) => {
+                log(&dir, "owner lock wasn't held by this owner; taken again");
+                lock_state()._lock = Some(lock);
+                if read_owner_file(&dir).is_none_or(|o| o.pid != mine.pid) {
+                    write_owner_file(&dir, &mine);
+                }
+            }
+            Check::Lost(other) => {
+                let other = other.map(|o| format!("{} pid {}", o.app, o.pid)).unwrap_or_else(|| "another process".into());
+                log(&dir, &format!("{other} holds the owner lock; this one steps down"));
+                // From now on engine calls go to that owner, and this
+                // process takes over only once it's gone.
+                {
+                    let mut st = lock_state();
+                    st._lock = None;
+                    st.client = None;
+                }
+                follow(&dir);
+                if let Some(listener) = LISTENER.get() {
+                    listener(LOST_OWNERSHIP_EVENT, Value::Null);
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn write_owner_file(dir: &Path, info: &OwnerInfo) {
+    let tmp = dir.join(format!("{OWNER_FILE}.tmp"));
+    if std::fs::write(&tmp, serde_json::to_vec(info).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&tmp, dir.join(OWNER_FILE));
+    }
+}
+
+/// Appends a timestamped line to `logs\link.log` (this process's id in it);
+/// a full log starts over, the old one kept as `link.log.old`.
+pub fn log(dir: &Path, message: &str) {
+    let logs = dir.join("logs");
+    let _ = std::fs::create_dir_all(&logs);
+    let path = logs.join(LOG_FILE);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX_BYTES) {
+        let _ = std::fs::rename(&path, logs.join(format!("{LOG_FILE}.old")));
+    }
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(file, "{ms} pid {} {message}", std::process::id());
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -453,6 +579,41 @@ fn random_token() -> Result<String, String> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The owner's self-check: holding, a lock found free (taken again),
+    /// and another process owning the engines.
+    #[test]
+    fn owner_checks_it_still_holds_the_lock() {
+        let dir = std::env::temp_dir().join(format!("dash-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = 111;
+        let info = |pid| OwnerInfo { app: "test".into(), pid, port: 1, token: "t".into() };
+        write_owner_file(&dir, &info(me));
+
+        let held = try_lock(&dir).expect("lock");
+        assert!(matches!(check_ownership(&dir, me, Some(&held)), Check::Held { renamed: false }));
+        assert!(try_lock(&dir).is_none(), "still held after the check");
+
+        // owner.json names a process without the lock: still ours, renamed.
+        write_owner_file(&dir, &info(333));
+        assert!(matches!(check_ownership(&dir, me, Some(&held)), Check::Held { renamed: true }));
+        write_owner_file(&dir, &info(me));
+
+        // Our handle lost the lock and nobody holds it: taken again.
+        held.unlock().unwrap();
+        let Check::Retaken(again) = check_ownership(&dir, me, Some(&held)) else { panic!("a free lock is taken again") };
+        assert!(try_lock(&dir).is_none(), "and stays held");
+
+        // Another owner holds it (here: `again`) and owner.json names it.
+        write_owner_file(&dir, &info(222));
+        let Check::Lost(Some(other)) = check_ownership(&dir, me, Some(&held)) else { panic!("another owner is noticed") };
+        assert_eq!(other.pid, 222);
+
+        drop((held, again));
+        log(&dir, "a line");
+        assert!(std::fs::read_to_string(dir.join("logs").join(LOG_FILE)).unwrap().contains("a line"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn request_lines_are_capped() {

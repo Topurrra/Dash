@@ -49,9 +49,27 @@ pub fn claim_engines() {
         &dash_core::shared::shared_data_dir(),
         "Dash",
         || {},
-        Arc::new(|_: &str, _: serde_json::Value| {}),
+        Arc::new(|event: &str, _: serde_json::Value| {
+            if event == dash_core::link::LOST_OWNERSHIP_EVENT {
+                restart_as_follower();
+            }
+        }),
     );
 }
+
+/// Another process owns the engines while this one ran them too: stop this
+/// one's workers and start Dash again, which then follows that owner. (Its
+/// clipboard capture, watchers and schedules can't be stopped piecemeal.)
+fn restart_as_follower() {
+    dash_search::search::stop_all_index_workers();
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).args(["--background", RESTARTED]).spawn();
+    }
+    std::process::exit(0);
+}
+
+/// Given to the restarted Dash: wait for this one to let go of the hotkeys.
+pub const RESTARTED: &str = "--restarted";
 
 /// First run (no saved index settings): index every drive's names and the
 /// home folder's contents. Later runs: the
