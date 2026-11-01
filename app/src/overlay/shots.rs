@@ -97,7 +97,31 @@ const SCENES: &[(&str, Scene)] = &[
     // Drags the list's scrollbar thumb down with mouse messages sent to this
     // window only (the real pointer doesn't move).
     ("22-scrollbar-dragged", |_, w, _| drag(w, (655, 142), (655, 420))),
+    ("23-clipboard-list", |v, w, cx| {
+        v.clip_view = ClipView::List;
+        v.set_mode(Mode::Clipboard, w, cx);
+        type_query(v, "", cx);
+    }),
+    ("24-clip-menu", |_, w, _| right_click(w, (200, 160))),
 ];
+
+/// A right-click at `at` (client pixels), sent to this window only.
+#[cfg(windows)]
+fn right_click(window: &Window, at: (i32, i32)) {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP};
+    let Some(hwnd) = window_handle(window) else { return };
+    let pos = LPARAM(((at.1 as u16 as isize) << 16) | (at.0 as u16 as isize));
+    // SAFETY: posting to this live window; the messages carry plain values.
+    unsafe {
+        let _ = PostMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), pos);
+        let _ = PostMessageW(hwnd, WM_RBUTTONDOWN, WPARAM(2), pos);
+        let _ = PostMessageW(hwnd, WM_RBUTTONUP, WPARAM(0), pos);
+    }
+}
+
+#[cfg(not(windows))]
+fn right_click(_: &Window, _: (i32, i32)) {}
 
 /// Presses at `from`, moves in steps to `to`, releases (client pixels).
 #[cfg(windows)]

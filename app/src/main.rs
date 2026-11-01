@@ -30,11 +30,13 @@ fn main() {
     let _runtime = host::runtime().enter();
     // Run the engines, or follow another app that already does.
     host::claim_engines();
-    host::start_search_engines();
+    // Pictures only: no scheduled builds or watchers, even if this run ends
+    // up owning the engines (searches still load the index when asked).
     if shots.is_none() {
-        if let Err(e) = dash_clipboard::start_clipboard_listener(host::host()) {
-            eprintln!("dash: clipboard capture unavailable: {e}");
-        }
+        host::start_search_engines();
+    }
+    if let Err(e) = dash_clipboard::start_clipboard_listener(host::host()) {
+        eprintln!("dash: clipboard capture unavailable: {e}");
     }
 
     Application::new().with_assets(icons::Assets).run(|cx: &mut App| {

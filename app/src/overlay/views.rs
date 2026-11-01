@@ -248,6 +248,9 @@ impl Overlay {
                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                                 this.click_clip(ix, event.click_count, window, cx)
                             }))
+                            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                this.clip_right_click(ix, event.position, cx)
+                            }))
                             .when(clip.image.is_some(), |d| d.child(icon(Icon::Image, 13., theme::muted())))
                             .child(div().flex_1().min_w_0().text_sm().text_color(theme::text()).one_line().child(clip.text.clone()))
                             .when(clip.pinned, |d| d.child(icon(Icon::Pin, 12., theme::accent())))
@@ -318,6 +321,9 @@ impl Overlay {
                                     .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                                         this.click_clip(ix, event.click_count, window, cx)
                                     }))
+                                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                        this.clip_right_click(ix, event.position, cx)
+                                    }))
                                     .child(body)
                                     .child(
                                         div()
@@ -345,6 +351,74 @@ impl Overlay {
         self.with_list_scrollbar(list)
     }
 
+    /// Right-click on a clipboard entry (any view): select it, open its menu.
+    pub(super) fn clip_right_click(&mut self, ix: usize, at: Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        self.selected = ix;
+        self.update_preview(cx);
+        self.clip_menu = Some(at);
+        cx.notify();
+    }
+
+    /// The clipboard entry's menu: the same actions as its keys.
+    pub(super) fn render_clip_menu(&self, at: Point<gpui::Pixels>, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let pinned = self.clips.get(self.selected).is_some_and(|c| c.pinned);
+        let items: [(ClipAction, &'static str, &'static str); 4] = [
+            (ClipAction::Paste, "Paste", "Enter"),
+            (ClipAction::Copy, "Copy", "Ctrl+Enter"),
+            (ClipAction::Pin, if pinned { "Unpin" } else { "Pin" }, "Alt+P"),
+            (ClipAction::Delete, "Delete", "Alt+D"),
+        ];
+        gpui::deferred(
+            gpui::anchored().position(at).snap_to_window().child(
+                div()
+                    .id("clip-menu")
+                    .occlude()
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .min_w(px(190.))
+                    .rounded_lg()
+                    .bg(theme::menu())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_md()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.clip_menu = None;
+                        cx.notify();
+                    }))
+                    .children(items.into_iter().map(|(action, label, keys)| {
+                        div()
+                            .id(label)
+                            .flex()
+                            .justify_between()
+                            .gap_4()
+                            .px_3()
+                            .py_1()
+                            .text_sm()
+                            .text_color(if action == ClipAction::Delete { theme::danger() } else { theme::text() })
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()))
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| this.run_clip_action(action, window, cx)))
+                            .child(label)
+                            .child(div().text_xs().text_color(theme::muted()).child(keys))
+                    })),
+            ),
+        )
+        .with_priority(1)
+        .into_any_element()
+    }
+
+    fn run_clip_action(&mut self, action: ClipAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.clip_menu = None;
+        match action {
+            ClipAction::Paste => self.on_open(&OpenSelected, window, cx),
+            ClipAction::Copy => self.on_reveal(&RevealSelected, window, cx),
+            ClipAction::Pin => self.on_toggle_pin(&TogglePin, window, cx),
+            ClipAction::Delete => self.on_delete_entry(&DeleteEntry, window, cx),
+        }
+        cx.notify();
+    }
+
     /// A click on a clipboard entry (any view): select it; double: paste.
     pub(super) fn click_clip(&mut self, ix: usize, clicks: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = ix;
@@ -354,6 +428,14 @@ impl Overlay {
             self.on_open(&OpenSelected, window, cx);
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClipAction {
+    Paste,
+    Copy,
+    Pin,
+    Delete,
 }
 
 const WINDOW_WIDTH: f32 = 1120.;

@@ -157,6 +157,8 @@ pub struct Overlay {
     clip_view: ClipView,
     /// Picture thumbnails for the Files grid.
     thumbs: views::Thumbs,
+    /// The clipboard entry menu, where it opened (for the selected entry).
+    clip_menu: Option<Point<gpui::Pixels>>,
     /// The video or music in the pane, by path.
     player: Option<(String, Player)>,
     settings: Entity<Settings>,
@@ -208,6 +210,7 @@ impl Overlay {
             search_view: prefs.search,
             clip_view: prefs.clipboard,
             thumbs: views::Thumbs::default(),
+            clip_menu: None,
             player: None,
             settings: cx.new(Settings::new),
             drawn_frame: None,
@@ -253,6 +256,8 @@ impl Overlay {
             .collect();
         entries.sort_by_key(|e| !e.is_pinned);
         self.clips = entries.into_iter().map(clip).collect();
+        // Its entry may have moved (pinned first) or gone.
+        self.clip_menu = None;
         let apps: Vec<(String, bool)> = self.clips.iter().filter_map(|c| c.app_path.clone()).map(|p| (p, false)).collect();
         self.request_icons(apps, cx);
         self.selected = self.selected.min(self.clips.len().saturating_sub(1));
@@ -631,8 +636,12 @@ impl Overlay {
     }
 
     fn on_dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
-        // Esc first closes the table's menu, rename box or delete question.
+        // Esc first closes a menu, the rename box or the delete question.
         if self.files_tab() && self.table_escape(window, cx) {
+            return;
+        }
+        if self.clip_menu.take().is_some() {
+            cx.notify();
             return;
         }
         self.hide(window, cx);
@@ -645,6 +654,7 @@ impl Overlay {
         self.settings.update(cx, |settings, cx| settings.stop_recording(cx));
         // A delete question or rename left open mustn't run on the next Enter.
         self.table_forget_pending();
+        self.clip_menu = None;
         window.remove_window();
     }
 
@@ -817,7 +827,8 @@ impl Overlay {
                     empty_state(Icon::Search, format!("Nothing copied matches “{query}”"), None)
                 };
             }
-            return self.render_clips(cx);
+            let menu = self.clip_menu.map(|at| self.render_clip_menu(at, cx));
+            return div().flex().flex_col().flex_1().min_h_0().child(self.render_clips(cx)).children(menu).into_any_element();
         }
         if let Some(error) = &self.error {
             return empty_state(Icon::Search, "Search isn't working right now", Some(error.as_str()));
@@ -962,6 +973,10 @@ impl Overlay {
                                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                                     this.click_clip(ix, event.click_count, window, cx)
                                 }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.clip_right_click(ix, event.position, cx)),
                             )
                             .child(match clip.image.clone() {
                                 Some(path) => div()

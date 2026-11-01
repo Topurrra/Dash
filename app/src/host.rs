@@ -54,7 +54,7 @@ pub fn claim_engines() {
 }
 
 /// First run (no saved index settings): index every drive's names and the
-/// home folder's contents, quietly. Later runs: the
+/// home folder's contents. Later runs: the
 /// scheduler keeps them fresh. Only the owner does this.
 pub fn start_search_engines() {
     use dash_search::search as s;
@@ -82,13 +82,15 @@ fn seed_first_index(host: Arc<dyn dash_core::Host>) {
         "performanceMode": "balanced",
         "watcherEnabled": true,
     }));
+    // Built with the saved mode (Balanced: below-normal priority with short
+    // pauses). Not Quiet: idle priority, 2 threads and 18 ms per file made a
+    // first index of a big drive take hours. Names first: they're what
+    // search needs; the contents take longer.
     if let Ok(options) = options {
         let _ = s::save_file_search_index_options(host.clone(), options.clone());
-        let mut build = options;
-        build.performance_mode = "quiet".into();
         runtime().spawn(async move {
-            let _ = s::start_content_search_index(host.clone(), build.clone()).await;
-            let _ = s::start_filename_search_index(host, build).await;
+            let _ = s::start_filename_search_index(host.clone(), options.clone()).await;
+            let _ = s::start_content_search_index(host, options).await;
         });
     }
 }
