@@ -45,6 +45,8 @@ pub struct Music {
     pub artist: Option<SharedString>,
     pub album: Option<SharedString>,
     pub cover: Option<Arc<gpui::Image>>,
+    /// From the file, in 100 ns units: the player only knows once it plays.
+    pub length: u64,
 }
 
 const AUDIO_EXTS: &[&str] = &["mp3", "flac", "wav", "ogg", "m4a", "aac", "opus", "wma"];
@@ -81,7 +83,8 @@ fn music(path: &Path, details: &mut Vec<(&'static str, SharedString)>) -> Option
         };
         Some(Arc::new(gpui::Image::from_bytes(format, picture.data().to_vec())))
     });
-    Some(Music { title, artist, album, cover })
+    let length = u64::try_from(props.duration().as_nanos() / 100).unwrap_or(u64::MAX);
+    Some(Music { title, artist, album, cover, length })
 }
 
 /// Reads `path` for the pane. `query` marks the first line that matches.
@@ -103,7 +106,7 @@ pub fn load(path: String, query: &str) -> Preview {
         }
         Ok(_) if IMAGE_EXTS.contains(&ext.as_str()) => Body::Image(p.to_path_buf()),
         Ok(_) if MEDIA_EXTS.contains(&ext.as_str()) => Body::Media(p.to_path_buf()),
-        Ok(_) => match dash_search::search::read_file_preview(path.clone(), Some(256 * 1024)) {
+        Ok(_) => match dash_search::search::read_file_preview(path.clone(), Some(PREVIEW_BYTES)).or_else(|| sniff_text(p)) {
             Some(text) if !text.trim().is_empty() => text_body(&text, !DOC_EXTS.contains(&ext.as_str()), query),
             _ => Body::Note("No preview for this kind of file.".into()),
         },
@@ -126,6 +129,37 @@ pub fn load(path: String, query: &str) -> Preview {
     Preview { path, name: name.into(), details, body, music }
 }
 
+const PREVIEW_BYTES: usize = 256 * 1024;
+
+/// Any other file that turns out to be text (`.cs`, `Makefile`,
+/// `.gitignore`…): UTF-8 with no zero bytes. Only read, never parsed.
+fn sniff_text(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).ok()?.take(PREVIEW_BYTES as u64).read_to_end(&mut bytes).ok()?;
+    looks_like_text(bytes)
+}
+
+fn looks_like_text(mut bytes: Vec<u8>) -> Option<String> {
+    if bytes.contains(&0) {
+        return None;
+    }
+    if bytes.starts_with(b"\xEF\xBB\xBF") {
+        bytes.drain(..3);
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Some(text),
+        // Cut mid-character at the read limit: keep what came before.
+        Err(e) if e.utf8_error().error_len().is_none() => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).ok()
+        }
+        Err(_) => None,
+    }
+}
+
 /// A clipboard entry's text, for the pane (no file behind it).
 pub fn text_only(text: &str) -> Body {
     text_body(text, false, "")
@@ -144,6 +178,19 @@ fn text_body(text: &str, code: bool, query: &str) -> Body {
         }))
         .flatten();
     Body::Text { lines, code, hit, truncated, full: text.to_string().into() }
+}
+
+/// 1234567 → "1,234,567".
+pub fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 pub fn human_size(bytes: u64) -> String {
@@ -168,6 +215,16 @@ fn when(t: std::time::SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_is_told_from_binary() {
+        assert_eq!(looks_like_text(b"class Invoice {}\n".to_vec()).as_deref(), Some("class Invoice {}\n"));
+        assert_eq!(looks_like_text(b"\xEF\xBB\xBFusing System;".to_vec()).as_deref(), Some("using System;"));
+        // Cut in the middle of "é" at the read limit.
+        assert_eq!(looks_like_text(b"caf\xC3".to_vec()).as_deref(), Some("caf"));
+        assert_eq!(looks_like_text(b"MZ\x90\x00\x03".to_vec()), None);
+        assert_eq!(looks_like_text(b"\xFF\xFEa\xFF".to_vec()), None);
+    }
 
     /// Writes tags and a cover into a copy of a Windows sound, then reads them back.
     #[cfg(windows)]

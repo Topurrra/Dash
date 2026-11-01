@@ -21,7 +21,11 @@ use crate::files_table::{self as ft, PageCache, Selection, PAGE};
 const MAX_OPEN: usize = 20;
 /// The most rows a file action takes at once.
 const MAX_ACT: usize = 5000;
+/// Table rows; Compact view's are shorter.
 const ROW_HEIGHT: f32 = 30.;
+const COMPACT_ROW_HEIGHT: f32 = 23.;
+/// List view: name over its folder.
+const LIST_ROW_HEIGHT: f32 = 48.;
 /// How far the mouse moves with the button down before a drag starts.
 const DRAG_START: f32 = 5.;
 /// The index's watcher needs a moment to see a change before a refresh.
@@ -93,16 +97,20 @@ impl Table {
         }
     }
 
+    pub(super) fn focus_ix(&self) -> usize {
+        self.sel.focus()
+    }
+
     pub(super) fn focus_path(&self) -> Option<String> {
         self.cache.row(self.sel.focus()).map(|r| r.path.clone())
     }
 
-    /// Footer: "12 of 4,512 · 3 selected · 4 ms".
+    /// Footer: "4,512 items · 3 selected · 4 ms".
     pub(super) fn summary(&self) -> String {
         if self.total == 0 {
             return String::new();
         }
-        let mut text = format!("{} of {}", thousands(self.sel.focus() + 1), thousands(self.total));
+        let mut text = plural(self.total);
         if self.sel.count() > 1 {
             text.push_str(&format!(" · {} selected", thousands(self.sel.count())));
         }
@@ -111,17 +119,7 @@ impl Table {
     }
 }
 
-fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
-}
+pub(super) use crate::preview::thousands;
 
 /// One page of a name search, on the engine runtime.
 async fn fetch(options: NameQueryOptions) -> Result<NameSearchResult, String> {
@@ -133,7 +131,7 @@ async fn fetch(options: NameQueryOptions) -> Result<NameSearchResult, String> {
         .and_then(|r| r)
 }
 
-fn plural(n: usize) -> String {
+pub(super) fn plural(n: usize) -> String {
     if n == 1 {
         "1 item".into()
     } else {
@@ -267,7 +265,7 @@ impl Overlay {
         self.table.confirm = None;
         self.table.notice = None;
         self.table.menu = None;
-        self.scroll.scroll_to_item(self.table.sel.focus(), ScrollStrategy::Center);
+        self.scroll_to_index(self.table.sel.focus(), cx);
         self.update_preview(cx);
         cx.notify();
     }
@@ -878,19 +876,45 @@ impl Overlay {
     // ── Drawing ────────────────────────────────────────────────────────
 
     pub(super) fn render_table(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let header = self.render_header(cx);
+        let view = self.search_view;
+        let header = match view {
+            SearchView::Table | SearchView::Compact => self.render_header(cx).into_any_element(),
+            SearchView::List | SearchView::Grid => self.render_sort_bar(cx),
+        };
         let menu = self.table.menu.map(|at| self.render_menu(at, cx));
         let focus = self.table.sel.focus();
-        let list = uniform_list(
-            "files-table",
-            self.table.total,
-            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
-                this.ensure_rows(range.clone(), cx);
-                range.map(|ix| this.render_row(ix, ix == focus, cx)).collect::<Vec<_>>()
-            }),
-        )
+        let total = self.table.total;
+        let list = match view {
+            SearchView::Grid => {
+                let cols = self.grid_cols();
+                uniform_list(
+                    "files-grid",
+                    total.div_ceil(cols),
+                    cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                        this.ensure_rows(range.start * cols..(range.end * cols).min(total), cx);
+                        range.map(|r| this.render_tile_row(r, cols, focus, cx)).collect::<Vec<_>>()
+                    }),
+                )
+            }
+            _ => uniform_list(
+                "files-table",
+                total,
+                cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                    this.ensure_rows(range.clone(), cx);
+                    range
+                        .map(|ix| match view {
+                            SearchView::List => this.render_list_row(ix, ix == focus, cx),
+                            _ => this.render_row(ix, ix == focus, cx),
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            ),
+        }
         .track_scroll(self.scroll.clone())
-        .flex_1();
+        .flex_1()
+        .px_2()
+        .into_any_element();
+        let list = self.with_list_scrollbar(list);
         div()
             .flex()
             .flex_col()
@@ -907,47 +931,48 @@ impl Overlay {
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (sort, descending) = (self.table.sort, self.table.descending);
         let column = |key: SortKey, label: &'static str| {
-            let arrow = if sort == key { if descending { " ▼" } else { " ▲" } } else { "" };
+            let sorted = sort == key;
             div()
                 .id(label)
                 .flex()
+                .items_center()
+                .gap_0p5()
                 .min_w_0()
-                .truncate()
                 .cursor_pointer()
-                .when(sort == key, |d| d.text_color(theme::text()))
+                .when(sorted, |d| d.text_color(theme::text_2()))
                 .hover(|s| s.text_color(theme::text()))
                 .on_click(cx.listener(move |this, _, _, cx| this.set_sort(key, cx)))
-                .child(format!("{label}{arrow}"))
+                .child(div().one_line().child(label))
+                .when(sorted, |d| d.child(icon(if descending { Icon::Down } else { Icon::Up }, 12., theme::text_2())))
         };
         div()
             .flex()
             .flex_none()
             .items_center()
-            .gap_2()
-            .h(px(26.))
-            .px_2()
+            .gap_3()
+            .h(px(if self.search_view == SearchView::Compact { 24. } else { 28. }))
+            .px_3()
             .mx_2()
             .text_xs()
             .text_color(theme::muted())
-            .border_b_1()
-            .border_color(theme::border())
             .child(column(SortKey::Name, "Name").flex_1().pl(px(26.)))
-            .child(column(SortKey::Path, "Path").flex_1())
-            .child(column(SortKey::Size, "Size").w(px(64.)).flex_none().justify_end())
-            .child(column(SortKey::Modified, "Modified").w(px(108.)).flex_none())
-            .child(column(SortKey::Type, "Type").w(px(52.)).flex_none())
+            .child(column(SortKey::Path, "Folder").flex_1())
+            .child(column(SortKey::Size, "Size").w(px(60.)).flex_none().justify_end())
+            .child(column(SortKey::Modified, "Modified").w(px(116.)).flex_none())
+            .child(column(SortKey::Type, "Type").w(px(48.)).flex_none())
     }
 
     fn render_row(&mut self, ix: usize, focused: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let compact = self.search_view == SearchView::Compact;
+        let row_height = if compact { COMPACT_ROW_HEIGHT } else { ROW_HEIGHT };
         let Some(row) = self.table.cache.row(ix).cloned() else {
             return div()
                 .id(ix)
                 .flex()
                 .items_center()
-                .h(px(ROW_HEIGHT))
-                .px_2()
-                .mx_2()
-                .pl(px(34.))
+                .w_full()
+                .h(px(row_height))
+                .pl(px(42.))
                 .text_xs()
                 .text_color(theme::muted())
                 .child("…")
@@ -980,23 +1005,10 @@ impl Overlay {
                 .into_any_element(),
         };
         let name = match renaming {
-            Some(input) => div()
-                .flex()
-                .flex_1()
-                .min_w_0()
-                .h(px(22.))
-                .items_center()
-                .px_1()
-                .rounded_sm()
-                .border_1()
-                .border_color(theme::accent())
-                .bg(theme::bg())
-                .text_sm()
-                .child(input)
-                .into_any_element(),
-            None => div().flex_1().min_w_0().truncate().text_color(theme::text()).child(row.name.clone()).into_any_element(),
+            Some(input) => rename_box(input, true),
+            None => div().flex_1().min_w_0().one_line().text_color(theme::text()).child(row.name.clone()).into_any_element(),
         };
-        let cell = || div().flex_none().text_xs().text_color(theme::muted()).truncate();
+        let cell = || div().flex_none().text_xs().text_color(theme::muted()).one_line();
         // With several selected, a faint ring marks the focused (previewed) one.
         let ring: gpui::Hsla =
             if focused && self.table.sel.count() > 1 { theme::border().into() } else { gpui::transparent_black() };
@@ -1004,17 +1016,18 @@ impl Overlay {
             .id(ix)
             .flex()
             .items_center()
-            .gap_2()
-            .h(px(ROW_HEIGHT))
-            .px_2()
-            .mx_2()
+            .gap_3()
+            .w_full()
+            .h(px(row_height))
+            .px_3()
             .rounded_md()
-            .text_sm()
+            .when(compact, |d| d.text_xs())
+            .when(!compact, |d| d.text_sm())
             .cursor_pointer()
             .border_1()
             .border_color(ring)
-            .when(selected, |d| d.bg(theme::accent_soft()))
-            .when(!selected, |d| d.hover(|s| s.bg(theme::panel())))
+            .when(selected, |d| d.bg(theme::selected()))
+            .when(!selected, |d| d.hover(|s| s.bg(theme::hover())))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| this.row_mouse_down(ix, event, window, cx)),
@@ -1024,18 +1037,201 @@ impl Overlay {
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| this.row_right_click(ix, event, window, cx)),
             )
             .child(div().flex().flex_1().min_w_0().items_center().gap_2().child(icon).child(name))
-            .child(div().flex_1().min_w_0().truncate().text_xs().text_color(theme::muted()).child(ft::folder_of(&row.path).to_string()))
-            .child(cell().w(px(64.)).text_right().child(if row.is_dir { String::new() } else { human_size(row.size) }))
-            .child(cell().w(px(108.)).child(ft::modified_text(row.modified_ms)))
-            .child(cell().w(px(52.)).child(ft::type_text(&row)))
+            .child(div().flex_1().min_w_0().one_line().text_xs().text_color(theme::muted()).child(ft::short_folder(ft::folder_of(&row.path), 30)))
+            .child(cell().w(px(60.)).text_right().child(if row.is_dir { String::new() } else { human_size(row.size) }))
+            .child(cell().w(px(116.)).child(ft::modified_text(row.modified_ms)))
+            .child(cell().w(px(48.)).child(ft::type_text(&row)))
+            .into_any_element()
+    }
+
+    /// The file's shell icon at `size`, or its extension in a box until it loads.
+    fn file_icon(&self, row: &NameRow, size: f32) -> gpui::AnyElement {
+        match self.icon(&row.path, row.is_dir) {
+            Some(icon) => img(icon).size(px(size)).flex_none().into_any_element(),
+            None => div()
+                .flex_none()
+                .size(px(size))
+                .rounded_sm()
+                .bg(theme::panel_2())
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px((size * 0.38).max(7.)))
+                .text_color(theme::text_2())
+                .child(ext_badge(&row.path, row.is_dir))
+                .into_any_element(),
+        }
+    }
+
+    /// Mouse handlers every view's item shares (select, open, drag, menu).
+    fn item_mouse(&self, item: gpui::Stateful<gpui::Div>, ix: usize, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        item.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| this.row_mouse_down(ix, event, window, cx)),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| this.row_right_click(ix, event, window, cx)),
+        )
+    }
+
+    /// List view: icon, name over the full folder, size and date.
+    fn render_list_row(&mut self, ix: usize, focused: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(row) = self.table.cache.row(ix).cloned() else {
+            return div().id(ix).w_full().h(px(LIST_ROW_HEIGHT)).into_any_element();
+        };
+        let selected = self.table.sel.contains(ix);
+        let renaming = self.table.rename.as_ref().filter(|r| r.ix == ix).map(|r| r.input.clone());
+        let ring: gpui::Hsla =
+            if focused && self.table.sel.count() > 1 { theme::border().into() } else { gpui::transparent_black() };
+        let meta = if row.is_dir {
+            ft::modified_text(row.modified_ms)
+        } else {
+            format!("{} · {}", human_size(row.size), ft::modified_text(row.modified_ms))
+        };
+        let item = div()
+            .id(ix)
+            .flex()
+            .items_center()
+            .gap_3()
+            .w_full()
+            .h(px(LIST_ROW_HEIGHT))
+            .px_3()
+            .rounded_lg()
+            .cursor_pointer()
+            .border_1()
+            .border_color(ring)
+            .when(selected, |d| d.bg(theme::selected()))
+            .when(!selected, |d| d.hover(|s| s.bg(theme::hover())))
+            .child(self.file_icon(&row, 28.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(match renaming {
+                        Some(input) => rename_box(input, false),
+                        None => div().text_sm().text_color(theme::text()).one_line().child(row.name.clone()).into_any_element(),
+                    })
+                    .child(div().text_xs().text_color(theme::muted()).one_line().child(ft::folder_of(&row.path).to_string())),
+            )
+            .child(div().flex_none().text_xs().text_color(theme::muted()).child(meta));
+        self.item_mouse(item, ix, cx).into_any_element()
+    }
+
+    /// Grid view: one row of tiles (`cols` of them), pictures as thumbnails.
+    fn render_tile_row(&mut self, r: usize, cols: usize, focus: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let total = self.table.total;
+        let tiles: Vec<gpui::AnyElement> = (r * cols..((r + 1) * cols).min(total))
+            .map(|ix| {
+                let Some(row) = self.table.cache.row(ix).cloned() else {
+                    return div().id(ix).w(px(views::TILE_W)).h(px(views::TILE_H)).into_any_element();
+                };
+                let selected = self.table.sel.contains(ix);
+                let focused = ix == focus && self.table.sel.count() > 1;
+                let renaming = self.table.rename.as_ref().filter(|r| r.ix == ix).map(|r| r.input.clone());
+                let picture = match self.thumb(&row.path, cx) {
+                    Some(thumb) => div()
+                        .size(px(84.))
+                        .rounded_md()
+                        .overflow_hidden()
+                        .bg(theme::panel_2())
+                        .child(img(thumb).size_full().object_fit(ObjectFit::Cover))
+                        .into_any_element(),
+                    None => div().size(px(84.)).flex().items_center().justify_center().child(self.file_icon(&row, 52.)).into_any_element(),
+                };
+                let item = div()
+                    .id(ix)
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1p5()
+                    .w(px(views::TILE_W))
+                    .h(px(views::TILE_H))
+                    .pt_2()
+                    .px_1p5()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if focused { theme::border() } else { gpui::transparent_black().into() })
+                    .when(selected, |d| d.bg(theme::selected()))
+                    .when(!selected, |d| d.hover(|s| s.bg(theme::hover())))
+                    .child(picture)
+                    .child(match renaming {
+                        Some(input) => rename_box(input, false),
+                        None => div()
+                            .w_full()
+                            .text_xs()
+                            .line_height(px(15.))
+                            .text_center()
+                            .text_color(theme::text())
+                            .line_clamp(2)
+                            // Two short lines' worth, cut in the middle.
+                            .child(ft::short_name(&row.name, 26))
+                            .into_any_element(),
+                    });
+                self.item_mouse(item, ix, cx).into_any_element()
+            })
+            .collect();
+        div()
+            .id(("tile-row", r))
+            .flex()
+            .gap(px(views::GRID_GAP))
+            .h(px(views::TILE_H + views::GRID_GAP))
+            .children(tiles)
+            .into_any_element()
+    }
+
+    /// List and Grid have no column headers: the sort order picks from here.
+    fn render_sort_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (sort, descending) = (self.table.sort, self.table.descending);
+        let keys = [
+            (SortKey::Relevance, "Best match"),
+            (SortKey::Name, "Name"),
+            (SortKey::Path, "Folder"),
+            (SortKey::Size, "Size"),
+            (SortKey::Modified, "Modified"),
+            (SortKey::Type, "Type"),
+        ];
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .h(px(32.))
+            .px_4()
+            .text_xs()
+            .text_color(theme::muted())
+            .child(div().mr_1().child("Sort"))
+            .children(keys.into_iter().map(|(key, label)| {
+                let active = sort == key;
+                div()
+                    .id(label)
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .h(px(22.))
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(active, |d| d.bg(theme::selected()).text_color(theme::text()))
+                    .when(!active, |d| d.hover(|s| s.bg(theme::hover()).text_color(theme::text_2())))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_sort(key, cx)))
+                    .child(label)
+                    .when(active && key != SortKey::Relevance, |d| {
+                        d.child(icon(if descending { Icon::Down } else { Icon::Up }, 11., theme::text_2()))
+                    })
+            }))
             .into_any_element()
     }
 
     fn render_menu(&self, at: Point<Pixels>, cx: &mut Context<Self>) -> gpui::AnyElement {
         let many = self.table.sel.count() > 1;
         let items: [(MenuItem, &'static str, &'static str); 7] = [
-            (MenuItem::Open, "Open", "↵"),
-            (MenuItem::Reveal, "Show in folder", "Ctrl+↵"),
+            (MenuItem::Open, "Open", "Enter"),
+            (MenuItem::Reveal, "Show in folder", "Ctrl+Enter"),
             (MenuItem::CopyPath, if many { "Copy paths" } else { "Copy path" }, "Ctrl+Shift+C"),
             (MenuItem::Rename, "Rename", "F2"),
             (MenuItem::Move, "Move to…", "Ctrl+M"),
@@ -1051,8 +1247,8 @@ impl Overlay {
                     .flex_col()
                     .py_1()
                     .min_w(px(210.))
-                    .rounded_md()
-                    .bg(theme::panel_2())
+                    .rounded_lg()
+                    .bg(theme::menu())
                     .border_1()
                     .border_color(theme::border())
                     .shadow_md()
@@ -1147,15 +1343,39 @@ impl Overlay {
                 .into_any_element();
         }
         if let Some(notice) = &self.table.notice {
-            return div().flex_1().min_w_0().text_color(theme::text_2()).truncate().child(notice.clone()).into_any_element();
+            return div().flex_1().min_w_0().text_color(theme::text_2()).one_line().child(notice.clone()).into_any_element();
         }
-        let keys = if self.table.rename.is_some() {
-            "↵ Rename   Esc Cancel"
-        } else {
-            "↵ Open   Ctrl+↵ Folder   Ctrl+Shift+C Copy path   F2 Rename   Del Delete   Ctrl+M Move   Shift+↑/↓ Ctrl+A Select   Esc Close"
-        };
-        div().flex_1().min_w_0().truncate().child(keys).into_any_element()
+        // Renaming: the keys are on the right.
+        div().flex_1().into_any_element()
     }
+
+    pub(super) fn table_renaming(&self) -> bool {
+        self.table.rename.is_some()
+    }
+
+    pub(super) fn table_confirming(&self) -> bool {
+        self.table.confirm.is_some()
+    }
+}
+
+/// The inline rename box, in any view (`grow`: fill a row's width).
+fn rename_box(input: Entity<TextInput>, grow: bool) -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_none()
+        .when(grow, |d| d.flex_1())
+        .w_full()
+        .min_w_0()
+        .h(px(22.))
+        .items_center()
+        .px_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(theme::accent())
+        .bg(theme::bg())
+        .text_sm()
+        .child(input)
+        .into_any_element()
 }
 
 #[cfg(test)]

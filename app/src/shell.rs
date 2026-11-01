@@ -104,7 +104,14 @@ pub fn label(hotkey: HotKey) -> String {
 
 /// The hotkey's current combination, for Settings.
 pub fn current(which: Which, cx: &App) -> String {
-    label(cx.global::<Shell>().get(which))
+    // No hotkeys set up (`dash --shots`): show the saved or default ones.
+    match cx.try_global::<Shell>() {
+        Some(shell) => label(shell.get(which)),
+        None => {
+            let (search, clipboard) = saved_or_default();
+            label(if which == Which::Search { search } else { clipboard })
+        }
+    }
 }
 
 /// Turns the global hotkeys off (true) or back on while a new one is recorded.
@@ -169,34 +176,23 @@ pub fn from_keystroke(keystroke: &gpui::Keystroke) -> Result<HotKey, String> {
     text.parse::<HotKey>().map_err(|_| format!("{} can't be a hotkey.", keystroke.key))
 }
 
-/// A small round icon drawn in code (no image files to ship).
+/// The logo, drawn in code (no image files to ship).
 fn icon() -> tray_icon::Icon {
     const N: u32 = 32;
-    let mut rgba = Vec::with_capacity((N * N * 4) as usize);
-    for y in 0..N {
-        for x in 0..N {
-            let (dx, dy) = (x as f32 - 15.5, y as f32 - 15.5);
-            let d = (dx * dx + dy * dy).sqrt();
-            let inside = d <= 14.5;
-            let ring = (9.0..=12.0).contains(&d) || (dx.abs() <= 1.5 && dy.abs() <= 6.0 && dx > -1.6);
-            let (r, g, b, a) = match (inside, ring) {
-                (true, true) => (0xff, 0xff, 0xff, 0xff),
-                (true, false) => (0x4f, 0x8c, 0xff, 0xff),
-                _ => (0, 0, 0, 0),
-            };
-            rgba.extend_from_slice(&[r, g, b, a]);
-        }
-    }
-    tray_icon::Icon::from_rgba(rgba, N, N).expect("icon")
+    tray_icon::Icon::from_rgba(crate::logo::rgba(N), N, N).expect("icon")
+}
+
+/// The saved hotkeys, or Ctrl+Alt+F / Ctrl+Alt+C.
+fn saved_or_default() -> (HotKey, HotKey) {
+    let saved = load_saved();
+    (
+        saved.0.unwrap_or(HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyF)),
+        saved.1.unwrap_or(HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyC)),
+    )
 }
 
 pub fn init(cx: &mut App) {
-    let defaults = (
-        HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyF),
-        HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyC),
-    );
-    let saved = load_saved();
-    let (search, clipboard) = (saved.0.unwrap_or(defaults.0), saved.1.unwrap_or(defaults.1));
+    let (search, clipboard) = saved_or_default();
     // Without either piece Dash still runs (tray or hotkeys, whichever works).
     let hotkeys = match GlobalHotKeyManager::new() {
         Ok(hotkeys) => Some(hotkeys),

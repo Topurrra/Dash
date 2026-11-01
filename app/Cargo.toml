@@ -33,8 +33,11 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 [target.'cfg(windows)'.dependencies]
 # Shell / Ole / KeyboardAndMouse: the Files table's Recycle Bin, "show in
 # folder" for several items and dragging files out; Storage_FileSystem:
-# rename / copy that never replace an existing file (file_ops.rs).
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Registry", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+# rename / copy that never replace an existing file (file_ops.rs); Dwm: the
+# overlay's rounded corners (DWM wants the window's handle); Gdi / Xps /
+# WindowsAndMessaging: `dash --shots` (overlay/shots.rs).
+raw-window-handle = "=0.6.2"
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_Storage_FileSystem", "Win32_Storage_Xps", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Registry", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(not(windows))'.dependencies]
 open = "5.3.3"

@@ -1755,6 +1755,7 @@ dependencies = [
  "image",
  "lofty",
  "open",
+ "raw-window-handle",
  "rodio",
  "serde_json",
  "tokio",

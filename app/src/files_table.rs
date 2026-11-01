@@ -291,6 +291,50 @@ pub fn folder_of(path: &str) -> &str {
     }
 }
 
+/// A file name of at most `max` characters, shortened in the middle so its
+/// end (extension included) stays: `(2003) Двойной Фор…-poster.jpg`.
+pub fn short_name(name: &str, max: usize) -> String {
+    let count = name.chars().count();
+    if count <= max {
+        return name.to_string();
+    }
+    let tail = (max / 3).max(1);
+    let head = max.saturating_sub(tail + 1);
+    let start: String = name.chars().take(head).collect();
+    let end: String = name.chars().skip(count - tail).collect();
+    format!("{start}…{end}")
+}
+
+/// A folder path of at most `max` characters, shortened in the middle so
+/// the drive and the last folders stay: `C:\…\templates\examples-main`.
+pub fn short_folder(folder: &str, max: usize) -> String {
+    if folder.chars().count() <= max {
+        return folder.to_string();
+    }
+    let sep = if folder.contains('\\') { '\\' } else { '/' };
+    let mut parts = folder.split(sep);
+    let head = parts.next().unwrap_or_default();
+    let rest: Vec<&str> = parts.filter(|p| !p.is_empty()).collect();
+    let mut len = head.chars().count() + 2;
+    let mut tail = Vec::new();
+    for part in rest.iter().rev() {
+        let add = part.chars().count() + 1;
+        if len + add > max && !tail.is_empty() {
+            break;
+        }
+        len += add;
+        tail.push(*part);
+    }
+    tail.reverse();
+    let mut tail = tail.join(&sep.to_string());
+    // One folder name longer than the room: keep its end.
+    let room = max.saturating_sub(head.chars().count() + 3).max(1);
+    if tail.chars().count() > room {
+        tail = tail.chars().skip(tail.chars().count() - room).collect();
+    }
+    format!("{head}{sep}…{sep}{tail}")
+}
+
 /// Whether `path` is `target` or inside it (a file in a folder being moved).
 pub fn is_within(path: &str, target: &str) -> bool {
     match path.strip_prefix(target) {
@@ -321,6 +365,28 @@ pub fn type_text(row: &NameRow) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_names_keep_their_end() {
+        assert_eq!(short_name("photo.jpg", 30), "photo.jpg");
+        let short = short_name("(2003) Двойной Форсаж-movie-poster.jpg", 30);
+        assert_eq!(short.chars().count(), 30);
+        assert!(short.starts_with("(2003) Двойной") && short.ends_with("poster.jpg"));
+    }
+
+    #[test]
+    fn long_folders_keep_drive_and_end() {
+        assert_eq!(short_folder("C:\\Users\\me", 30), "C:\\Users\\me");
+        assert_eq!(
+            short_folder("C:\\Users\\user\\Projects\\OMNIS-X\\backup\\templates\\examples-main", 30),
+            "C:\\…\\templates\\examples-main"
+        );
+        assert_eq!(short_folder("/home/me/a/very/deep/tree/of/folders", 20), "/…/tree/of/folders");
+        // A single long folder name: its end.
+        let short = short_folder("D:\\x\\an-extremely-long-folder-name-indeed", 20);
+        assert_eq!(short.chars().count(), 20);
+        assert!(short.starts_with("D:\\…\\") && short.ends_with("indeed"));
+    }
 
     fn row(name: &str) -> NameRow {
         NameRow {

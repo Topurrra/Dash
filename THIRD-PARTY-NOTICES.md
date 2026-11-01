@@ -15,6 +15,7 @@ licenses. Each project's site has the full license text.
 | libarchive, bzip2, giflib, libjpeg-turbo, libcurl, OpenSSL, xz (liblzma), libpng, libwebp, lz4, OpenJPEG, libtiff, zlib, zstd | Tesseract's image and compression libraries | Each under its own permissive license (BSD-style, MIT, Zlib, curl, Apache-2.0, libpng, libtiff, IJG) |
 | Microsoft Visual C++ runtime | Needed by Tesseract | Microsoft Visual C++ Redistributable license |
 | [EmbeddingGemma 2](https://huggingface.co/onnx-community/embeddinggemma-2-ONNX) | Search by meaning | Gemma Terms of Use (below) |
+| [Inter](https://github.com/rsms/inter) 4.1 (built into `dash.exe`) | The interface font | SIL Open Font License 1.1 ([`app/assets/fonts/Inter-LICENSE.txt`](app/assets/fonts/Inter-LICENSE.txt)) |
 
 ### Gemma
 

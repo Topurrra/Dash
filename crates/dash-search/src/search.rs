@@ -8842,6 +8842,13 @@ fn hydrate_status_from_index_worker_files(app: &std::sync::Arc<dyn dash_core::Ho
     if !status_file.running {
         return;
     }
+    // A worker that was killed (or crashed) mid-build never writes
+    // "finished": with no live worker, "running" is stale, and believing it
+    // would show "Indexing" forever.
+    if !worker_process_running(&SEARCH_INDEX_WORKER) {
+        update_status(|status| status.indexing = false);
+        return;
+    }
 
     let options_path = state_dir.join(INDEX_WORKER_OPTIONS_FILE);
     let options_from_worker = fs::read(&options_path)

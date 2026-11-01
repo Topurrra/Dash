@@ -5,10 +5,13 @@
 mod file_ops;
 mod files_table;
 mod host;
+mod icons;
 mod input;
+mod logo;
 mod media;
 mod overlay;
 mod preview;
+mod scrollbar;
 mod settings;
 mod shell;
 mod theme;
@@ -20,18 +23,28 @@ fn main() {
     if dash_search::search::maybe_run_index_worker_from_args() {
         return;
     }
+    // `--shots <folder>`: pictures of each view, then quit (overlay/shots.rs).
+    let args: Vec<String> = std::env::args().collect();
+    let shots = args.iter().position(|a| a == "--shots").map(|i| args.get(i + 1).cloned().unwrap_or_else(|| "dash-shots".into()));
     // The engines' async parts run on Tokio; enter it for the whole app.
     let _runtime = host::runtime().enter();
     // Run the engines, or follow another app that already does.
     host::claim_engines();
     host::start_search_engines();
-    if let Err(e) = dash_clipboard::start_clipboard_listener(host::host()) {
-        eprintln!("dash: clipboard capture unavailable: {e}");
+    if shots.is_none() {
+        if let Err(e) = dash_clipboard::start_clipboard_listener(host::host()) {
+            eprintln!("dash: clipboard capture unavailable: {e}");
+        }
     }
 
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_assets(icons::Assets).run(|cx: &mut App| {
+        theme::load_fonts(cx);
         input::bind_keys(cx);
         overlay::init(cx);
+        if let Some(dir) = shots {
+            overlay::shots(dir.into(), cx);
+            return;
+        }
         shell::init(cx);
         // Started at sign-in: wait in the tray.
         if !std::env::args().any(|a| a == "--background") {

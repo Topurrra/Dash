@@ -11,23 +11,31 @@ use std::time::Duration;
 
 use dash_clipboard::{ClipboardEntry, EntryKind};
 use gpui::{
-    actions, div, img, prelude::*, px, size, uniform_list, App, Bounds, ClipboardItem, Context, Entity, FocusHandle,
+    actions, div, ease_out_quint, img, prelude::*, px, size, uniform_list, Animation, AnimationExt, App, Bounds, ClipboardItem, Context, Entity, FocusHandle,
     Focusable, Global, KeyBinding, MouseButton, ObjectFit, Point, RenderImage, ScrollHandle, ScrollStrategy, SharedString, Subscription,
     UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
     WindowOptions,
 };
 
+use crate::icons::{icon, Icon};
 use crate::input::{InputEvent, TextInput};
 use crate::media::{self, Player};
 use crate::settings::{self, Settings};
 use crate::preview::{self, human_size, Body, Preview};
-use crate::theme;
+use crate::scrollbar::scrollbar;
+use crate::theme::{self, OneLine};
 
+mod shots;
 mod table;
+mod views;
+
+use views::{ClipView, SearchView};
+
+pub use shots::run as shots;
 
 actions!(
     dash,
-    [SelectNext, SelectPrev, PageDown, PageUp, OpenSelected, RevealSelected, CopyPath, Dismiss, NextTab, SearchMode, ClipboardMode, TogglePin, DeleteEntry, ToggleWrap, PlayPause, Back10, Forward10, Mute, VolumeUp, VolumeDown, OpenSettings, SelectAllRows, ExtendNext, ExtendPrev, RenameSelected, DeleteSelected, DeleteForGood, MoveSelected]
+    [SelectNext, SelectPrev, PageDown, PageUp, SelectFirst, SelectLast, OpenSelected, RevealSelected, CopyPath, Dismiss, NextTab, SearchMode, ClipboardMode, TogglePin, DeleteEntry, ToggleWrap, PlayPause, Back10, Forward10, Mute, VolumeUp, VolumeDown, OpenSettings, SelectAllRows, ExtendNext, ExtendPrev, RenameSelected, DeleteSelected, DeleteForGood, MoveSelected, TogglePane, SelectLeft, SelectRight]
 );
 
 pub fn bind_keys(cx: &mut App) {
@@ -37,6 +45,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", SelectPrev, ctx),
         KeyBinding::new("pagedown", PageDown, ctx),
         KeyBinding::new("pageup", PageUp, ctx),
+        // Home / End reach the list when it has focus (the search box uses
+        // them for its caret); with Ctrl from anywhere.
+        KeyBinding::new("home", SelectFirst, ctx),
+        KeyBinding::new("end", SelectLast, ctx),
+        KeyBinding::new("ctrl-home", SelectFirst, ctx),
+        KeyBinding::new("ctrl-end", SelectLast, ctx),
         KeyBinding::new("enter", OpenSelected, ctx),
         KeyBinding::new("ctrl-enter", RevealSelected, ctx),
         KeyBinding::new("ctrl-shift-c", CopyPath, ctx),
@@ -65,6 +79,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", DeleteSelected, ctx),
         KeyBinding::new("shift-delete", DeleteForGood, ctx),
         KeyBinding::new("ctrl-m", MoveSelected, ctx),
+        KeyBinding::new("ctrl-p", TogglePane, ctx),
+        // Grids: across a row (the search box keeps them for its caret).
+        KeyBinding::new("left", SelectLeft, ctx),
+        KeyBinding::new("right", SelectRight, ctx),
     ]);
 }
 
@@ -121,7 +139,10 @@ pub struct Overlay {
     error: Option<String>,
     selected: usize,
     generation: u64,
-    status: SharedString,
+    /// The index is still being built.
+    indexing: bool,
+    /// Bumped each time the window opens, to fade it in.
+    appear: u64,
     scroll: UniformListScrollHandle,
     preview: Option<Preview>,
     /// Clipboard: the selected entry's pane, by entry id.
@@ -129,6 +150,13 @@ pub struct Overlay {
     preview_generation: u64,
     preview_scroll: ScrollHandle,
     wrap: bool,
+    /// The preview pane is shown (Ctrl+P or the header button; remembered).
+    show_pane: bool,
+    /// How the Files tab and the clipboard history are shown (remembered).
+    search_view: SearchView,
+    clip_view: ClipView,
+    /// Picture thumbnails for the Files grid.
+    thumbs: views::Thumbs,
     /// The video or music in the pane, by path.
     player: Option<(String, Player)>,
     settings: Entity<Settings>,
@@ -154,6 +182,7 @@ impl Overlay {
         let subscription = cx.subscribe(&input, |this: &mut Self, _input, event: &InputEvent, cx| match event {
             InputEvent::Changed => this.query_changed(cx),
         });
+        let prefs = views::load_prefs();
         Overlay {
             input,
             focus: cx.focus_handle(),
@@ -167,13 +196,18 @@ impl Overlay {
             error: None,
             selected: 0,
             generation: 0,
-            status: "".into(),
+            indexing: false,
+            appear: 0,
             scroll: UniformListScrollHandle::new(),
             preview: None,
             clip_preview: None,
             preview_generation: 0,
             preview_scroll: ScrollHandle::new(),
-            wrap: false,
+            wrap: true,
+            show_pane: prefs.show_pane,
+            search_view: prefs.search,
+            clip_view: prefs.clipboard,
+            thumbs: views::Thumbs::default(),
             player: None,
             settings: cx.new(Settings::new),
             drawn_frame: None,
@@ -268,15 +302,10 @@ impl Overlay {
         cx.notify();
     }
 
+    /// The full numbers are in Settings; the footer only says it's busy.
     fn refresh_status(&mut self) {
         let host = crate::host::host();
-        self.status = match dash_search::search::get_file_search_status(host) {
-            Ok(s) if s.filename_indexing || s.indexing => {
-                format!("Indexing… {} names, {} documents so far", s.filename_indexed_files, s.indexed_files).into()
-            }
-            Ok(s) => format!("{} names · {} documents indexed", s.filename_indexed_files, s.indexed_files).into(),
-            Err(e) => e.into(),
-        };
+        self.indexing = dash_search::search::get_file_search_status(host).is_ok_and(|s| s.filename_indexing || s.indexing);
     }
 
     fn query_changed(&mut self, cx: &mut Context<Self>) {
@@ -362,6 +391,12 @@ impl Overlay {
 
     /// Loads the pane for the selected row (Search) or entry (Clipboard).
     fn update_preview(&mut self, cx: &mut Context<Self>) {
+        // Pane hidden: nothing to load (and nothing playing).
+        if !self.show_pane {
+            self.preview = None;
+            self.player = None;
+            return;
+        }
         if self.mode == Mode::Clipboard {
             self.update_clip_preview();
             self.preview_scroll.set_offset(Point::default());
@@ -423,6 +458,13 @@ impl Overlay {
         self.clip_preview = Some((clip.id, body));
     }
 
+    fn on_toggle_pane(&mut self, _: &TogglePane, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_pane = !self.show_pane;
+        self.save_prefs();
+        self.update_preview(cx);
+        cx.notify();
+    }
+
     fn on_toggle_wrap(&mut self, _: &ToggleWrap, _: &mut Window, cx: &mut Context<Self>) {
         self.wrap = !self.wrap;
         cx.notify();
@@ -481,7 +523,7 @@ impl Overlay {
         }
         let next = (self.selected as isize + delta).clamp(0, count as isize - 1) as usize;
         self.selected = next;
-        self.scroll.scroll_to_item(next, ScrollStrategy::Center);
+        self.scroll_to_index(next, cx);
         self.update_preview(cx);
         cx.notify();
     }
@@ -493,17 +535,24 @@ impl Overlay {
         self.rows().get(self.selected).map(|r| r.path.to_string())
     }
 
+    // In a grid, Up / Down move a whole row of tiles.
     fn on_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
-        self.select(1, cx);
+        self.select(self.step(), cx);
     }
     fn on_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
-        self.select(-1, cx);
+        self.select(-self.step(), cx);
     }
     fn on_page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.select(8, cx);
+        self.select(if self.grid_active() { 3 * self.step() } else { 8 }, cx);
     }
     fn on_page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.select(-8, cx);
+        self.select(if self.grid_active() { -3 * self.step() } else { -8 }, cx);
+    }
+    fn on_first(&mut self, _: &SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
+        self.select(-(self.count() as isize), cx);
+    }
+    fn on_last(&mut self, _: &SelectLast, _: &mut Window, cx: &mut Context<Self>) {
+        self.select(self.count() as isize, cx);
     }
 
     fn on_open(&mut self, _: &OpenSelected, window: &mut Window, cx: &mut Context<Self>) {
@@ -704,19 +753,30 @@ impl Overlay {
         self.set_mode(Mode::Settings, window, cx);
     }
 
-    fn render_mode_chip(&self, mode: Mode, label: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+    /// One segment of the Search / Clipboard / Settings switch (no label: icon only).
+    fn render_mode_chip(&self, mode: Mode, glyph: Icon, label: Option<&'static str>, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.mode == mode;
+        let color = if active { theme::text() } else { theme::muted() };
         div()
-            .id(label)
-            .px_3()
-            .py_1()
+            .id(match mode {
+                Mode::Search => "mode-search",
+                Mode::Clipboard => "mode-clipboard",
+                Mode::Settings => "mode-settings",
+            })
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .h(px(28.))
+            .px_2p5()
             .rounded_md()
             .text_sm()
             .cursor_pointer()
-            .when(active, |d| d.bg(theme::accent_soft()).text_color(theme::text()))
-            .when(!active, |d| d.text_color(theme::muted()).hover(|s| s.text_color(theme::text_2())))
+            .text_color(color)
+            .when(active, |d| d.bg(theme::selected()))
+            .when(!active, |d| d.hover(|s| s.bg(theme::hover()).text_color(theme::text_2())))
             .on_click(cx.listener(move |this, _, window, cx| this.set_mode(mode, window, cx)))
-            .child(label)
+            .child(icon(glyph, 15., color))
+            .children(label)
     }
 
     fn render_tab(&self, tab: Tab, label: &'static str, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
@@ -724,14 +784,15 @@ impl Overlay {
         div()
             .id(label)
             .flex()
-            .gap_1()
-            .px_3()
-            .py_1()
+            .items_center()
+            .gap_1p5()
+            .h(px(26.))
+            .px_2p5()
+            .rounded_md()
             .text_sm()
             .cursor_pointer()
-            .border_b_2()
-            .when(active, |d| d.border_color(theme::accent()).text_color(theme::text()))
-            .when(!active, |d| d.border_color(gpui::transparent_black()).text_color(theme::muted()))
+            .when(active, |d| d.bg(theme::selected()).text_color(theme::text()))
+            .when(!active, |d| d.text_color(theme::muted()).hover(|s| s.bg(theme::hover()).text_color(theme::text_2())))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.tab = tab;
                 this.selected = 0;
@@ -739,48 +800,45 @@ impl Overlay {
                 cx.notify();
             }))
             .child(label)
-            .child(div().text_color(theme::muted()).child(count.to_string()))
+            .child(div().text_xs().text_color(theme::muted()).child(table::thousands(count)))
     }
 
     fn render_body(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let query = self.query(cx);
-        let note = |text: String| {
-            div()
-                .flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .px_6()
-                .text_sm()
-                .text_color(theme::muted())
-                .child(text)
-                .into_any_element()
-        };
         if self.mode == Mode::Clipboard {
             if self.clips.is_empty() {
-                return note(if query.is_empty() { "Nothing copied yet.".into() } else { "Nothing found.".into() });
+                return if query.is_empty() {
+                    empty_state(Icon::Clipboard, "Nothing copied yet", Some("Copy text or an image anywhere and it shows up here."))
+                } else {
+                    empty_state(Icon::Search, format!("Nothing copied matches “{query}”"), None)
+                };
             }
             return self.render_clips(cx);
         }
         if let Some(error) = &self.error {
-            return note(error.clone());
+            return empty_state(Icon::Search, "Search isn't working right now", Some(error.as_str()));
         }
+        let inside_hint = "Tab searches inside files instead.";
         if self.tab == Tab::Files {
             if self.table.total == 0 {
-                return note(match (self.searching, query.is_empty()) {
-                    (true, _) => "Searching…".into(),
-                    (false, true) => "Type to search file names. Tab switches to what's inside files.".into(),
-                    (false, false) => "Nothing found.".into(),
-                });
+                return match (self.searching, query.is_empty()) {
+                    (true, _) => empty_state(Icon::Search, "Searching…", None),
+                    (false, true) => empty_state(Icon::Search, "Type to find files and folders", Some("Any part of the name, any case.")),
+                    (false, false) => empty_state(Icon::Search, format!("No names match “{query}”"), Some(inside_hint)),
+                };
             }
             return self.render_table(cx);
         }
         let count = self.rows().len();
         if count == 0 {
-            return note(if self.searching { "Searching…".into() } else { "Nothing found.".into() });
+            return if self.searching {
+                empty_state(Icon::Search, "Searching…", None)
+            } else {
+                empty_state(Icon::File, format!("No file contains “{query}”"), Some("Only folders chosen in Settings are read."))
+            };
         }
         let selected = self.selected;
-        uniform_list(
+        let list = uniform_list(
             "results",
             count,
             cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
@@ -794,13 +852,13 @@ impl Overlay {
                             .flex()
                             .gap_3()
                             .items_center()
-                            .h(px(if row.snippet.is_some() { 58. } else { 44. }))
+                            .w_full()
+                            .h(px(if row.snippet.is_some() { 62. } else { 44. }))
                             .px_3()
-                            .mx_2()
-                            .rounded_md()
+                            .rounded_lg()
                             .cursor_pointer()
-                            .when(active, |d| d.bg(theme::panel_2()))
-                            .hover(|s| s.bg(theme::panel()))
+                            .when(active, |d| d.bg(theme::selected()))
+                            .when(!active, |d| d.hover(|s| s.bg(theme::hover())))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -843,10 +901,10 @@ impl Overlay {
                                     .flex_1()
                                     .min_w_0()
                                     .overflow_hidden()
-                                    .child(div().text_sm().text_color(theme::text()).truncate().child(row.name.clone()))
-                                    .child(div().text_xs().text_color(theme::muted()).truncate().child(row.path.clone()))
+                                    .child(div().text_sm().text_color(theme::text()).one_line().child(row.name.clone()))
+                                    .child(div().text_xs().text_color(theme::muted()).one_line().child(row.path.clone()))
                                     .when_some(row.snippet.clone(), |d, s| {
-                                        d.child(div().text_xs().text_color(theme::text_2()).truncate().child(s))
+                                        d.child(div().text_xs().text_color(theme::text_2()).one_line().child(s))
                                     }),
                             )
                             .child(div().flex_none().text_xs().text_color(theme::muted()).child(row.meta.clone()))
@@ -856,12 +914,25 @@ impl Overlay {
         )
         .track_scroll(self.scroll.clone())
         .flex_1()
-        .into_any_element()
+        .px_2()
+        .into_any_element();
+        self.with_list_scrollbar(list)
+    }
+
+    /// The results list (any tab) with its scrollbar.
+    fn with_list_scrollbar(&self, list: gpui::AnyElement) -> gpui::AnyElement {
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        div().relative().flex().flex_col().flex_1().min_h_0().child(list).child(scrollbar("list-scrollbar", &handle)).into_any_element()
     }
 
     fn render_clips(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        match self.clip_view {
+            ClipView::List => {}
+            ClipView::Grid => return self.render_clips_grid(cx),
+            ClipView::Compact => return self.render_clips_compact(cx),
+        }
         let selected = self.selected;
-        uniform_list(
+        let list = uniform_list(
             "clips",
             self.clips.len(),
             cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
@@ -869,34 +940,30 @@ impl Overlay {
                     .filter_map(|ix| this.clips.get(ix).cloned().map(|clip| (ix, clip)))
                     .map(|(ix, clip)| {
                         let active = ix == selected;
+                        let app_icon = clip.app_path.as_deref().and_then(|p| this.icon(p, false));
                         div()
                             .id(ix)
                             .flex()
                             .gap_3()
                             .items_center()
-                            .h(px(64.))
+                            .w_full()
+                            .h(px(60.))
                             .px_3()
-                            .mx_2()
-                            .rounded_md()
+                            .rounded_lg()
                             .cursor_pointer()
-                            .when(active, |d| d.bg(theme::panel_2()))
-                            .hover(|s| s.bg(theme::panel()))
+                            .when(active, |d| d.bg(theme::selected()))
+                            .when(!active, |d| d.hover(|s| s.bg(theme::hover())))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                    this.selected = ix;
-                                    this.update_preview(cx);
-                                    cx.notify();
-                                    if event.click_count >= 2 {
-                                        this.on_open(&OpenSelected, window, cx);
-                                    }
+                                    this.click_clip(ix, event.click_count, window, cx)
                                 }),
                             )
                             .child(match clip.image.clone() {
                                 Some(path) => div()
                                     .flex_none()
-                                    .w(px(84.))
-                                    .h(px(52.))
+                                    .w(px(72.))
+                                    .h(px(44.))
                                     .rounded_md()
                                     .overflow_hidden()
                                     .bg(theme::panel_2())
@@ -905,63 +972,49 @@ impl Overlay {
                                             // An id keeps a GIF's frame between redraws.
                                             .id(SharedString::from(format!("clip-img-{}", clip.id)))
                                             .size_full()
-                                            .object_fit(ObjectFit::Contain),
+                                            .object_fit(ObjectFit::Cover),
                                     )
                                     .into_any_element(),
                                 None => div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_sm()
-                                    .text_color(theme::text())
-                                    .line_clamp(2)
-                                    .child(clip.text.clone())
+                                    .flex_none()
+                                    .size(px(28.))
+                                    .rounded_md()
+                                    .bg(theme::panel())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(match app_icon {
+                                        Some(app) => img(app).size(px(20.)).into_any_element(),
+                                        None => icon(Icon::Clipboard, 15., theme::muted()).into_any_element(),
+                                    })
                                     .into_any_element(),
-                            })
-                            .when(clip.image.is_some(), |d| {
-                                d.child(div().flex_1().min_w_0().text_sm().text_color(theme::text_2()).truncate().child(clip.text.clone()))
                             })
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .flex_none()
-                                    .items_end()
-                                    .gap_1()
-                                    .text_xs()
-                                    .text_color(theme::muted())
-                                    .when(clip.pinned, |d| d.child(div().text_color(theme::accent()).child("Pinned")))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .when_some(clip.app_path.as_deref().and_then(|p| this.icon(p, false)), |d, icon| {
-                                                d.child(img(icon).w(px(14.)).h(px(14.)))
-                                            })
-                                            .child(clip.meta.clone()),
-                                    ),
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_0p5()
+                                    .child(div().text_sm().text_color(theme::text()).one_line().child(clip.text.clone()))
+                                    .child(div().text_xs().text_color(theme::muted()).one_line().child(clip.meta.clone())),
                             )
+                            .when(clip.pinned, |d| d.child(icon(Icon::Pin, 14., theme::accent())))
                     })
                     .collect::<Vec<_>>()
             }),
         )
         .track_scroll(self.scroll.clone())
         .flex_1()
-        .into_any_element()
+        .px_2()
+        .into_any_element();
+        self.with_list_scrollbar(list)
     }
 }
 
 impl Overlay {
     fn render_pane(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let pane = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .border_l_1()
-            .border_color(theme::border())
-            .bg(theme::panel());
+        let pane = div().flex().flex_col().flex_1().min_w_0().min_h_0().border_l_1().border_color(theme::border());
         let (name, details, body): (Option<SharedString>, Vec<(&'static str, SharedString)>, Option<&Body>) = match self.mode {
             Mode::Search => match &self.preview {
                 Some(p) if self.selected_path().as_deref() == Some(p.path.as_str()) => {
@@ -970,55 +1023,43 @@ impl Overlay {
                 _ => (None, Vec::new(), None),
             },
             Mode::Clipboard => match (&self.clip_preview, self.clips.get(self.selected)) {
-                (Some((id, body)), Some(clip)) if *id == clip.id => {
-                    (None, vec![("From", clip.meta.clone())], Some(body))
-                }
+                (Some((id, body)), Some(clip)) if *id == clip.id => (Some(clip.meta.clone()), Vec::new(), Some(body)),
                 _ => (None, Vec::new(), None),
             },
             Mode::Settings => (None, Vec::new(), None),
         };
+        // Nothing selected: an empty, untinted pane.
         let Some(body) = body else {
             return pane.into_any_element();
         };
+        let pane = pane.bg(theme::panel());
         let text = match body {
             Body::Text { full, .. } => Some(full.clone()),
             _ => None,
         };
         let wrap = self.wrap;
-        let button = |id: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .px_2()
-                .py_0p5()
-                .rounded_md()
-                .text_xs()
-                .text_color(theme::text_2())
-                .bg(theme::panel_2())
-                .cursor_pointer()
-                .hover(|s| s.text_color(theme::text()))
-                .child(label)
-        };
         let header = div()
             .flex()
             .items_center()
-            .gap_2()
-            .px_3()
-            .h(px(36.))
+            .gap_1()
+            .pl_4()
+            .pr_2()
+            .h(px(40.))
             .flex_none()
             .border_b_1()
             .border_color(theme::border())
-            .child(div().flex_1().min_w_0().text_sm().truncate().child(name.unwrap_or_else(|| "Preview".into())))
+            .child(div().flex_1().min_w_0().text_sm().text_color(theme::text_2()).one_line().child(name.unwrap_or_else(|| "Preview".into())))
             .when(text.is_some(), |d| {
-                d.child(
-                    button("wrap", if wrap { "No wrap" } else { "Wrap" })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.wrap = !this.wrap;
-                            cx.notify();
-                        })),
-                )
+                d.child(icon_button("wrap", Icon::Wrap, wrap).on_click(cx.listener(|this, _, _, cx| {
+                    this.wrap = !this.wrap;
+                    cx.notify();
+                })))
             })
             .when_some(text, |d, text| {
-                d.child(button("copy-text", "Copy text").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()))))
+                d.child(
+                    icon_button("copy-text", Icon::Copy, false)
+                        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()))),
+                )
             });
         let content = match body {
             Body::Image(path) => div()
@@ -1029,25 +1070,19 @@ impl Overlay {
                 .child(img(path.clone()).id("pane-img").size_full().object_fit(ObjectFit::Contain))
                 .into_any_element(),
             Body::Media(_) => self.render_player(cx),
-            Body::Note(note) => div()
-                .flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .px_6()
-                .text_sm()
-                .text_color(theme::muted())
-                .child(note.clone())
-                .into_any_element(),
+            Body::Note(note) => {
+                let glyph = if note.as_ref() == "Folder" { Icon::Folder } else { Icon::File };
+                empty_state(glyph, note.clone(), None)
+            }
             Body::Text { lines, code, hit, truncated, .. } => {
                 let (code, hit) = (*code, *hit);
-                div()
+                let text = div()
                     .id("pane-text")
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .py_2()
+                    .py_3()
                     .overflow_scroll()
                     .track_scroll(&self.preview_scroll)
                     .text_xs()
@@ -1057,7 +1092,7 @@ impl Overlay {
                         div()
                             .flex()
                             .flex_none()
-                            .px_2()
+                            .px_3()
                             .when(Some(ix) == hit, |d| d.bg(theme::accent_soft()))
                             .when(code, |d| {
                                 d.child(
@@ -1080,7 +1115,15 @@ impl Overlay {
                     }))
                     .when(*truncated, |d| {
                         d.child(div().px_3().py_2().text_color(theme::muted()).child("… the rest isn't shown here."))
-                    })
+                    });
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(text)
+                    .child(scrollbar("pane-scrollbar", &self.preview_scroll))
                     .into_any_element()
             }
         };
@@ -1103,7 +1146,7 @@ impl Overlay {
                                 .flex()
                                 .gap_2()
                                 .child(div().w(px(64.)).flex_none().text_color(theme::muted()).child(label))
-                                .child(div().flex_1().min_w_0().truncate().text_color(theme::text_2()).child(value))
+                                .child(div().flex_1().min_w_0().one_line().text_color(theme::text_2()).child(value))
                         })),
                 )
             })
@@ -1121,15 +1164,15 @@ impl Overlay {
             .flex_none()
             .items_end()
             .gap(px(2.))
-            .h(px(18.))
+            .h(px(16.))
             .children((1..=10usize).map(move |step| {
                 div()
                     .id(("vol", step))
-                    .w(px(5.))
-                    .h(px(4. + step as f32 * 1.4))
-                    .rounded_sm()
+                    .w(px(4.))
+                    .h(px(4. + step as f32 * 1.2))
+                    .rounded_full()
                     .cursor_pointer()
-                    .bg(if step <= level { theme::accent() } else { theme::border() })
+                    .bg(if step <= level { theme::text_2() } else { theme::panel_2() })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.set_volume(step as f32 / 10., cx)),
@@ -1142,7 +1185,10 @@ impl Overlay {
         let Some(player) = self.player() else {
             return div().flex_1().into_any_element();
         };
-        let (position, duration, paused) = (player.position(), player.duration(), player.paused());
+        let (position, mut duration, paused) = (player.position(), player.duration(), player.paused());
+        if duration == 0 {
+            duration = self.preview.as_ref().and_then(|p| p.music.as_ref()).map_or(0, |m| m.length);
+        }
         let picture = if let Some(error) = player.error() {
             div().text_sm().text_color(theme::muted()).child(format!("Can't play this: {error}")).into_any_element()
         } else if player.is_video() {
@@ -1169,9 +1215,7 @@ impl Overlay {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(64.))
-                    .text_color(theme::muted())
-                    .child("♪")
+                    .child(icon(Icon::Music, 56., theme::muted()))
                     .into_any_element(),
             };
             div()
@@ -1195,49 +1239,44 @@ impl Overlay {
                                 .child(music.and_then(|m| m.title.clone()).unwrap_or(name)),
                         )
                         .when_some(music.and_then(|m| m.artist.clone()), |d, a| {
-                            d.child(div().text_sm().text_color(theme::text_2()).truncate().child(a))
+                            d.child(div().text_sm().text_color(theme::text_2()).one_line().child(a))
                         })
                         .when_some(music.and_then(|m| m.album.clone()), |d, a| {
-                            d.child(div().text_sm().text_color(theme::muted()).truncate().child(a))
+                            d.child(div().text_sm().text_color(theme::muted()).one_line().child(a))
                         }),
                 )
                 .into_any_element()
         };
-        let button = |id: &'static str, label: String| {
-            div()
-                .id(id)
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .text_sm()
-                .text_color(theme::text())
-                .bg(theme::panel_2())
-                .cursor_pointer()
-                .hover(|s| s.bg(theme::border()))
-                .child(label)
-        };
-        // A row of thin cells: clicking one jumps there.
+        // A row of thin cells: clicking one jumps there. The track is
+        // drawn once underneath, so it reads as one rounded bar.
         const CELLS: usize = 80;
-        let done = if duration > 0 { (position as f64 / duration as f64 * CELLS as f64) as usize } else { 0 };
-        let bar = div().flex().flex_1().h(px(14.)).items_center().children((0..CELLS).map(|i| {
-            div()
-                .id(("seek", i))
-                .flex_1()
-                .h(px(14.))
-                .flex()
-                .items_center()
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        if let Some(p) = this.player() {
-                            p.seek(media::hns_from_fraction(i as f32 / CELLS as f32, p.duration()));
-                            cx.notify();
-                        }
-                    }),
-                )
-                .child(div().w_full().h(px(4.)).bg(if i < done { theme::accent() } else { theme::border() }))
+        let done = if duration > 0 { (position as f64 / duration as f64).clamp(0., 1.) as f32 } else { 0. };
+        let cells = div().absolute().inset_0().flex().children((0..CELLS).map(|i| {
+            div().id(("seek", i)).flex_1().h_full().cursor_pointer().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(p) = this.player() {
+                        p.seek(media::hns_from_fraction(i as f32 / CELLS as f32, p.duration()));
+                        cx.notify();
+                    }
+                }),
+            )
         }));
+        let bar = div()
+            .relative()
+            .flex()
+            .flex_1()
+            .h(px(16.))
+            .items_center()
+            .child(
+                div()
+                    .w_full()
+                    .h(px(4.))
+                    .rounded_full()
+                    .bg(theme::panel_2())
+                    .child(div().h_full().w(gpui::relative(done)).rounded_full().bg(theme::accent())),
+            )
+            .child(cells);
         div()
             .flex()
             .flex_col()
@@ -1259,37 +1298,51 @@ impl Overlay {
                     .items_center()
                     .gap_2()
                     .px_3()
-                    .h(px(40.))
+                    .h(px(52.))
                     .flex_none()
-                    .child(button("play", if paused { "▶".into() } else { "❚❚".into() }).on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(p) = this.player() {
-                            p.toggle();
-                            cx.notify();
-                        }
-                    })))
-                    .child(button("back", "−10".into()).on_click(cx.listener(|this, _, _, cx| {
+                    .border_t_1()
+                    .border_color(theme::border())
+                    .child(
+                        div()
+                            .id("play")
+                            .flex_none()
+                            .size(px(34.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(theme::accent())
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.85))
+                            .child(icon(if paused { Icon::Play } else { Icon::Pause }, 15., gpui::white()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(p) = this.player() {
+                                    p.toggle();
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .child(icon_button("back", Icon::Back, false).on_click(cx.listener(|this, _, _, cx| {
                         if let Some(p) = this.player() {
                             p.skip(-10);
                             cx.notify();
                         }
                     })))
-                    .child(button("fwd", "+10".into()).on_click(cx.listener(|this, _, _, cx| {
+                    .child(icon_button("fwd", Icon::Forward, false).on_click(cx.listener(|this, _, _, cx| {
                         if let Some(p) = this.player() {
                             p.skip(10);
                             cx.notify();
                         }
                     })))
-                    .child(div().text_xs().text_color(theme::text_2()).child(media::clock(position)))
+                    .child(div().flex_none().text_xs().text_color(theme::text_2()).child(media::clock(position)))
                     .child(bar)
-                    .child(div().text_xs().text_color(theme::muted()).child(media::clock(duration)))
-                    .child(
-                        button("mute", if self.muted { "Muted".into() } else { "Sound".into() }).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.muted = !this.muted;
-                                this.apply_volume(cx);
-                            },
-                        )),
-                    )
+                    .child(div().flex_none().text_xs().text_color(theme::muted()).child(media::clock(duration)))
+                    .child(icon_button("mute", if self.muted { Icon::Muted } else { Icon::Volume }, false).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.muted = !this.muted;
+                            this.apply_volume(cx);
+                        },
+                    )))
                     .child(self.render_volume(cx)),
             )
             .into_any_element()
@@ -1304,6 +1357,10 @@ impl Render for Overlay {
                 let _ = window.drop_image(old);
             }
         }
+        // Thumbnails pushed out of the cache: free their textures.
+        for old in self.thumbs.evicted.drain(..) {
+            let _ = window.drop_image(old);
+        }
         let has_query = !self.query(cx).is_empty();
         div()
             .key_context("Overlay")
@@ -1312,6 +1369,8 @@ impl Render for Overlay {
             .on_action(cx.listener(Self::on_prev))
             .on_action(cx.listener(Self::on_page_down))
             .on_action(cx.listener(Self::on_page_up))
+            .on_action(cx.listener(Self::on_first))
+            .on_action(cx.listener(Self::on_last))
             .on_action(cx.listener(Self::on_open))
             .on_action(cx.listener(Self::on_reveal))
             .on_action(cx.listener(Self::on_copy_path))
@@ -1336,62 +1395,81 @@ impl Render for Overlay {
             .on_action(cx.listener(Self::on_delete_selected))
             .on_action(cx.listener(Self::on_delete_for_good))
             .on_action(cx.listener(Self::on_move_selected))
+            .on_action(cx.listener(Self::on_toggle_pane))
+            .on_action(cx.listener(Self::on_left))
+            .on_action(cx.listener(Self::on_right))
             .on_key_down(cx.listener(Self::on_list_key_down))
             .flex()
             .flex_col()
             .size_full()
             .bg(theme::bg())
-            .border_1()
-            .border_color(theme::border())
             .text_color(theme::text())
-            .font_family("Segoe UI")
+            .font_family(theme::FONT)
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .gap_2()
-                    .px_3()
-                    .pt_3()
-                    .child(self.render_mode_chip(Mode::Search, "Search", cx))
-                    .child(self.render_mode_chip(Mode::Clipboard, "Clipboard", cx))
-                    .child(div().flex_1())
-                    .child(self.render_mode_chip(Mode::Settings, "Settings", cx)),
-            )
-            .when(self.mode != Mode::Settings, |d| d.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .mx_3()
-                    .mt_2()
-                    .px_3()
-                    .h(px(42.))
-                    .rounded_lg()
-                    .bg(theme::panel())
-                    .border_1()
+                    .gap_3()
+                    .h(px(58.))
+                    .pl_5()
+                    .pr_3()
+                    .border_b_1()
                     .border_color(theme::border())
-                    .text_size(px(16.))
-                    .line_height(px(22.))
-                    .child(self.input.clone()),
-            ))
+                    .child(icon(
+                        match self.mode {
+                            Mode::Search => Icon::Search,
+                            Mode::Clipboard => Icon::Clipboard,
+                            Mode::Settings => Icon::Settings,
+                        },
+                        19.,
+                        theme::muted(),
+                    ))
+                    .child(match self.mode {
+                        Mode::Settings => div().flex_1().text_size(px(18.)).child("Settings").into_any_element(),
+                        _ => div().flex_1().min_w_0().text_size(px(18.)).line_height(px(24.)).child(self.input.clone()).into_any_element(),
+                    })
+                    .children(self.render_view_switch(cx))
+                    .when(self.mode != Mode::Settings, |d| {
+                        d.child(icon_button("toggle-pane", Icon::Panel, self.show_pane).on_click(cx.listener(|this, _, window, cx| {
+                            this.on_toggle_pane(&TogglePane, window, cx)
+                        })))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_0p5()
+                            .p(px(3.))
+                            .rounded_lg()
+                            .bg(theme::panel())
+                            .child(self.render_mode_chip(Mode::Search, Icon::Search, Some("Search"), cx))
+                            .child(self.render_mode_chip(Mode::Clipboard, Icon::Clipboard, Some("Clipboard"), cx))
+                            .child(self.render_mode_chip(Mode::Settings, Icon::Settings, None, cx)),
+                    ),
+            )
             .when(self.mode == Mode::Search && has_query, |d| {
                 d.child(
                     div()
                         .flex()
-                        .gap_2()
+                        .flex_none()
+                        .gap_1()
+                        .h(px(40.))
                         .px_3()
-                        .mt_2()
                         .border_b_1()
                         .border_color(theme::border())
                         .items_center()
                         .child(self.render_tab(Tab::Files, "Files", self.table.total, cx))
                         .child(self.render_tab(Tab::Inside, "Inside", self.inside_total, cx))
                         .child(div().flex_1())
-                        .when(self.tab == Tab::Files, |d| d.child(self.render_best_match(cx))),
+                        // List and Grid have their own sort bar.
+                        .when(self.tab == Tab::Files && matches!(self.search_view, SearchView::Table | SearchView::Compact), |d| {
+                            d.child(self.render_best_match(cx))
+                        }),
                 )
             })
-            .when(self.mode == Mode::Settings, |d| {
-                d.child(div().flex().flex_1().min_h_0().mt_2().border_t_1().border_color(theme::border()).child(self.settings.clone()))
-            })
+            .when(self.mode == Mode::Settings, |d| d.child(div().flex().flex_1().min_h_0().child(self.settings.clone())))
             .when(self.mode != Mode::Settings, |d| d.child(
                 div()
                     .flex()
@@ -1402,49 +1480,152 @@ impl Render for Overlay {
                         div()
                             .flex()
                             .flex_col()
-                            .w(px(if self.files_tab() { 660. } else { 470. }))
-                            .flex_none()
+                            .when(self.show_pane, |d| d.w(px(if self.files_tab() { 660. } else { 470. })).flex_none())
+                            .when(!self.show_pane, |d| d.flex_1().min_w_0())
                             .min_h_0()
                             .pt_2()
                             .child(self.render_body(cx)),
                     )
-                    .child(self.render_pane(cx)),
+                    .when(self.show_pane, |d| d.child(self.render_pane(cx))),
             ))
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .px_3()
-                    .h(px(30.))
-                    .border_t_1()
-                    .border_color(theme::border())
-                    .text_xs()
-                    .text_color(theme::muted())
-                    .gap_4()
-                    .child(if self.files_tab() && self.table_footer_busy() {
-                        self.render_table_footer(cx)
-                    } else if self.mode == Mode::Search && self.player().is_some() {
-                        "↵ Open   Alt+K Play/Pause   Alt+J/L −10/+10 s   Alt+↑/↓ Volume   Alt+M Mute   Esc Close".into_any_element()
-                    } else if self.files_tab() {
-                        self.render_table_footer(cx)
-                    } else if self.mode == Mode::Search {
-                        "↵ Open   Ctrl+↵ Show in folder   Ctrl+Shift+C Copy path   Tab Files/Inside   Alt+W Wrap   Esc Close".into_any_element()
-                    } else if self.mode == Mode::Clipboard {
-                        "↵ Paste   Ctrl+↵ Copy   Alt+P Pin   Alt+D Delete   Esc Close".into_any_element()
-                    } else {
-                        "Ctrl+1 Search   Ctrl+2 Clipboard   Esc Close".into_any_element()
-                    })
-                    // Files: "12 of 4,512 · 3 selected · 4 ms" beside the index status.
-                    .when(self.files_tab(), |d| {
-                        let summary = self.table.summary();
-                        let text = if summary.is_empty() { self.status.to_string() } else { format!("{summary}   {}", self.status) };
-                        d.child(div().flex_none().child(text))
-                    })
-                    .when(self.mode == Mode::Search && !self.files_tab(), |d| d.child(self.status.clone()))
-                    .when(self.mode == Mode::Clipboard, |d| d.child(format!("{} items", self.clips.len()))),
-            )
+            .child(self.render_footer(cx))
+            // Fades in each time it opens.
+            .with_animation(("appear", self.appear), Animation::new(Duration::from_millis(140)).with_easing(ease_out_quint()), |d, t| {
+                d.opacity(t)
+            })
     }
+}
+
+impl Overlay {
+    /// Left: counts, what an action did, or a question; right: the keys
+    /// that matter here (the rest are in the right-click menu).
+    fn render_footer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let busy = self.files_tab() && self.table_footer_busy();
+        let status: gpui::AnyElement = if busy {
+            self.render_table_footer(cx)
+        } else {
+            let text = match self.mode {
+                Mode::Search if self.files_tab() => self.table.summary(),
+                Mode::Search if self.query(cx).is_empty() => String::new(),
+                Mode::Search => match self.inside_total { 1 => "1 file contains it".into(), n => format!("{} files contain it", table::thousands(n)) },
+                Mode::Clipboard => table::plural(self.clips.len()),
+                Mode::Settings => String::new(),
+            };
+            div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap_3()
+                .child(div().one_line().child(text))
+                .when(self.indexing && self.mode != Mode::Settings, |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_1p5()
+                            .child(div().size(px(6.)).rounded_full().bg(theme::accent()))
+                            .child("Indexing"),
+                    )
+                })
+                .into_any_element()
+        };
+        let keys: &[(&[&str], &str)] = if self.files_tab() && self.table_renaming() {
+            &[(&["Enter"], "Rename"), (&["Esc"], "Cancel")]
+        } else if self.mode == Mode::Search && self.player().is_some() {
+            &[(&["Enter"], "Open"), (&["Alt", "K"], "Play"), (&["Alt", "J", "L"], "−10 / +10 s"), (&["Alt", "↑↓"], "Volume")]
+        } else if self.files_tab() {
+            &[(&["Enter"], "Open"), (&["Ctrl", "Enter"], "Show in folder"), (&["F2"], "Rename"), (&["Del"], "Delete")]
+        } else {
+            match self.mode {
+                Mode::Search => &[(&["Enter"], "Open"), (&["Ctrl", "Enter"], "Show in folder"), (&["Tab"], "Files")],
+                Mode::Clipboard => &[(&["Enter"], "Paste"), (&["Ctrl", "Enter"], "Copy"), (&["Alt", "P"], "Pin"), (&["Alt", "D"], "Delete")],
+                Mode::Settings => &[(&["Ctrl", "1"], "Search"), (&["Ctrl", "2"], "Clipboard"), (&["Esc"], "Close")],
+            }
+        };
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_4()
+            .pl_4()
+            .pr_3()
+            .h(px(36.))
+            .border_t_1()
+            .border_color(theme::border())
+            .text_xs()
+            .text_color(theme::muted())
+            .child(status)
+            .when(!(busy && self.table_confirming()), |d| {
+                d.child(div().flex().flex_none().items_center().gap_4().children(keys.iter().map(|(caps, label)| hint(caps, label))))
+            })
+    }
+}
+
+/// "[Ctrl] [↵] Show in folder".
+fn hint(caps: &[&str], label: &str) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .children(caps.iter().map(|cap| {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .min_w(px(20.))
+                .h(px(20.))
+                .px_1()
+                .rounded(px(5.))
+                .bg(theme::panel_2())
+                .text_color(theme::text_2())
+                .child(cap.to_string())
+        }))
+        .child(div().ml_0p5().child(label.to_string()))
+}
+
+/// A square button with an icon; `on` keeps it lit (a toggle that's on).
+fn icon_button(id: &'static str, glyph: Icon, on: bool) -> gpui::Stateful<gpui::Div> {
+    let color = if on { theme::text() } else { theme::muted() };
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(28.))
+        .rounded_md()
+        .cursor_pointer()
+        .when(on, |d| d.bg(theme::panel_2()))
+        .hover(|s| s.bg(theme::panel_2()))
+        .child(icon(glyph, 15., color))
+}
+
+/// A centred icon, a line, and an optional hint below it.
+fn empty_state(glyph: Icon, title: impl Into<SharedString>, hint: Option<&str>) -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .px_8()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(48.))
+                .mb_1()
+                .rounded_xl()
+                .bg(theme::panel_2())
+                .child(icon(glyph, 22., theme::muted())),
+        )
+        .child(div().text_sm().text_color(theme::text_2()).text_center().child(title.into()))
+        .when_some(hint, |d, hint| d.child(div().text_xs().text_color(theme::muted()).text_center().child(hint.to_string())))
+        .into_any_element()
 }
 
 fn age(modified_ms: u64) -> String {
@@ -1592,6 +1773,30 @@ fn keep_alive(cx: &mut App) {
     }
 }
 
+/// Windows 11 rounds the window's corners and draws a thin outline (older
+/// Windows ignores both).
+#[cfg(windows)]
+fn round_corners(window: &Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
+
+    let Ok(handle) = HasWindowHandle::window_handle(window) else { return };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else { return };
+    let hwnd = HWND(handle.hwnd.get());
+    let corners = DWMWCP_ROUND;
+    let border = theme::window_border();
+    // SAFETY: `hwnd` is this live window's; each value points at a local of
+    // the size passed, which the call only reads.
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, std::ptr::from_ref(&corners).cast(), size_of_val(&corners) as u32);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, std::ptr::from_ref(&border).cast(), size_of_val(&border) as u32);
+    }
+}
+
+#[cfg(not(windows))]
+fn round_corners(_: &Window) {}
+
 /// Shows the overlay in `mode` (or hides it when it's already showing
 /// that mode).
 pub fn summon(mode: Mode, cx: &mut App) {
@@ -1632,13 +1837,24 @@ pub fn summon(mode: Mode, cx: &mut App) {
         is_movable: false,
         is_resizable: false,
         is_minimizable: false,
-        window_background: WindowBackgroundAppearance::Opaque,
+        window_background: WindowBackgroundAppearance::Blurred,
         app_id: Some("Dash".into()),
         ..Default::default()
     };
     let opened = cx.open_window(options, |window, cx| {
+        theme::follow(window.appearance());
+        round_corners(window);
         overlay.update(cx, |view, cx| {
+            view.appear += 1;
             view.shown(mode, window, cx);
+            // Windows switched between light and dark while it's open.
+            cx.observe_window_appearance(window, |_, window, cx| {
+                if theme::follow(window.appearance()) {
+                    round_corners(window);
+                    cx.notify();
+                }
+            })
+            .detach();
             // Clicking elsewhere hides it.
             cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() && !settings::PICKING.load(std::sync::atomic::Ordering::SeqCst) {

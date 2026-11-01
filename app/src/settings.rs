@@ -8,8 +8,11 @@ use std::time::Duration;
 use dash_search::search::{self as s, FileSearchIndexOptions, FileSearchStatus};
 use gpui::{div, prelude::*, px, App, Context, Entity, PathPromptOptions, ScrollHandle, SharedString, Window};
 
+use crate::icons::{icon, Icon};
 use crate::input::TextInput;
-use crate::theme;
+use crate::preview::thousands;
+use crate::scrollbar::scrollbar;
+use crate::theme::{self, OneLine};
 
 /// True while a folder picker is open, so losing focus to it doesn't hide the overlay.
 pub static PICKING: AtomicBool = AtomicBool::new(false);
@@ -93,6 +96,12 @@ impl Settings {
             ocr_ready: false,
             model_ready: false,
         }
+    }
+
+    /// `dash --shots`: 0 Search, 1 Clipboard, 2 General.
+    pub fn show_section(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.section = [Section::Search, Section::Clipboard, Section::General][ix.min(2)];
+        cx.notify();
     }
 
     /// Re-reads everything (each time the page opens).
@@ -184,45 +193,55 @@ impl Settings {
         let Some(o) = self.options.clone() else {
             return note("The index hasn't been set up yet — it starts on first run.");
         };
-        let status_line = match &self.status {
-            Some(st) if st.filename_indexing || st.indexing => {
-                format!("Indexing… {} names, {} documents so far", st.filename_indexed_files, st.indexed_files)
-            }
-            Some(st) => format!(
-                "{} names · {} documents · watching: {}",
-                st.filename_indexed_files, st.indexed_files, st.diagnostics.watcher_strategy
-            ),
-            None => "Status unavailable".into(),
-        };
         let indexing = self.status.as_ref().is_some_and(|st| st.filename_indexing || st.indexing);
+        let names = self.status.as_ref().map_or(0, |st| st.filename_indexed_files);
+        let documents = self.status.as_ref().map_or(0, |st| st.indexed_files);
         let content_on = o.content_indexing_enabled && o.index_content;
-        div()
+        let state = match (&self.status, indexing) {
+            (None, _) => "Status unavailable",
+            (Some(_), true) => "Indexing…",
+            (Some(_), false) if o.watcher_enabled => "Up to date · watching for changes",
+            (Some(_), false) => "Up to date",
+        };
+        let summary = div()
             .flex()
             .flex_col()
-            .gap_4()
+            .gap_3()
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::border())
+            .bg(theme::panel())
             .child(
-                row("Index", Some(status_line)).child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(button("rebuild", "Rebuild now").on_click(cx.listener(|this, _, _, cx| this.rebuild(cx))))
-                        .when(indexing, |d| {
-                            d.child(button("stop", "Stop").on_click(cx.listener(|this, _, _, cx| {
-                                let _ = s::cancel_file_search_index_build();
-                                this.message = Some("Stopping…".into());
-                                cx.notify();
-                            })))
-                        }),
-                ),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_8()
+                    .child(stat(thousands(names as usize), "file names"))
+                    .when(content_on, |d| d.child(stat(thousands(documents as usize), "documents")))
+                    .child(div().flex_1())
+                    .when(indexing, |d| {
+                        d.child(button("stop", "Stop").on_click(cx.listener(|this, _, _, cx| {
+                            let _ = s::cancel_file_search_index_build();
+                            this.message = Some("Stopping…".into());
+                            cx.notify();
+                        })))
+                    })
+                    .child(primary_button("rebuild", "Rebuild now").on_click(cx.listener(|this, _, _, cx| this.rebuild(cx)))),
             )
-            .child(self.folder_list(
-                Folders::Names,
-                "Name search covers",
-                "Folders or whole drives whose file names you can find.",
-                &o.filename_roots,
-                cx,
-            ))
-            .child(row("Search inside files", Some("Index the text of documents and code.".into())).child(toggle(
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(div().size(px(7.)).rounded_full().bg(if indexing { theme::accent() } else { theme::success() }))
+                    .child(state),
+            );
+
+        let mut inside = vec![row("Search inside files", Some("Index the text of documents and code.".into()))
+            .child(toggle(
                 "content",
                 content_on,
                 cx.listener(move |this, _, _, cx| {
@@ -235,123 +254,156 @@ impl Settings {
                         cx,
                     )
                 }),
-            )))
-            .when(content_on, |d| {
-                d.child(self.folder_list(
-                    Folders::Inside,
-                    "Inside search covers",
-                    "Folders whose files' text is indexed.",
-                    &o.roots,
-                    cx,
-                ))
-                .child(row("Largest file read", Some("Bigger files are found by name only.".into())).child(chips(
-                    "max-kb",
-                    &[(256, "256 KB"), (1024, "1 MB"), (4096, "4 MB"), (16384, "16 MB")],
-                    o.max_content_kb.unwrap_or(1024),
-                    cx,
-                    |this, kb, cx| this.save(|o| o.max_content_kb = Some(kb), true, cx),
-                )))
-            })
-            .child(self.folder_list(
-                Folders::Skipped,
-                "Skipped folders",
-                "Never indexed (Windows and Program Files are always skipped).",
-                &o.exclude_folders,
-                cx,
             ))
-            .child(
-                row("Skipped file types", Some("Extensions, separated by commas.".into())).child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .items_center()
-                        .child(field(self.extensions.clone()).w(px(240.)))
-                        .child(button("save-ext", "Apply").on_click(cx.listener(|this, _, _, cx| {
-                            let list: Vec<String> = this
-                                .extensions
-                                .read(cx)
-                                .text()
-                                .split(|c: char| c == ',' || c.is_whitespace())
-                                .map(|e| e.trim().trim_start_matches('.').to_lowercase())
-                                .filter(|e| !e.is_empty())
-                                .collect();
-                            this.save(|o| o.exclude_extensions = list, true, cx);
-                        }))),
-                ),
-            )
-            .when(content_on, |d| {
-                let ocr_on = o.ocr_on_index_enabled;
-                let semantic_on = o.semantic_search_enabled;
-                let (ocr_ready, model_ready) = (self.ocr_ready, self.model_ready);
-                d.child(
-                    row(
-                        "Read text in pictures and scans",
-                        Some(if ocr_ready {
-                            "OCR for images and scanned PDFs in the folders below. Slower indexing.".into()
-                        } else {
-                            "OCR isn't installed with this copy of Dash.".into()
-                        }),
-                    )
-                    .child(toggle(
-                        "ocr",
-                        ocr_on,
-                        cx.listener(move |this, _, _, cx| this.save(|o| o.ocr_on_index_enabled = !ocr_on, true, cx)),
-                    )),
-                )
-                .when(ocr_on, |d| {
-                    d.child(self.folder_list(
-                        Folders::Ocr,
-                        "Read pictures in",
-                        "Only these folders (OCR is slow on whole drives).",
-                        &o.ocr_on_index_folders,
+            .into_any_element()];
+        if content_on {
+            let ocr_on = o.ocr_on_index_enabled;
+            let semantic_on = o.semantic_search_enabled;
+            let (ocr_ready, model_ready) = (self.ocr_ready, self.model_ready);
+            inside.push(self.folder_list(Folders::Inside, "Folders", "Whose files' text is indexed.", &o.roots, cx));
+            inside.push(
+                row("Largest file read", Some("Bigger files are found by name only.".into()))
+                    .child(chips(
+                        "max-kb",
+                        &[(256, "256 KB"), (1024, "1 MB"), (4096, "4 MB"), (16384, "16 MB")],
+                        o.max_content_kb.unwrap_or(1024),
                         cx,
+                        |this, kb, cx| this.save(|o| o.max_content_kb = Some(kb), true, cx),
                     ))
-                })
-                .child(
-                    row(
-                        "Search by meaning",
-                        Some(if model_ready {
-                            "Finds documents about what you type, not only exact words. Uses more memory.".into()
-                        } else {
-                            "The meaning model isn't installed with this copy of Dash.".into()
-                        }),
-                    )
-                    .child(toggle(
-                        "semantic",
-                        semantic_on,
-                        cx.listener(move |this, _, _, cx| {
-                            this.save(|o| o.semantic_search_enabled = !semantic_on, true, cx)
-                        }),
-                    )),
+                    .into_any_element(),
+            );
+            inside.push(
+                row(
+                    "Read text in pictures and scans",
+                    Some(if ocr_ready {
+                        "OCR for images and scanned PDFs. Slower indexing.".into()
+                    } else {
+                        "OCR isn't installed with this copy of Dash.".into()
+                    }),
                 )
-            })
-            .child(row("Hidden files", Some("Include hidden files and folders.".into())).child(toggle(
-                "hidden",
-                o.include_hidden,
-                cx.listener(move |this, _, _, cx| this.save(|o| o.include_hidden = !o.include_hidden, true, cx)),
-            )))
-            .child(row("Watch for changes", Some("Keep the index up to date as files change.".into())).child(toggle(
-                "watch",
-                o.watcher_enabled,
-                cx.listener(move |this, _, _, cx| this.save(|o| o.watcher_enabled = !o.watcher_enabled, false, cx)),
-            )))
-            .child(row("Indexing speed", Some("Quiet uses the least CPU.".into())).child(chips(
-                "speed",
-                &[(0, "Quiet"), (1, "Balanced"), (2, "Fast")],
-                match o.performance_mode.as_str() {
-                    "quiet" => 0,
-                    "fast" => 2,
-                    _ => 1,
-                },
-                cx,
-                |this, v, cx| {
-                    let mode = ["quiet", "balanced", "fast"][v as usize].to_string();
-                    this.save(|o| o.performance_mode = mode, false, cx)
-                },
-            )))
+                .child(toggle(
+                    "ocr",
+                    ocr_on,
+                    cx.listener(move |this, _, _, cx| this.save(|o| o.ocr_on_index_enabled = !ocr_on, true, cx)),
+                ))
+                .into_any_element(),
+            );
+            if ocr_on {
+                inside.push(self.folder_list(
+                    Folders::Ocr,
+                    "Read pictures in",
+                    "Only these folders (OCR is slow on whole drives).",
+                    &o.ocr_on_index_folders,
+                    cx,
+                ));
+            }
+            inside.push(
+                row(
+                    "Search by meaning",
+                    Some(if model_ready {
+                        "Finds documents about what you type, not only exact words. Uses more memory.".into()
+                    } else {
+                        "The meaning model isn't installed with this copy of Dash.".into()
+                    }),
+                )
+                .child(toggle(
+                    "semantic",
+                    semantic_on,
+                    cx.listener(move |this, _, _, cx| this.save(|o| o.semantic_search_enabled = !semantic_on, true, cx)),
+                ))
+                .into_any_element(),
+            );
+        }
+
+        let file_types = row("Skipped file types", Some("Extensions, separated by commas.".into()))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(field(self.extensions.clone()).w(px(200.)))
+                    .child(button("save-ext", "Apply").on_click(cx.listener(|this, _, _, cx| {
+                        let list: Vec<String> = this
+                            .extensions
+                            .read(cx)
+                            .text()
+                            .split(|c: char| c == ',' || c.is_whitespace())
+                            .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+                            .filter(|e| !e.is_empty())
+                            .collect();
+                        this.save(|o| o.exclude_extensions = list, true, cx);
+                    }))),
+            )
+            .into_any_element();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_6()
+            .child(summary)
+            .child(group(
+                "File names",
+                vec![self.folder_list(
+                    Folders::Names,
+                    "Folders and drives",
+                    "Every file and folder name in these can be found.",
+                    &o.filename_roots,
+                    cx,
+                )],
+            ))
+            .child(group("Text inside files", inside))
+            .child(group(
+                "Skip",
+                vec![
+                    self.folder_list(
+                        Folders::Skipped,
+                        "Skipped folders",
+                        "Never indexed. Windows and Program Files are always skipped.",
+                        &o.exclude_folders,
+                        cx,
+                    ),
+                    file_types,
+                ],
+            ))
+            .child(group(
+                "Indexing",
+                vec![
+                    row("Hidden files", Some("Include hidden files and folders.".into()))
+                        .child(toggle(
+                            "hidden",
+                            o.include_hidden,
+                            cx.listener(move |this, _, _, cx| this.save(|o| o.include_hidden = !o.include_hidden, true, cx)),
+                        ))
+                        .into_any_element(),
+                    row("Watch for changes", Some("Keep the index up to date as files change.".into()))
+                        .child(toggle(
+                            "watch",
+                            o.watcher_enabled,
+                            cx.listener(move |this, _, _, cx| this.save(|o| o.watcher_enabled = !o.watcher_enabled, false, cx)),
+                        ))
+                        .into_any_element(),
+                    row("Speed", Some("Quiet uses the least CPU.".into()))
+                        .child(chips(
+                            "speed",
+                            &[(0, "Quiet"), (1, "Balanced"), (2, "Fast")],
+                            match o.performance_mode.as_str() {
+                                "quiet" => 0,
+                                "fast" => 2,
+                                _ => 1,
+                            },
+                            cx,
+                            |this, v, cx| {
+                                let mode = ["quiet", "balanced", "fast"][v as usize].to_string();
+                                this.save(|o| o.performance_mode = mode, false, cx)
+                            },
+                        ))
+                        .into_any_element(),
+                ],
+            ))
             .into_any_element()
     }
 
+    /// A list of folders with "Add folder…", each folder removable.
     fn folder_list(
         &self,
         which: Folders,
@@ -359,37 +411,26 @@ impl Settings {
         hint: &'static str,
         folders: &[String],
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
         let id = title;
         div()
             .flex()
             .flex_col()
-            .gap_1()
-            .child(row(title, Some(hint.into())).child(button(id, "Add folder…").on_click(cx.listener(
-                move |this, _, window, cx| this.add_folders(which, window, cx),
-            ))))
-            .children(folders.iter().enumerate().map(|(ix, folder)| {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .pl_3()
-                    .text_xs()
-                    .text_color(theme::text_2())
-                    .child(div().flex_1().truncate().child(folder.clone()))
-                    .child(
-                        div()
-                            .id((id, ix))
-                            .px_2()
-                            .rounded_md()
-                            .text_color(theme::muted())
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(theme::text()).bg(theme::panel_2()))
-                            .child("Remove")
-                            .on_click(cx.listener(move |this, _, _, cx| this.remove_folder(which, ix, cx))),
-                    )
-            }))
-            .when(folders.is_empty(), |d| d.child(div().pl_3().text_xs().text_color(theme::muted()).child("None")))
+            .gap_2()
+            .child(row(title, Some(hint.into())).child(
+                button_with_icon(id, Icon::Plus, "Add folder").on_click(cx.listener(move |this, _, window, cx| {
+                    this.add_folders(which, window, cx)
+                })),
+            ))
+            .child(list_items(
+                folders.iter().enumerate().map(|(ix, folder)| {
+                    list_item(Some(Icon::Folder), folder.clone(), (id, ix), cx.listener(move |this, _, _, cx| {
+                        this.remove_folder(which, ix, cx)
+                    }))
+                }),
+                folders.is_empty(),
+            ))
+            .into_any_element()
     }
 
     fn render_clipboard(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -400,119 +441,116 @@ impl Settings {
         let image_days = c::get_clipboard_image_retention_days();
         let apps = c::get_clipboard_exclusions();
         let confirm = self.confirm_clear;
+        const KEEP: &[(u32, &str)] = &[(1, "1 day"), (7, "7 days"), (14, "14 days"), (30, "30 days"), (90, "90 days"), (0, "Always")];
+        // Images: 2 days by default (they're big).
+        const KEEP_IMAGES: &[(u32, &str)] = &[(1, "1 day"), (2, "2 days"), (7, "7 days"), (14, "14 days"), (30, "30 days"), (90, "90 days"), (0, "Always")];
+        let never = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                row("Never save from", Some("Copies made in these apps are skipped (password managers by default).".into())).child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .items_center()
+                        .child(field(self.new_app.clone()).w(px(200.)))
+                        .child(button("add-app", "Add").on_click(cx.listener(|this, _, _, cx| {
+                            let name = this.new_app.read(cx).text().trim().to_string();
+                            if name.is_empty() {
+                                return;
+                            }
+                            let mut apps = c::get_clipboard_exclusions();
+                            if !apps.iter().any(|a| a.eq_ignore_ascii_case(&name)) {
+                                apps.push(name);
+                                let _ = c::set_clipboard_exclusions(apps);
+                            }
+                            this.new_app.update(cx, |input, cx| input.set_text("", cx));
+                            cx.notify();
+                        })))
+                        .child(button("reset-apps", "Reset").on_click(cx.listener(|_, _, _, cx| {
+                            let _ = c::reset_clipboard_exclusions_to_defaults();
+                            cx.notify();
+                        }))),
+                ),
+            )
+            .child(list_items(
+                apps.iter().enumerate().map(|(ix, app)| {
+                    let name = app.clone();
+                    list_item(None, app.clone(), ("app", ix), cx.listener(move |_, _, _, cx| {
+                        let apps: Vec<String> = c::get_clipboard_exclusions().into_iter().filter(|a| *a != name).collect();
+                        let _ = c::set_clipboard_exclusions(apps);
+                        cx.notify();
+                    }))
+                }),
+                apps.is_empty(),
+            ))
+            .into_any_element();
         div()
             .flex()
             .flex_col()
-            .gap_4()
-            .child(row("Save what I copy", Some("Off pauses the history until you turn it back on.".into())).child(toggle(
-                "capture",
-                capturing,
-                cx.listener(move |_, _, _, cx| {
-                    let _ = c::set_clipboard_paused(capturing);
-                    cx.notify();
-                }),
-            )))
-            .child(row("Save images", Some("Screenshots and copied pictures, GIFs included.".into())).child(toggle(
-                "images",
-                images,
-                cx.listener(move |_, _, _, cx| {
-                    let _ = c::set_clipboard_images_enabled(!images);
-                    cx.notify();
-                }),
-            )))
-            .child(row("Keep text for", Some("Pinned items are always kept.".into())).child(chips(
-                "days",
-                &[(1, "1 day"), (7, "7 days"), (14, "14 days"), (30, "30 days"), (90, "90 days"), (0, "Always")],
-                days,
-                cx,
-                |_, d, cx| {
-                    let _ = c::set_clipboard_retention_days(d);
-                    cx.notify();
-                },
-            )))
-            .child(row("Keep images for", None).child(chips(
-                "image-days",
-                &[(1, "1 day"), (7, "7 days"), (14, "14 days"), (30, "30 days"), (90, "90 days"), (0, "Always")],
-                image_days,
-                cx,
-                |_, d, cx| {
-                    let _ = c::set_clipboard_image_retention_days(d);
-                    cx.notify();
-                },
-            )))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
+            .gap_6()
+            .child(group(
+                "History",
+                vec![
+                    row("Save what I copy", Some("Off pauses the history until you turn it back on.".into()))
+                        .child(toggle(
+                            "capture",
+                            capturing,
+                            cx.listener(move |_, _, _, cx| {
+                                let _ = c::set_clipboard_paused(capturing);
+                                cx.notify();
+                            }),
+                        ))
+                        .into_any_element(),
+                    row("Save images", Some("Screenshots and copied pictures, GIFs included.".into()))
+                        .child(toggle(
+                            "images",
+                            images,
+                            cx.listener(move |_, _, _, cx| {
+                                let _ = c::set_clipboard_images_enabled(!images);
+                                cx.notify();
+                            }),
+                        ))
+                        .into_any_element(),
+                ],
+            ))
+            .child(group(
+                "Keep",
+                vec![
+                    row("Text", Some("Pinned items are always kept.".into()))
+                        .child(chips("days", KEEP, days, cx, |_, d, cx| {
+                            let _ = c::set_clipboard_retention_days(d);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                    row("Images", None)
+                        .child(chips("image-days", KEEP_IMAGES, image_days, cx, |_, d, cx| {
+                            let _ = c::set_clipboard_image_retention_days(d);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                ],
+            ))
+            .child(group("Privacy", vec![never]))
+            .child(group(
+                "Clear",
+                vec![row("Clear history", Some("Removes everything except pinned items.".into()))
                     .child(
-                        row("Never save from", Some("Copies made in these apps are skipped (password managers by default).".into()))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(field(self.new_app.clone()).w(px(220.)))
-                                    .child(button("add-app", "Add").on_click(cx.listener(|this, _, _, cx| {
-                                        let name = this.new_app.read(cx).text().trim().to_string();
-                                        if name.is_empty() {
-                                            return;
-                                        }
-                                        let mut apps = c::get_clipboard_exclusions();
-                                        if !apps.iter().any(|a| a.eq_ignore_ascii_case(&name)) {
-                                            apps.push(name);
-                                            let _ = c::set_clipboard_exclusions(apps);
-                                        }
-                                        this.new_app.update(cx, |input, cx| input.set_text("", cx));
-                                        cx.notify();
-                                    })))
-                                    .child(button("reset-apps", "Reset").on_click(cx.listener(|_, _, _, cx| {
-                                        let _ = c::reset_clipboard_exclusions_to_defaults();
-                                        cx.notify();
-                                    }))),
-                            ),
+                        button("clear", if confirm { "Click again to clear" } else { "Clear…" })
+                            .when(confirm, |d| d.text_color(theme::danger()).border_color(theme::danger()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.confirm_clear {
+                                    let _ = c::clear_clipboard_history();
+                                    this.confirm_clear = false;
+                                    this.message = Some("History cleared.".into());
+                                } else {
+                                    this.confirm_clear = true;
+                                }
+                                cx.notify();
+                            })),
                     )
-                    .children(apps.iter().enumerate().map(|(ix, app)| {
-                        let name = app.clone();
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .pl_3()
-                            .text_xs()
-                            .text_color(theme::text_2())
-                            .child(div().flex_1().truncate().child(app.clone()))
-                            .child(
-                                div()
-                                    .id(("app", ix))
-                                    .px_2()
-                                    .rounded_md()
-                                    .text_color(theme::muted())
-                                    .cursor_pointer()
-                                    .hover(|s| s.text_color(theme::text()).bg(theme::panel_2()))
-                                    .child("Remove")
-                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                        let apps: Vec<String> =
-                                            c::get_clipboard_exclusions().into_iter().filter(|a| *a != name).collect();
-                                        let _ = c::set_clipboard_exclusions(apps);
-                                        cx.notify();
-                                    })),
-                            )
-                    })),
-            )
-            .child(row("Clear history", Some("Removes everything except pinned items.".into())).child(
-                button("clear", if confirm { "Click again to clear" } else { "Clear…" }).on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        if this.confirm_clear {
-                            let _ = c::clear_clipboard_history();
-                            this.confirm_clear = false;
-                            this.message = Some("History cleared.".into());
-                        } else {
-                            this.confirm_clear = true;
-                        }
-                        cx.notify();
-                    },
-                )),
+                    .into_any_element()],
             ))
             .into_any_element()
     }
@@ -607,59 +645,91 @@ impl Settings {
         div()
             .flex()
             .flex_col()
-            .gap_4()
-            .child(row("Indexing and clipboard", Some(engines)))
-            .child(self.hotkey_row(crate::shell::Which::Search, "Search", "Opens Dash in Search mode from anywhere.", cx))
-            .child(self.hotkey_row(crate::shell::Which::Clipboard, "Clipboard", "Opens the clipboard history.", cx))
-            .child(row("Settings", Some("Inside Dash.".into())).child(keycap("Ctrl+,")))
-            .child(row(START_AT_LOGIN, Some("Dash waits in the tray after you sign in.".into())).child(toggle(
-                "login",
-                login,
-                cx.listener(move |this, _, _, cx| {
-                    match startup::set(!login) {
-                        Ok(()) => this.login = startup::enabled(),
-                        Err(e) => this.message = Some(format!("Couldn't change it: {e}").into()),
-                    }
-                    cx.notify();
-                }),
-            )))
-            .child(row("Data folder", Some(data.display().to_string())).child(button("open-data", "Open").on_click(
-                move |_, _, _| {
-                    let _ = std::process::Command::new("explorer").arg(&data).spawn();
-                },
-            )))
-            .child(row("Quit Dash", Some("Stops indexing and clipboard saving until you start it again.".into())).child(
-                button("quit", "Quit").on_click(|_, _, cx| {
-                    s::stop_all_index_workers();
-                    cx.quit();
-                }),
+            .gap_6()
+            .child(group(
+                "Shortcuts",
+                vec![
+                    self.hotkey_row(crate::shell::Which::Search, "Search", "Opens Dash in Search mode from anywhere.", cx)
+                        .into_any_element(),
+                    self.hotkey_row(crate::shell::Which::Clipboard, "Clipboard", "Opens the clipboard history.", cx)
+                        .into_any_element(),
+                    row("Settings", Some("Inside Dash.".into())).child(keycap("Ctrl+,")).into_any_element(),
+                    row("Preview pane", Some("Shows or hides the pane beside the results.".into()))
+                        .child(keycap("Ctrl+P"))
+                        .into_any_element(),
+                ],
+            ))
+            .child(group(
+                "System",
+                vec![
+                    row(START_AT_LOGIN, Some("Dash waits in the tray after you sign in.".into()))
+                        .child(toggle(
+                            "login",
+                            login,
+                            cx.listener(move |this, _, _, cx| {
+                                match startup::set(!login) {
+                                    Ok(()) => this.login = startup::enabled(),
+                                    Err(e) => this.message = Some(format!("Couldn't change it: {e}").into()),
+                                }
+                                cx.notify();
+                            }),
+                        ))
+                        .into_any_element(),
+                    row("Data folder", Some(data.display().to_string()))
+                        .child(button("open-data", "Open").on_click(move |_, _, _| {
+                            let _ = std::process::Command::new("explorer").arg(&data).spawn();
+                        }))
+                        .into_any_element(),
+                    row("Indexing and clipboard", Some(engines)).into_any_element(),
+                ],
+            ))
+            .child(group(
+                "Quit",
+                vec![row("Quit Dash", Some("Stops indexing and clipboard saving until you start it again.".into()))
+                    .child(button_with_icon("quit", Icon::Power, "Quit").on_click(|_, _, cx| {
+                        s::stop_all_index_workers();
+                        cx.quit();
+                    }))
+                    .into_any_element()],
             ))
             .into_any_element()
     }
 
-    fn nav(&self, section: Section, label: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+    fn nav(&self, section: Section, glyph: Icon, label: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.section == section;
+        let color = if active { theme::text() } else { theme::text_2() };
         div()
             .id(label)
+            .flex()
+            .items_center()
+            .gap_2p5()
+            .h(px(34.))
             .px_3()
-            .py_1p5()
             .rounded_md()
             .text_sm()
             .cursor_pointer()
-            .when(active, |d| d.bg(theme::accent_soft()).text_color(theme::text()))
-            .when(!active, |d| d.text_color(theme::text_2()).hover(|s| s.bg(theme::panel())))
+            .text_color(color)
+            .when(active, |d| d.bg(theme::selected()).font_weight(gpui::FontWeight::MEDIUM))
+            .when(!active, |d| d.hover(|s| s.bg(theme::hover())))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.section = section;
                 this.confirm_clear = false;
                 this.message = None;
+                this.scroll.set_offset(gpui::Point::default());
                 cx.notify();
             }))
+            .child(icon(glyph, 16., if active { theme::text() } else { theme::muted() }))
             .child(label)
     }
 }
 
 impl Render for Settings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (title, subtitle) = match self.section {
+            Section::Search => ("Search", "What Dash indexes, and how."),
+            Section::Clipboard => ("Clipboard", "What's kept in your history, and for how long."),
+            Section::General => ("General", "Shortcuts, startup and your data."),
+        };
         let body = match self.section {
             Section::Search => self.render_search(cx),
             Section::Clipboard => self.render_clipboard(cx),
@@ -674,28 +744,68 @@ impl Render for Settings {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .w(px(180.))
+                    .w(px(200.))
                     .flex_none()
                     .p_3()
                     .border_r_1()
                     .border_color(theme::border())
-                    .child(self.nav(Section::Search, "Search", cx))
-                    .child(self.nav(Section::Clipboard, "Clipboard", cx))
-                    .child(self.nav(Section::General, "General", cx))
+                    .child(self.nav(Section::Search, Icon::Search, "Search", cx))
+                    .child(self.nav(Section::Clipboard, Icon::Clipboard, "Clipboard", cx))
+                    .child(self.nav(Section::General, Icon::Settings, "General", cx))
+                    .child(div().flex_1())
+                    // What the last change did, until the next one.
                     .when_some(self.message.clone(), |d, m| {
-                        d.child(div().mt_4().px_1().text_xs().text_color(theme::accent()).child(m))
+                        d.child(
+                            div()
+                                .flex()
+                                .items_start()
+                                .gap_2()
+                                .p_3()
+                                .rounded_md()
+                                .bg(theme::accent_soft())
+                                .text_xs()
+                                .text_color(theme::text())
+                                .child(div().mt(px(5.)).size(px(6.)).flex_none().rounded_full().bg(theme::accent()))
+                                .child(div().flex_1().min_w_0().child(m)),
+                        )
                     }),
             )
             .child(
                 div()
-                    .id("settings-body")
+                    .relative()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_w_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .px_5()
-                    .py_4()
-                    .child(body),
+                    .child(
+                        div()
+                            .id("settings-body")
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_6()
+                                    .max_w(px(680.))
+                                    .w_full()
+                                    .mx_auto()
+                                    .px_8()
+                                    .pt_6()
+                                    .pb_10()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(div().text_size(px(20.)).font_weight(gpui::FontWeight::SEMIBOLD).child(title))
+                                            .child(div().text_sm().text_color(theme::muted()).child(subtitle)),
+                                    )
+                                    .child(body),
+                            ),
+                    )
+                    .child(scrollbar("settings-scrollbar", &self.scroll)),
             )
     }
 }
@@ -715,45 +825,168 @@ fn note(text: &'static str) -> gpui::AnyElement {
     div().text_sm().text_color(theme::muted()).child(text).into_any_element()
 }
 
+/// A titled group of settings: one rounded card, rows split by lines.
+fn group(title: &'static str, rows: Vec<gpui::AnyElement>) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(div().px_1().text_xs().font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::muted()).child(title))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme::border())
+                .bg(theme::panel())
+                .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                    div().flex().flex_col().px_4().py_3().when(ix > 0, |d| d.border_t_1().border_color(theme::border())).child(row)
+                })),
+        )
+}
+
+/// A big number over a small label, for the index summary.
+fn stat(value: String, label: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .child(div().text_size(px(22.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::text()).child(value))
+        .child(div().text_xs().text_color(theme::muted()).child(label))
+}
+
 /// A setting: title and hint on the left, the control on the right.
 fn row(title: &'static str, hint: Option<String>) -> gpui::Div {
-    div().flex().items_center().gap_4().child(
+    div().flex().items_center().gap_6().child(
         div()
             .flex()
             .flex_col()
+            .gap_0p5()
             .flex_1()
             .min_w_0()
-            .child(div().text_sm().text_color(theme::text()).child(title))
-            .when_some(hint, |d, h| d.child(div().text_xs().text_color(theme::muted()).truncate().child(h))),
+            .child(div().text_sm().font_weight(gpui::FontWeight::MEDIUM).text_color(theme::text()).child(title))
+            .when_some(hint, |d, h| d.child(div().text_xs().text_color(theme::muted()).line_clamp(2).child(h))),
     )
 }
 
 fn button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .flex()
         .flex_none()
+        .items_center()
+        .gap_1p5()
+        .h(px(30.))
         .px_3()
-        .py_1()
         .rounded_md()
         .text_xs()
+        .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme::text())
         .bg(theme::panel_2())
         .border_1()
         .border_color(theme::border())
         .cursor_pointer()
-        .hover(|s| s.bg(theme::border()))
+        .hover(|s| s.bg(theme::selected()))
         .child(label)
+}
+
+fn button_with_icon(id: &'static str, glyph: Icon, label: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_1p5()
+        .h(px(30.))
+        .pl_2p5()
+        .pr_3()
+        .rounded_md()
+        .text_xs()
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(theme::text())
+        .bg(theme::panel_2())
+        .border_1()
+        .border_color(theme::border())
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::selected()))
+        .child(icon(glyph, 14., theme::text_2()))
+        .child(label)
+}
+
+/// The one main action on a page.
+fn primary_button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(30.))
+        .px_3()
+        .rounded_md()
+        .text_xs()
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(gpui::white())
+        .bg(theme::accent())
+        .cursor_pointer()
+        .hover(|s| s.opacity(0.88))
+        .child(label)
+}
+
+/// Folders (or apps) under a setting, each with a remove button.
+fn list_items(items: impl Iterator<Item = gpui::AnyElement>, empty: bool) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .children(items)
+        .when(empty, |d| d.child(div().px_2().py_1().text_xs().text_color(theme::muted()).child("None yet")))
+}
+
+fn list_item(
+    glyph: Option<Icon>,
+    text: String,
+    id: impl Into<gpui::ElementId>,
+    remove: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .h(px(32.))
+        .pl_2()
+        .pr_1()
+        .rounded_md()
+        .bg(theme::panel())
+        .when_some(glyph, |d, g| d.child(icon(g, 14., theme::muted())))
+        .child(div().flex_1().min_w_0().text_sm().text_color(theme::text_2()).one_line().child(text))
+        .child(
+            div()
+                .id(id)
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(24.))
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::panel_2()))
+                .child(icon(Icon::Close, 13., theme::muted()))
+                .on_click(remove),
+        )
+        .into_any_element()
 }
 
 fn keycap(keys: impl Into<SharedString>) -> impl IntoElement {
     div()
+        .flex_none()
         .px_2()
-        .py_0p5()
+        .py_1()
         .rounded_md()
         .border_1()
         .border_color(theme::border())
         .bg(theme::panel_2())
         .text_xs()
+        .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme::text_2())
         .child(keys.into())
 }
@@ -763,7 +996,7 @@ fn field(input: Entity<TextInput>) -> gpui::Div {
         .flex()
         .items_center()
         .px_2()
-        .h(px(28.))
+        .h(px(30.))
         .rounded_md()
         .bg(theme::panel())
         .border_1()
@@ -787,11 +1020,13 @@ fn toggle(
         .flex()
         .cursor_pointer()
         .when(on, |d| d.bg(theme::accent()).justify_end())
-        .when(!on, |d| d.bg(theme::border()).justify_start())
+        .when(!on, |d| d.bg(theme::selected()).justify_start())
         .on_click(listener)
-        .child(div().w(px(16.)).h(px(16.)).rounded_full().bg(theme::text()))
+        // White on either theme; a light-theme "off" track needs its shadow.
+        .child(div().w(px(16.)).h(px(16.)).rounded_full().bg(gpui::white()).shadow_sm())
 }
 
+/// A segmented control: one of a few choices.
 fn chips(
     id: &'static str,
     choices: &[(u32, &'static str)],
@@ -799,20 +1034,24 @@ fn chips(
     cx: &mut Context<Settings>,
     pick: fn(&mut Settings, u32, &mut Context<Settings>),
 ) -> impl IntoElement {
-    div().flex().flex_none().gap_1().children(choices.iter().map(|&(value, label)| {
-        let active = value == current;
-        div()
-            .id((id, value as usize))
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .text_xs()
-            .cursor_pointer()
-            .when(active, |d| d.bg(theme::accent_soft()).text_color(theme::text()))
-            .when(!active, |d| d.text_color(theme::muted()).hover(|s| s.text_color(theme::text_2())))
-            .on_click(cx.listener(move |this, _, _, cx| pick(this, value, cx)))
-            .child(label)
-    }))
+    div().flex().flex_none().gap_0p5().p(px(2.)).rounded_md().bg(theme::panel_2()).children(choices.iter().map(
+        |&(value, label)| {
+            let active = value == current;
+            div()
+                .id((id, value as usize))
+                .flex()
+                .items_center()
+                .h(px(24.))
+                .px_2p5()
+                .rounded(px(5.))
+                .text_xs()
+                .cursor_pointer()
+                .when(active, |d| d.bg(theme::menu()).text_color(theme::text()).font_weight(gpui::FontWeight::MEDIUM).shadow_sm())
+                .when(!active, |d| d.text_color(theme::muted()).hover(|s| s.text_color(theme::text())))
+                .on_click(cx.listener(move |this, _, _, cx| pick(this, value, cx)))
+                .child(label)
+        },
+    ))
 }
 
 /// Start with Windows: a value under the user's Run key.
