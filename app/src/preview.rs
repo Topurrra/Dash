@@ -1,0 +1,207 @@
+//! The preview pane beside the results: what's inside the selected file
+//! (code with line numbers, document text, images, GIFs) plus its details.
+//! Loaded off the UI thread; video and music play (see `media`).
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use gpui::SharedString;
+
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tif", "tiff"];
+const MEDIA_EXTS: &[&str] = &[
+    "mp4", "mkv", "webm", "mov", "avi", "wmv", "m4v", "mp3", "flac", "wav", "ogg", "m4a", "aac", "opus", "wma",
+];
+/// Documents whose text is extracted (shown without line numbers).
+const DOC_EXTS: &[&str] = &["pdf", "docx", "xlsx", "pptx", "odt", "ods", "odp", "rtf"];
+const MAX_LINES: usize = 2000;
+
+pub enum Body {
+    Image(PathBuf),
+    /// Video or music: played in the pane.
+    Media(PathBuf),
+    Text {
+        lines: Vec<SharedString>,
+        /// Code / plain text: show line numbers.
+        code: bool,
+        /// Line to scroll to and mark (Inside: the first match).
+        hit: Option<usize>,
+        truncated: bool,
+        full: SharedString,
+    },
+    Note(SharedString),
+}
+
+pub struct Preview {
+    pub path: String,
+    pub name: SharedString,
+    pub details: Vec<(&'static str, SharedString)>,
+    pub body: Body,
+    /// Music: its tags and cover, for the player.
+    pub music: Option<Music>,
+}
+
+pub struct Music {
+    pub title: Option<SharedString>,
+    pub artist: Option<SharedString>,
+    pub album: Option<SharedString>,
+    pub cover: Option<Arc<gpui::Image>>,
+}
+
+const AUDIO_EXTS: &[&str] = &["mp3", "flac", "wav", "ogg", "m4a", "aac", "opus", "wma"];
+
+/// Tags and the first embedded picture; adds what's useful to `details`.
+fn music(path: &Path, details: &mut Vec<(&'static str, SharedString)>) -> Option<Music> {
+    use lofty::prelude::*;
+    let file = lofty::read_from_path(path).ok()?;
+    let props = file.properties();
+    if let Some(kbps) = props.audio_bitrate() {
+        details.push(("Bitrate", format!("{kbps} kbps").into()));
+    }
+    if let Some(hz) = props.sample_rate() {
+        details.push(("Sample rate", format!("{:.1} kHz", hz as f32 / 1000.).into()));
+    }
+    let tag = file.primary_tag().or_else(|| file.first_tag());
+    let text = |value: Option<std::borrow::Cow<str>>| value.map(|v| SharedString::from(v.trim().to_string())).filter(|v| !v.is_empty());
+    let (title, artist, album) = match tag {
+        Some(t) => (text(t.title()), text(t.artist()), text(t.album())),
+        None => (None, None, None),
+    };
+    if let Some(year) = tag.and_then(|t| t.year()) {
+        details.push(("Year", year.to_string().into()));
+    }
+    let cover = tag.and_then(|t| t.pictures().first()).and_then(|picture| {
+        use lofty::picture::MimeType;
+        let format = match picture.mime_type()? {
+            MimeType::Png => gpui::ImageFormat::Png,
+            MimeType::Jpeg => gpui::ImageFormat::Jpeg,
+            MimeType::Gif => gpui::ImageFormat::Gif,
+            MimeType::Bmp => gpui::ImageFormat::Bmp,
+            MimeType::Tiff => gpui::ImageFormat::Tiff,
+            _ => return None,
+        };
+        Some(Arc::new(gpui::Image::from_bytes(format, picture.data().to_vec())))
+    });
+    Some(Music { title, artist, album, cover })
+}
+
+/// Reads `path` for the pane. `query` marks the first line that matches.
+pub fn load(path: String, query: &str) -> Preview {
+    let p = Path::new(&path);
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let meta = std::fs::metadata(p);
+    let mut details: Vec<(&'static str, SharedString)> = Vec::new();
+    if let Some(parent) = p.parent() {
+        details.push(("Folder", parent.display().to_string().into()));
+    }
+    let body = match &meta {
+        Err(e) => Body::Note(format!("Can't read it: {e}").into()),
+        Ok(m) if m.is_dir() => {
+            let items = std::fs::read_dir(p).map(|d| d.take(100_000).count()).unwrap_or(0);
+            details.push(("Contains", format!("{items} items").into()));
+            Body::Note("Folder".into())
+        }
+        Ok(_) if IMAGE_EXTS.contains(&ext.as_str()) => Body::Image(p.to_path_buf()),
+        Ok(_) if MEDIA_EXTS.contains(&ext.as_str()) => Body::Media(p.to_path_buf()),
+        Ok(_) => match dash_search::search::read_file_preview(path.clone(), Some(256 * 1024)) {
+            Some(text) if !text.trim().is_empty() => text_body(&text, !DOC_EXTS.contains(&ext.as_str()), query),
+            _ => Body::Note("No preview for this kind of file.".into()),
+        },
+    };
+    if let Ok(m) = &meta {
+        if m.is_file() {
+            details.push(("Size", human_size(m.len()).into()));
+        }
+        if !ext.is_empty() {
+            details.push(("Type", ext.to_uppercase().into()));
+        }
+        if let Ok(t) = m.modified() {
+            details.push(("Modified", when(t).into()));
+        }
+        if let Ok(t) = m.created() {
+            details.push(("Created", when(t).into()));
+        }
+    }
+    let music = if AUDIO_EXTS.contains(&ext.as_str()) && matches!(body, Body::Media(_)) { music(p, &mut details) } else { None };
+    Preview { path, name: name.into(), details, body, music }
+}
+
+/// A clipboard entry's text, for the pane (no file behind it).
+pub fn text_only(text: &str) -> Body {
+    text_body(text, false, "")
+}
+
+fn text_body(text: &str, code: bool, query: &str) -> Body {
+    let all: Vec<&str> = text.lines().collect();
+    let truncated = all.len() > MAX_LINES;
+    let lines: Vec<SharedString> =
+        all.iter().take(MAX_LINES).map(|l| SharedString::from(l.replace('\t', "    "))).collect();
+    let words: Vec<String> = query.split_whitespace().filter(|w| w.chars().count() >= 2).map(str::to_lowercase).collect();
+    let hit = (!words.is_empty())
+        .then(|| lines.iter().position(|l| {
+            let l = l.to_lowercase();
+            words.iter().any(|w| l.contains(w))
+        }))
+        .flatten();
+    Body::Text { lines, code, hit, truncated, full: text.to_string().into() }
+}
+
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024. && unit < UNITS.len() - 1 {
+        value /= 1024.;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn when(t: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes tags and a cover into a copy of a Windows sound, then reads them back.
+    #[cfg(windows)]
+    #[test]
+    fn music_tags_and_cover_are_read() {
+        use lofty::config::WriteOptions;
+        use lofty::picture::{MimeType, Picture, PictureType};
+        use lofty::prelude::*;
+        use lofty::tag::{Tag, TagType};
+
+        let dir = std::env::temp_dir().join(format!("dash-music-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("song.wav");
+        std::fs::copy(r"C:\Windows\Media\Alarm01.wav", &file).unwrap();
+
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([200, 30, 30, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title("Test Title".into());
+        tag.set_artist("Test Artist".into());
+        tag.set_album("Test Album".into());
+        tag.push_picture(Picture::new_unchecked(PictureType::CoverFront, Some(MimeType::Png), None, png));
+        tag.save_to_path(&file, WriteOptions::default()).unwrap();
+
+        let preview = load(file.display().to_string(), "");
+        assert!(matches!(preview.body, Body::Media(_)));
+        let music = preview.music.expect("music");
+        assert_eq!(music.title.as_ref().map(|s| s.as_ref()), Some("Test Title"));
+        assert_eq!(music.artist.as_ref().map(|s| s.as_ref()), Some("Test Artist"));
+        assert_eq!(music.album.as_ref().map(|s| s.as_ref()), Some("Test Album"));
+        assert!(music.cover.is_some(), "cover read");
+        assert!(preview.details.iter().any(|(k, _)| *k == "Sample rate"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -1,0 +1,49 @@
+[package]
+name = "dash"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Dash: search and clipboard history in a hotkey overlay"
+
+[[bin]]
+name = "dash"
+path = "src/main.rs"
+
+[dependencies]
+dash-core.workspace = true
+dash-clipboard = { path = "../crates/dash-clipboard" }
+# With semantic search (EmbeddingGemma 2 through ONNX Runtime, linked in);
+# the model ships in the installer (installer/dash.nsi).
+dash-search = { path = "../crates/dash-search", features = ["semantic"] }
+serde_json.workspace = true
+gpui = "=0.2.2"
+# Pinned, at least two weeks old when chosen (2026-11-01).
+global-hotkey = "=0.9.0"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+unicode-segmentation = "1"
+image.workspace = true
+# Plays the sound (Windows decodes with Media Foundation; macOS / Linux with
+# rodio's own decoders, below). Pinned (2026-11-01).
+rodio = { version = "=0.21.1", default-features = false, features = ["playback"] }
+# Music tags and cover art. Pinned (2026-11-01).
+lofty = "=0.22.4"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+
+[target.'cfg(windows)'.dependencies]
+# Shell / Ole / KeyboardAndMouse: the Files table's Recycle Bin, "show in
+# folder" for several items and dragging files out; Storage_FileSystem:
+# rename / copy that never replace an existing file (file_ops.rs).
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Registry", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+
+[target.'cfg(not(windows))'.dependencies]
+open = "5.3.3"
+rodio = { version = "=0.21.1", default-features = false, features = ["playback", "symphonia-all"] }
+
+# Tray icon: the usual backend on Windows / macOS; on Linux the D-Bus (KSNI)
+# one, which runs its own thread (no GTK loop needed).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tray-icon = "=0.26.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { version = "=0.26.1", default-features = false, features = ["ksni"] }

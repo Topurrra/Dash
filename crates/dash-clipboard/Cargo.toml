@@ -1,0 +1,32 @@
+[package]
+name = "dash-clipboard"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Clipboard history: capture, store, pins, retention, paste"
+
+[dependencies]
+dash-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+image.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# macOS / Linux clipboard (text + images; Wayland too). Pinned (2026-11-01).
+[target.'cfg(not(windows))'.dependencies]
+arboard = { version = "=3.4.1", features = ["wayland-data-control"] }

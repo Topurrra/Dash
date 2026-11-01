@@ -1,0 +1,337 @@
+//! Runs in any app that is a `dash_core::Host`.
+//! Semantic-search vector store.
+//!
+//! Multiple embedding vectors per content-indexed document — one per text
+//! chunk (see `embedding::chunk_text`) — keyed by absolute path. Written by
+//! the content indexer (`search.rs::run_content_indexer`, behind the
+//! semantic toggle) and read at query time to find the documents *closest
+//! in meaning* to the query: the ones the keyword passes miss because they
+//! share no literal words. Scoring a document by its BEST chunk (not one
+//! averaged doc vector) is what makes long documents actually findable — a
+//! single relevant paragraph is no longer diluted by the rest of the file.
+//!
+//! **int8 quantization.** Each chunk vector is stored as `i8[EMBED_DIM]`
+//! (one byte per dimension) instead of `f32[EMBED_DIM]` — 4× less disk and,
+//! more importantly, 4× less RAM, since the whole set is held in memory for
+//! the brute-force scan. This directly serves the "runs on 4–8 GB machines"
+//! mandate: 100 k chunks at 768-d ≈ 77 MB in RAM. Cosine is invariant
+//! to positive scaling, so quantizing per-vector to the full int8 range and
+//! computing cosine on the raw bytes recovers the true similarity to within
+//! quantization noise — no stored scale factor needed.
+//!
+//! Storage: its own redb file (`vector_cache.redb`) beside the search index,
+//! same sidecar pattern as `ocr_cache.rs`. Vectors are **plaintext** — a
+//! lossy transform of the content index, which is itself plaintext on disk
+//! by design (see the encrypt-at-rest disclosure); an int8 embedding vector
+//! is strictly less recoverable than the indexed text beside it.
+//!
+//! Query path: `top_k` brute-forces cosine over every stored chunk, keeping
+//! each document's best chunk. Decoded vectors are held in a process-global
+//! cache keyed by the redb file's mtime, so a query only reloads when the
+//! indexer has written since the last scan. All errors swallow to empty: a
+//! vector-store failure never breaks search, it just means no semantic
+//! candidates that query.
+//!
+//! ponytail: exact brute-force cosine over an in-RAM int8 set. Fine to
+//! several hundred k chunks; past that, an ANN index (hnsw) would trade a
+//! little accuracy for speed — deferred deliberately (quantization is the
+//! scale lever that fits the hardware target). `top_k`'s signature stays the
+//! same if that day comes.
+
+use redb::{Database, ReadableTable, TableDefinition};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
+
+pub const VECTOR_CACHE_FILE: &str = "vector_cache.redb";
+
+/// Key = absolute path (utf-8), value = packed chunk set:
+/// `[u16 dim][u16 chunk_count][i8; dim]…` (one i8 block per chunk).
+const VECTOR_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("vector_cache_v2");
+
+/// Serialize store access at the process level (mirrors `OCR_CACHE_LOCK`).
+static VECTOR_CACHE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// mtime-guarded decode cache: `(db mtime at load, decoded chunk sets)`.
+/// `top_k` reuses this whenever the redb file hasn't changed since the last
+/// load, so repeated queries don't re-read/re-decode the store.
+type ChunkSet = (String, Vec<Vec<i8>>);
+static DECODE_CACHE: LazyLock<Mutex<Option<(SystemTime, Vec<ChunkSet>)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+pub fn cache_path_for_dir(dir: &Path) -> PathBuf {
+    dir.join(VECTOR_CACHE_FILE)
+}
+
+/// Quantize a float vector to int8 using a per-vector max-abs scale, so the
+/// full [-127, 127] range is used regardless of the vector's magnitude. The
+/// scale is deliberately NOT stored: cosine is invariant to positive scaling
+/// of each argument, so `cosine(q, i8)` ≈ `cosine(q, f32)`.
+fn quantize(vec: &[f32]) -> Vec<i8> {
+    let maxabs = vec.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    if maxabs <= 0.0 {
+        return vec![0i8; vec.len()];
+    }
+    let scale = 127.0 / maxabs;
+    vec.iter()
+        .map(|&v| (v * scale).round().clamp(-127.0, 127.0) as i8)
+        .collect()
+}
+
+/// `[u16 dim][u16 chunk_count][i8; dim]…`, little-endian. All chunks must
+/// share one dimension (they do — same model). Empty input → empty output.
+fn pack(chunks: &[Vec<i8>]) -> Vec<u8> {
+    let dim = chunks.first().map(|c| c.len()).unwrap_or(0);
+    if dim == 0 || dim > u16::MAX as usize || chunks.len() > u16::MAX as usize {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(4 + dim * chunks.len());
+    out.extend_from_slice(&(dim as u16).to_le_bytes());
+    out.extend_from_slice(&(chunks.len() as u16).to_le_bytes());
+    for chunk in chunks {
+        if chunk.len() != dim {
+            return Vec::new(); // ragged input — refuse rather than misalign
+        }
+        out.extend(chunk.iter().map(|&q| q as u8));
+    }
+    out
+}
+
+/// Reverse of `pack`. `None` on any malformed record (treated as absent).
+fn unpack(bytes: &[u8]) -> Option<Vec<Vec<i8>>> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let dim = u16::from_le_bytes(bytes[0..2].try_into().ok()?) as usize;
+    let count = u16::from_le_bytes(bytes[2..4].try_into().ok()?) as usize;
+    if dim == 0 || bytes.len() != 4 + dim * count {
+        return None;
+    }
+    let mut chunks = Vec::with_capacity(count);
+    for i in 0..count {
+        let start = 4 + i * dim;
+        let chunk: Vec<i8> = bytes[start..start + dim].iter().map(|&b| b as i8).collect();
+        chunks.push(chunk);
+    }
+    Some(chunks)
+}
+
+fn open_db(path: &Path) -> Result<Database, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Cannot create vector cache directory: {e}"))?;
+    }
+    let db = if path.exists() {
+        match Database::open(path) {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!(
+                    "vector_cache: cannot open existing store ({error}); quarantining and starting fresh."
+                );
+                let quarantined = path.with_extension("corrupt.redb");
+                let _ = fs::rename(path, quarantined);
+                Database::create(path).map_err(|e| format!("Cannot create vector cache: {e}"))?
+            }
+        }
+    } else {
+        Database::create(path).map_err(|e| format!("Cannot create vector cache: {e}"))?
+    };
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| format!("Cannot initialize vector cache: {e}"))?;
+    {
+        let _ = write_txn
+            .open_table(VECTOR_TABLE)
+            .map_err(|e| format!("Cannot initialize vector table: {e}"))?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| format!("Cannot commit vector cache init: {e}"))?;
+    Ok(db)
+}
+
+/// Store (or overwrite) one document's chunk vectors. `chunks` are the raw
+/// f32 embeddings, one per text passage; they're quantized to int8 here.
+/// Errors are logged, never bubbled — a failed write just costs one doc's
+/// semantic recall.
+pub fn store(db_path: &Path, path: &str, chunks: &[Vec<f32>]) {
+    if chunks.is_empty() {
+        return;
+    }
+    let quantized: Vec<Vec<i8>> = chunks
+        .iter()
+        .filter(|c| !c.is_empty())
+        .map(|c| quantize(c))
+        .collect();
+    let packed = pack(&quantized);
+    if packed.is_empty() {
+        return;
+    }
+    let _guard = match VECTOR_CACHE_LOCK.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let db = match open_db(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("vector_cache: cannot open for store ({e})");
+            return;
+        }
+    };
+    if let Ok(write_txn) = db.begin_write() {
+        if let Ok(mut table) = write_txn.open_table(VECTOR_TABLE) {
+            let _ = table.insert(path, packed.as_slice());
+        }
+        let _ = write_txn.commit();
+    }
+}
+
+/// Wipe the store (called at the start of a full rebuild so vectors for
+/// deleted files don't linger as orphans). Best-effort.
+pub fn clear(db_path: &Path) {
+    let _guard = match VECTOR_CACHE_LOCK.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let _ = fs::remove_file(db_path);
+    if let Ok(mut cache) = DECODE_CACHE.lock() {
+        *cache = None;
+    }
+}
+
+/// Load every stored chunk set, using the mtime-guarded cache when the store
+/// hasn't changed since the last load.
+fn load_all_cached(db_path: &Path) -> Vec<ChunkSet> {
+    let mtime = fs::metadata(db_path).and_then(|m| m.modified()).ok();
+    if let (Some(mtime), Ok(cache)) = (mtime, DECODE_CACHE.lock()) {
+        if let Some((cached_mtime, sets)) = cache.as_ref() {
+            if *cached_mtime == mtime {
+                return sets.clone();
+            }
+        }
+    }
+    let sets = read_all(db_path);
+    if let (Some(mtime), Ok(mut cache)) = (mtime, DECODE_CACHE.lock()) {
+        *cache = Some((mtime, sets.clone()));
+    }
+    sets
+}
+
+fn read_all(db_path: &Path) -> Vec<ChunkSet> {
+    if !db_path.exists() {
+        return Vec::new();
+    }
+    let db = match open_db(db_path) {
+        Ok(db) => db,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if let Ok(read_txn) = db.begin_read() {
+        if let Ok(table) = read_txn.open_table(VECTOR_TABLE) {
+            if let Ok(iter) = table.iter() {
+                for entry in iter.flatten() {
+                    let path = entry.0.value().to_string();
+                    if let Some(chunks) = unpack(entry.1.value()) {
+                        out.push((path, chunks));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Cosine between an f32 query and an int8 chunk vector. Guards zero-norm and
+/// length mismatch (→ 0). The int8 side is treated as f32; because cosine is
+/// scale-invariant, the missing dequant scale doesn't matter.
+fn cosine_f32_i8(query: &[f32], chunk: &[i8]) -> f32 {
+    if query.len() != chunk.len() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut nq = 0.0f32;
+    let mut nc = 0.0f32;
+    for i in 0..query.len() {
+        let c = chunk[i] as f32;
+        dot += query[i] * c;
+        nq += query[i] * query[i];
+        nc += c * c;
+    }
+    if nq <= 0.0 || nc <= 0.0 {
+        return 0.0;
+    }
+    (dot / (nq.sqrt() * nc.sqrt())).clamp(-1.0, 1.0)
+}
+
+/// The `k` documents whose BEST chunk is most similar to `query`, as
+/// `(path, cosine)` pairs sorted most-similar first. The path is returned
+/// exactly as stored (original case) so callers can look the document up by
+/// its `path_exact` term. Only positive similarities are returned. Empty on
+/// any error or empty store.
+pub fn top_k(db_path: &Path, query: &[f32], k: usize) -> Vec<(String, f32)> {
+    if query.is_empty() || k == 0 {
+        return Vec::new();
+    }
+    let _guard = match VECTOR_CACHE_LOCK.lock() {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+    let sets = load_all_cached(db_path);
+    let mut scored: Vec<(String, f32)> = sets
+        .iter()
+        .filter_map(|(path, chunks)| {
+            let best = chunks
+                .iter()
+                .map(|chunk| cosine_f32_i8(query, chunk))
+                .fold(0.0f32, f32::max);
+            (best > 0.0).then(|| (path.clone(), best))
+        })
+        .collect();
+    scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(k);
+    scored
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_roundtrips_multichunk() {
+        let a = quantize(&[1.0, 0.0, -0.5]);
+        let b = quantize(&[0.0, 1.0, 0.25]);
+        let packed = pack(&[a.clone(), b.clone()]);
+        assert_eq!(unpack(&packed), Some(vec![a, b]));
+        // Malformed inputs are rejected, not panicked on.
+        assert_eq!(unpack(&[]), None);
+        assert_eq!(unpack(&[3, 0, 1, 0]), None); // claims dim 3 / 1 chunk, no body
+    }
+
+    #[test]
+    fn quantize_preserves_direction() {
+        // Cosine on the quantized vector should closely match the f32 cosine.
+        let a = [0.9f32, 0.1, -0.3, 0.05];
+        let b = [0.85f32, 0.2, -0.25, 0.0];
+        let qb = quantize(&b);
+        let f32_cos = {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        };
+        let q_cos = cosine_f32_i8(&a, &qb);
+        assert!((f32_cos - q_cos).abs() < 0.02, "quant cosine drift too high: {f32_cos} vs {q_cos}");
+    }
+
+    #[test]
+    fn cosine_ranks_aligned_over_orthogonal() {
+        let q = [1.0f32, 0.0, 0.0];
+        assert!((cosine_f32_i8(&q, &quantize(&[2.0, 0.0, 0.0])) - 1.0).abs() < 1e-3);
+        assert!(cosine_f32_i8(&q, &quantize(&[0.0, 1.0, 0.0])).abs() < 1e-3);
+        assert!((cosine_f32_i8(&q, &quantize(&[-1.0, 0.0, 0.0])) + 1.0).abs() < 1e-3);
+        // Zero-norm and mismatched length are safe (→ 0), never NaN/panic.
+        assert_eq!(cosine_f32_i8(&q, &[0i8, 0, 0]), 0.0);
+        assert_eq!(cosine_f32_i8(&q, &[1i8, 0]), 0.0);
+    }
+}

@@ -1,0 +1,94 @@
+//! Dash as the host of its engines: their files live in the shared data
+//! folder (`%LOCALAPPDATA%\Dash`). Other apps built on the same engines can
+//! use it too: whichever starts first runs the engines, the others follow
+//! it (see `dash_core::link`).
+
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+
+pub struct DashHost {
+    dir: PathBuf,
+}
+
+impl dash_core::Host for DashHost {
+    fn data_dir(&self) -> Result<PathBuf, String> {
+        std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
+        Ok(self.dir.clone())
+    }
+
+    /// The overlay reads state when it opens, so events only go to a follower.
+    fn emit(&self, event: &str, payload: serde_json::Value) {
+        dash_core::link::broadcast(event, &payload);
+    }
+}
+
+/// The one host of this process.
+pub fn host() -> Arc<dyn dash_core::Host> {
+    static HOST: OnceLock<Arc<dyn dash_core::Host>> = OnceLock::new();
+    HOST.get_or_init(|| Arc::new(DashHost { dir: dash_core::shared::shared_data_dir() })).clone()
+}
+
+/// The async runtime the engines' async APIs run on.
+pub fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("dash-engine")
+            .build()
+            .expect("tokio runtime")
+    })
+}
+
+/// Runs the engines, or follows another app that already does.
+pub fn claim_engines() {
+    dash_core::link::register(dash_clipboard::link_handler());
+    dash_core::link::register(dash_search::link::link_handler(host(), runtime().handle().clone()));
+    dash_core::link::claim(
+        &dash_core::shared::shared_data_dir(),
+        "Dash",
+        || {},
+        Arc::new(|_: &str, _: serde_json::Value| {}),
+    );
+}
+
+/// First run (no saved index settings): index every drive's names and the
+/// home folder's contents, quietly. Later runs: the
+/// scheduler keeps them fresh. Only the owner does this.
+pub fn start_search_engines() {
+    use dash_search::search as s;
+    dash_core::link::when_owner(|| {
+        let host = host();
+        if matches!(s::get_file_search_index_options(host.clone()), Ok(None)) {
+            seed_first_index(host);
+        }
+    });
+    s::start_file_search_scheduler(host());
+    s::prewarm_search_engines(host());
+}
+
+fn seed_first_index(host: Arc<dyn dash_core::Host>) {
+    use dash_search::search as s;
+    let drives = s::list_logical_drives();
+    let home = std::env::var("USERPROFILE").ok().into_iter().collect::<Vec<_>>();
+    let options: Result<s::FileSearchIndexOptions, _> = serde_json::from_value(serde_json::json!({
+        "roots": home,
+        "filenameRoots": drives,
+        "includeHidden": false,
+        "indexContent": true,
+        "maxContentKb": null,
+        "commitEvery": null,
+        "performanceMode": "balanced",
+        "watcherEnabled": true,
+    }));
+    if let Ok(options) = options {
+        let _ = s::save_file_search_index_options(host.clone(), options.clone());
+        let mut build = options;
+        build.performance_mode = "quiet".into();
+        runtime().spawn(async move {
+            let _ = s::start_content_search_index(host.clone(), build.clone()).await;
+            let _ = s::start_filename_search_index(host, build).await;
+        });
+    }
+}
