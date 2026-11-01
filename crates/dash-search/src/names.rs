@@ -50,7 +50,8 @@ fn search_names_blocking(app: Arc<dyn Host>, options: NameQueryOptions) -> Resul
     let Some(table) = table else {
         return fallback_search(app, &query, &options, started);
     };
-    let (total, ids) = table.search(&query, query.is_empty(), &options);
+    let hide = hidden_bits(&table);
+    let (total, ids) = table.search(&query, query.is_empty(), &options, hide.as_deref());
     let rows = ids.into_iter().map(|id| table.row(id)).collect();
     Ok(NameSearchResult { total, rows, took_ms: started.elapsed().as_millis() as u64, error: None })
 }
@@ -512,10 +513,23 @@ impl Table {
     /// Runs a search: the match count and one page of ids, in order.
     /// `match_all` skips the scan (empty query); `options.query` is also read
     /// for relevance ranking.
-    pub(crate) fn search(&self, matcher: &dyn Matcher, match_all: bool, options: &NameQueryOptions) -> (usize, Vec<u32>) {
+    /// `hide`: entries left out (see `forget_paths`).
+    pub(crate) fn search(&self, matcher: &dyn Matcher, match_all: bool, options: &NameQueryOptions, hide: Option<&[u64]>) -> (usize, Vec<u32>) {
         let (bits, total) = if match_all { (None, self.items.len()) } else {
             let (bits, total) = self.match_bits(matcher);
             (Some(bits), total)
+        };
+        let (bits, total) = match hide {
+            None => (bits, total),
+            Some(hide) => {
+                let mut bits = bits.unwrap_or_else(|| all_bits(self.items.len()));
+                let mut total = total;
+                for (word, hidden) in bits.iter_mut().zip(hide) {
+                    total -= (*word & hidden).count_ones() as usize;
+                    *word &= !hidden;
+                }
+                (Some(bits), total)
+            }
         };
         let slot = match options.sort {
             SortKey::Relevance => {
@@ -570,6 +584,104 @@ impl Table {
             keys.iter().skip(options.offset).take(options.limit).map(pick).collect()
         }
     }
+}
+
+/// A bitset with the first `n` bits set.
+fn all_bits(n: usize) -> Vec<u64> {
+    let mut bits = vec![u64::MAX; n.div_ceil(64)];
+    if n % 64 != 0 {
+        if let Some(last) = bits.last_mut() {
+            *last = (1u64 << (n % 64)) - 1;
+        }
+    }
+    bits
+}
+
+// ---- Removed by the app ----
+
+/// Paths the app itself just deleted or moved away. The table only learns of
+/// that once the watcher updated the filename index and a rebuild ran
+/// (seconds later, or not at all with the watcher off), so until then name
+/// search leaves them, and everything inside them, out.
+#[derive(Default)]
+struct Gone {
+    /// Case-folded on Windows, no trailing separator.
+    paths: std::collections::HashSet<String>,
+    /// The table `bits` were worked out for (its address; 0: none yet).
+    table: usize,
+    bits: Vec<u64>,
+}
+
+static GONE: LazyLock<Mutex<Gone>> = LazyLock::new(Mutex::default);
+
+/// Leaves `paths` (and what's inside them) out of name search until the
+/// index no longer has them or they exist again (on the owner when this app
+/// follows).
+pub fn forget_paths(paths: Vec<String>) {
+    if dash_core::link::is_follower() {
+        let forwarded: Option<Result<(), String>> = dash_core::link::forward("forget_paths", serde_json::json!({ "paths": paths }));
+        if forwarded.is_some() {
+            return;
+        }
+    }
+    let Ok(mut gone) = GONE.lock() else { return };
+    gone.paths.extend(paths.iter().map(|p| gone_key(p)));
+    gone.table = 0;
+}
+
+fn gone_key(path: &str) -> String {
+    let trimmed = path.trim_end_matches(is_sep);
+    // Keep a root's separator (`c:\`).
+    let key = if trimmed.ends_with(':') || trimmed.is_empty() { path } else { trimmed };
+    fold_case(key)
+}
+
+/// Windows paths ignore case; elsewhere they don't.
+fn fold_case(path: &str) -> String {
+    if cfg!(windows) { path.to_lowercase() } else { path.to_string() }
+}
+
+/// Matches entries that are, or are inside, a forgotten path; notes which
+/// forgotten paths the table still has.
+struct UnderGone<'a> {
+    paths: &'a std::collections::HashSet<String>,
+    found: Mutex<std::collections::HashSet<String>>,
+}
+
+impl Matcher for UnderGone<'_> {
+    fn matches(&self, entry: &Entry) -> bool {
+        let path = fold_case(entry.path);
+        if self.paths.contains(&path) {
+            if let Ok(mut found) = self.found.lock() {
+                found.insert(path);
+            }
+            return true;
+        }
+        path.char_indices().filter(|&(_, c)| is_sep(c)).any(|(i, _)| self.paths.contains(&path[..i]))
+    }
+}
+
+/// The entries of `table` to leave out, if any. Worked out again for each new
+/// table, dropping paths that exist again or that the table no longer has.
+fn hidden_bits(table: &Arc<Table>) -> Option<Vec<u64>> {
+    let mut gone = GONE.lock().ok()?;
+    if gone.paths.is_empty() {
+        return None;
+    }
+    let key = Arc::as_ptr(table) as usize;
+    if gone.table != key {
+        gone.paths.retain(|p| !std::path::Path::new(p).exists());
+        let matcher = UnderGone { paths: &gone.paths, found: Mutex::default() };
+        let (bits, _) = table.match_bits(&matcher);
+        let found = matcher.found.into_inner().unwrap_or_default();
+        gone.paths.retain(|p| found.contains(p));
+        gone.bits = bits;
+        gone.table = key;
+        if gone.paths.is_empty() {
+            return None;
+        }
+    }
+    Some(gone.bits.clone())
 }
 
 /// One page of `order`, keeping only ids set in `bits` (all when `None`).
@@ -912,6 +1024,29 @@ mod tests {
         assert_eq!(rows, [r"C:\a\x.txt", r"C:\a\z.txt", r"C:\b\c\d\w", r"C:\b\c\y.txt", r"D:\q"]);
     }
 
+    /// Deleted paths (and what's inside a deleted folder) leave the results
+    /// and the count; paths the table doesn't have are noted as not found.
+    #[test]
+    fn forgotten_paths_are_left_out() {
+        let mut b = TableBuilder::default();
+        for (path, dir) in [(r"C:\a", true), (r"C:\a\x.txt", false), (r"C:\a\sub\y.txt", false), (r"C:\b.txt", false), (r"C:\ab.txt", false)] {
+            b.push(path, dir, 0, 0, 0);
+        }
+        let t = b.finish(0);
+        let paths: std::collections::HashSet<String> = [gone_key(r"C:\A\"), gone_key(r"C:\missing.txt")].into_iter().collect();
+        let matcher = UnderGone { paths: &paths, found: Mutex::default() };
+        let (hide, hidden) = t.match_bits(&matcher);
+        // C:\a, both files inside it; not C:\ab.txt (same prefix, other name).
+        assert_eq!(hidden, 3);
+        assert_eq!(matcher.found.into_inner().unwrap().len(), 1);
+        let (total, ids) = t.search(&Everything, true, &opts("", SortKey::Name, false, 0, 10), Some(&hide));
+        assert_eq!(total, 2);
+        assert_eq!(names(&t, &ids), ["ab.txt", "b.txt"]);
+        let (total, _) = t.search(&Contains("txt"), false, &opts("txt", SortKey::Name, false, 0, 10), Some(&hide));
+        assert_eq!(total, 2);
+        assert_eq!(all_bits(70).iter().map(|w| w.count_ones()).sum::<u32>(), 70);
+    }
+
     #[test]
     fn counts_children() {
         let t = sample();
@@ -928,7 +1063,7 @@ mod tests {
     #[test]
     fn sorts_by_every_column() {
         let t = sample();
-        let run = |sort, desc| names(&t, &t.search(&Contains("re"), false, &opts("", sort, desc, 0, 100)).1);
+        let run = |sort, desc| names(&t, &t.search(&Contains("re"), false, &opts("", sort, desc, 0, 100), None).1);
         assert_eq!(run(SortKey::Name, false), ["q1 report.pdf", "Report Final.docx", "report.pdf", "reports"]);
         assert_eq!(run(SortKey::Name, true), ["reports", "report.pdf", "Report Final.docx", "q1 report.pdf"]);
         assert_eq!(run(SortKey::Size, false), ["reports", "q1 report.pdf", "Report Final.docx", "report.pdf"]);
@@ -941,24 +1076,24 @@ mod tests {
     #[test]
     fn pages_with_offset_and_limit() {
         let t = sample();
-        let (total, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 1, 2));
+        let (total, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 1, 2), None);
         assert_eq!(total, 4);
         assert_eq!(names(&t, &ids), ["Report Final.docx", "report.pdf"]);
-        let (total, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 3, 10));
+        let (total, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 3, 10), None);
         assert_eq!((total, names(&t, &ids)), (4, vec!["reports".to_string()]));
-        let (_, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 50, 10));
+        let (_, ids) = t.search(&Contains("re"), false, &opts("re", SortKey::Name, false, 50, 10), None);
         assert!(ids.is_empty());
     }
 
     #[test]
     fn empty_query_lists_everything() {
         let t = sample();
-        let (total, ids) = t.search(&Everything, true, &opts("", SortKey::Relevance, false, 0, 3));
+        let (total, ids) = t.search(&Everything, true, &opts("", SortKey::Relevance, false, 0, 3), None);
         assert_eq!(total, 8);
         assert_eq!(names(&t, &ids), [r"C:\", "me", "notes.txt"]);
-        let (_, ids) = t.search(&Everything, true, &opts("", SortKey::Name, true, 0, 2));
+        let (_, ids) = t.search(&Everything, true, &opts("", SortKey::Name, true, 0, 2), None);
         assert_eq!(names(&t, &ids), ["Users", "reports"]);
-        let (_, ids) = t.search(&Everything, true, &opts("", SortKey::Name, true, 7, 5));
+        let (_, ids) = t.search(&Everything, true, &opts("", SortKey::Name, true, 7, 5), None);
         assert_eq!(names(&t, &ids), [r"C:\"]);
         // The real (placeholder or F2) parser treats "" as empty.
         assert!(crate::query::parse("").unwrap().is_empty());
@@ -971,7 +1106,7 @@ mod tests {
             b.push(path, !path.contains('.'), 1, 0, 0);
         }
         let t = b.finish(0);
-        let (total, ids) = t.search(&Contains("report"), false, &opts("report", SortKey::Relevance, false, 0, 10));
+        let (total, ids) = t.search(&Contains("report"), false, &opts("report", SortKey::Relevance, false, 0, 10), None);
         assert_eq!(total, 6);
         assert_eq!(names(&t, &ids), ["Report", "report.pdf", "reports", "reporting.md", "q1 report.pdf", "misreport.txt"]);
         assert_eq!(match_tier("ext:pdf", "pdf"), 2);
@@ -1077,12 +1212,12 @@ mod tests {
             let parsed = crate::query::parse(query).unwrap();
             for sort in [SortKey::Relevance, SortKey::Name, SortKey::Size] {
                 let t = Instant::now();
-                let (total, ids) = table.search(&parsed, false, &opts(query, sort, false, 0, 100));
+                let (total, ids) = table.search(&parsed, false, &opts(query, sort, false, 0, 100), None);
                 println!("{label:>18} {sort:?}: {total} hits, {} rows, {:?}", ids.len(), t.elapsed());
             }
         }
         let t = Instant::now();
-        let (total, _) = table.search(&Everything, true, &opts("", SortKey::Path, true, 500_000, 100));
+        let (total, _) = table.search(&Everything, true, &opts("", SortKey::Path, true, 500_000, 100), None);
         println!("empty query, Path desc page @500k: {total} total, {:?}", t.elapsed());
         /// Allocation-free ASCII case-insensitive substring test.
         struct AsciiContains(&'static [u8]);
@@ -1131,7 +1266,7 @@ mod tests {
             let parsed = crate::query::parse(query).unwrap();
             for sort in [SortKey::Relevance, SortKey::Name, SortKey::Modified] {
                 let t = Instant::now();
-                let (total, ids) = table.search(&parsed, false, &opts(query, sort, true, 0, 100));
+                let (total, ids) = table.search(&parsed, false, &opts(query, sort, true, 0, 100), None);
                 println!("{query:>8} {sort:?}: {total} hits, {} rows, {:?}", ids.len(), t.elapsed());
             }
         }

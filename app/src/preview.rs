@@ -29,7 +29,20 @@ pub enum Body {
         full: SharedString,
     },
     Note(SharedString),
+    /// A folder: what's in it (folders first, then by name; at most
+    /// `FOLDER_ITEMS`) and how many items it has in all.
+    Folder { items: Vec<FolderItem>, total: usize },
 }
+
+pub struct FolderItem {
+    pub name: SharedString,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// Entries listed in a folder's preview; the rest are counted.
+const FOLDER_ITEMS: usize = 500;
 
 pub struct Preview {
     pub path: String,
@@ -100,9 +113,9 @@ pub fn load(path: String, query: &str) -> Preview {
     let body = match &meta {
         Err(e) => Body::Note(format!("Can't read it: {e}").into()),
         Ok(m) if m.is_dir() => {
-            let items = std::fs::read_dir(p).map(|d| d.take(100_000).count()).unwrap_or(0);
-            details.push(("Contains", format!("{items} items").into()));
-            Body::Note("Folder".into())
+            let (items, total) = folder_items(p);
+            details.push(("Contains", if total == 1 { "1 item".into() } else { format!("{} items", thousands(total)).into() }));
+            Body::Folder { items, total }
         }
         Ok(_) if IMAGE_EXTS.contains(&ext.as_str()) => Body::Image(p.to_path_buf()),
         Ok(_) if MEDIA_EXTS.contains(&ext.as_str()) => Body::Media(p.to_path_buf()),
@@ -127,6 +140,32 @@ pub fn load(path: String, query: &str) -> Preview {
     }
     let music = if AUDIO_EXTS.contains(&ext.as_str()) && matches!(body, Body::Media(_)) { music(p, &mut details) } else { None };
     Preview { path, name: name.into(), details, body, music }
+}
+
+/// A folder's entries for the pane, and how many it has (counting stops at
+/// 100,000).
+fn folder_items(folder: &Path) -> (Vec<FolderItem>, usize) {
+    let Ok(read) = std::fs::read_dir(folder) else { return (Vec::new(), 0) };
+    let mut all: Vec<FolderItem> = read
+        .take(100_000)
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            FolderItem {
+                name: entry.file_name().to_string_lossy().into_owned().into(),
+                path: entry.path().display().to_string(),
+                is_dir,
+                size: 0,
+            }
+        })
+        .collect();
+    let total = all.len();
+    all.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    all.truncate(FOLDER_ITEMS);
+    for item in all.iter_mut().filter(|i| !i.is_dir) {
+        item.size = std::fs::metadata(&item.path).map(|m| m.len()).unwrap_or(0);
+    }
+    (all, total)
 }
 
 const PREVIEW_BYTES: usize = 256 * 1024;
@@ -215,6 +254,21 @@ fn when(t: std::time::SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folders_list_their_contents() {
+        let dir = std::env::temp_dir().join(format!("dash-folder-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("zeta")).unwrap();
+        std::fs::write(dir.join("b.txt"), b"12345").unwrap();
+        std::fs::write(dir.join("A.md"), b"").unwrap();
+        let preview = load(dir.display().to_string(), "");
+        let Body::Folder { items, total } = preview.body else { panic!("not a folder body") };
+        assert_eq!(total, 3);
+        let names: Vec<&str> = items.iter().map(|i| i.name.as_ref()).collect();
+        assert_eq!(names, ["zeta", "A.md", "b.txt"], "folders first, then by name");
+        assert_eq!(items[2].size, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn text_is_told_from_binary() {

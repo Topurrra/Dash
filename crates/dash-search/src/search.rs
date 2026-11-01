@@ -2326,7 +2326,8 @@ pub fn open_search_result_path(app: std::sync::Arc<dyn dash_core::Host>, path: S
         return Err("Only files and folders can be opened from search results".to_string());
     }
 
-    open::that_detached(&target_path)
+    // The app gets a normal path, not the canonical `\\?\D:\…` form.
+    open::that_detached(dash_core::safe_path::without_verbatim_prefix(&target_path))
         .map_err(|error| format!("Failed to open search result: {error}"))?;
 
     // Record the activation with the appropriate kind so search ranking learns
@@ -3849,7 +3850,25 @@ pub fn start_file_search_scheduler(app: std::sync::Arc<dyn dash_core::Host>) {
         }
         // Periodic trigger: keep the standalone filename index fresh.
         let _ = run_scheduled_filename_index_rebuild(&app);
+        restart_stopped_watcher(&app);
     });
+}
+
+/// A watcher worker that died (killed, or an error it couldn't get past)
+/// left the index frozen until the next start: start it again. At most
+/// once per scheduler tick, so one that keeps failing can't spin.
+fn restart_stopped_watcher(app: &std::sync::Arc<dyn dash_core::Host>) {
+    if worker_process_running(&SEARCH_WATCHER_WORKER) || SEARCH_STATUS.lock().map(|s| s.indexing).unwrap_or(true) {
+        return;
+    }
+    let Ok(Some(config)) = read_search_config(app) else { return };
+    if !config.options.watcher_enabled || config.options.watcher_paused {
+        return;
+    }
+    let indexed_files = SEARCH_STATUS.lock().map(|s| s.indexed_files).unwrap_or(0).max(config.indexed_files);
+    if let Err(error) = start_isolated_watch_worker(app, config.options, indexed_files) {
+        update_status(|status| status.last_error = Some(error));
+    }
 }
 
 fn run_scheduled_file_search_rebuild(app: &std::sync::Arc<dyn dash_core::Host>) -> Result<(), String> {

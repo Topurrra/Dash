@@ -98,9 +98,11 @@ impl Settings {
         }
     }
 
-    /// `dash --shots`: 0 Search, 1 Clipboard, 2 General.
-    pub fn show_section(&mut self, ix: usize, cx: &mut Context<Self>) {
+    /// `dash --shots`: 0 Search, 1 Clipboard, 2 General; `bottom`: scrolled
+    /// to the end.
+    pub fn show_section(&mut self, ix: usize, bottom: bool, cx: &mut Context<Self>) {
         self.section = [Section::Search, Section::Clipboard, Section::General][ix.min(2)];
+        self.scroll.set_offset(gpui::point(px(0.), if bottom { px(-100_000.) } else { px(0.) }));
         cx.notify();
     }
 

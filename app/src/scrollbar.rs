@@ -56,6 +56,10 @@ pub fn scrollbar(id: impl Into<ElementId>, handle: &ScrollHandle) -> AnyElement 
     let drag = ThumbDrag { id: id.clone(), grab: grab.clone() };
     let (on_track, on_move, on_thumb) = (handle.clone(), handle.clone(), handle.clone());
     let thumb_grab = grab.clone();
+    // The press was on the thumb (it runs first): the track mustn't jump.
+    // It isn't stopped there, or the track would never start the drag.
+    let pressed_thumb = Rc::new(Cell::new(false));
+    let thumb_pressed = pressed_thumb.clone();
     div()
         .id(id.clone())
         .absolute()
@@ -66,6 +70,9 @@ pub fn scrollbar(id: impl Into<ElementId>, handle: &ScrollHandle) -> AnyElement 
         .group("scrollbar")
         // Clicking the track: the thumb's middle goes there.
         .on_mouse_down(MouseButton::Left, move |event, window, _: &mut App| {
+            if pressed_thumb.replace(false) {
+                return;
+            }
             let y = f32::from(event.position.y - on_track.bounds().origin.y);
             grab.set(height / 2.);
             scroll_to(&on_track, y - height / 2., view, height, max);
@@ -92,9 +99,9 @@ pub fn scrollbar(id: impl Into<ElementId>, handle: &ScrollHandle) -> AnyElement 
                 .bg(theme::scrollbar())
                 .group_hover("scrollbar", |s| s.w(px(7.)).bg(theme::muted()))
                 // Grabbed on the thumb: keep that point under the pointer.
-                .on_mouse_down(MouseButton::Left, move |event: &gpui::MouseDownEvent, _, cx: &mut App| {
+                .on_mouse_down(MouseButton::Left, move |event: &gpui::MouseDownEvent, _, _: &mut App| {
                     thumb_grab.set(f32::from(event.position.y - on_thumb.bounds().origin.y) - top);
-                    cx.stop_propagation();
+                    thumb_pressed.set(true);
                 }),
         )
         .into_any_element()

@@ -8,7 +8,7 @@ use gpui::{
     actions, div, fill, point, prelude::*, px, relative, rgba, size, App, Bounds, ClipboardItem, Context, CursorStyle,
     ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId,
     Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
+    ShapedLine, SharedString, Style, TextRun, ContentMask, UTF16Selection, UnderlineStyle, Window,
 };
 use unicode_segmentation::*;
 
@@ -46,6 +46,9 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// How far the text is scrolled left, so the caret stays in view when
+    /// the text is wider than the box.
+    scroll_x: Pixels,
 }
 
 impl EventEmitter<InputEvent> for TextInput {}
@@ -62,6 +65,7 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            scroll_x: px(0.),
         }
     }
 
@@ -157,12 +161,32 @@ impl TextInput {
         self.replace_text_in_range(None, "", window, cx)
     }
 
+    /// One click places the caret (Shift: extends), two select the word,
+    /// three or more select everything (as Cortex's editor does; a single
+    /// line is all there is).
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        self.is_selecting = true;
-        if event.modifiers.shift {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
-        } else {
-            self.move_to(self.index_for_mouse_position(event.position), cx)
+        let at = self.index_for_mouse_position(event.position);
+        match event.click_count {
+            2 => {
+                self.is_selecting = false;
+                self.selection_reversed = false;
+                self.selected_range = surrounding_word(&self.content, at);
+                cx.notify();
+            }
+            n if n >= 3 => {
+                self.is_selecting = false;
+                self.selection_reversed = false;
+                self.selected_range = 0..self.content.len();
+                cx.notify();
+            }
+            _ => {
+                self.is_selecting = true;
+                if event.modifiers.shift {
+                    self.select_to(at, cx);
+                } else {
+                    self.move_to(at, cx)
+                }
+            }
         }
     }
 
@@ -225,7 +249,7 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        line.closest_index_for_x(position.x - bounds.left() + self.scroll_x)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -276,6 +300,34 @@ impl TextInput {
             .find_map(|(idx, _)| (idx > offset).then_some(idx))
             .unwrap_or(self.content.len())
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CharKind {
+    Whitespace,
+    Punctuation,
+    Word,
+}
+
+fn char_kind(c: char) -> CharKind {
+    if c.is_whitespace() {
+        CharKind::Whitespace
+    } else if c.is_alphanumeric() || c == '_' {
+        CharKind::Word
+    } else {
+        CharKind::Punctuation
+    }
+}
+
+/// The run of same-kind characters around `offset` (a word, a stretch of
+/// punctuation or of spaces), preferring a word: Cortex's `surrounding_word`.
+fn surrounding_word(text: &str, offset: usize) -> Range<usize> {
+    let offset = clamp_range(text, &(offset..offset)).start;
+    let (before, after) = text.split_at(offset);
+    let kind = before.chars().next_back().map(char_kind).max(after.chars().next().map(char_kind));
+    let start = offset - before.chars().rev().take_while(|&c| Some(char_kind(c)) == kind).map(char::len_utf8).sum::<usize>();
+    let end = offset + after.chars().take_while(|&c| Some(char_kind(c)) == kind).map(char::len_utf8).sum::<usize>();
+    start..end
 }
 
 /// The UTF-8 offset in `text` of a UTF-16 offset (past the end: the end).
@@ -391,9 +443,10 @@ impl EntityInputHandler for TextInput {
     ) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
+        let left = bounds.left() - self.scroll_x;
         Some(Bounds::from_corners(
-            point(bounds.left() + last_layout.x_for_index(range.start), bounds.top()),
-            point(bounds.left() + last_layout.x_for_index(range.end), bounds.bottom()),
+            point(left + last_layout.x_for_index(range.start), bounds.top()),
+            point(left + last_layout.x_for_index(range.end), bounds.bottom()),
         ))
     }
 
@@ -405,7 +458,7 @@ impl EntityInputHandler for TextInput {
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
-        let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
+        let utf8_index = last_layout.index_for_x(point.x - line_point.x + self.scroll_x)?;
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -420,6 +473,7 @@ struct PrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    scroll: Pixels,
 }
 
 impl IntoElement for TextElement {
@@ -466,10 +520,13 @@ impl Element for TextElement {
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
         let content = input.content.clone();
+        let empty = content.is_empty();
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
+        let old_scroll = input.scroll_x;
+        let marked_range = input.marked_range.clone();
         let style = window.text_style();
-        let (display_text, text_color) = if content.is_empty() {
+        let (display_text, text_color) = if empty {
             (input.placeholder.clone(), self.placeholder_color)
         } else {
             (content, style.color)
@@ -482,7 +539,7 @@ impl Element for TextElement {
             underline: None,
             strikethrough: None,
         };
-        let marked = input.marked_range.as_ref().map(|r| clamp_range(&display_text, r));
+        let marked = marked_range.as_ref().map(|r| clamp_range(&display_text, r));
         let runs = if let Some(marked_range) = marked.as_ref() {
             vec![
                 TextRun { len: marked_range.start, ..run.clone() },
@@ -501,12 +558,23 @@ impl Element for TextElement {
         };
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line = window.text_system().shape_line(display_text, font_size, &runs, None);
-        let cursor_pos = if input.content.is_empty() { px(0.) } else { line.x_for_index(cursor) };
-        let (selection, cursor) = if selected_range.is_empty() || input.content.is_empty() {
+        let cursor_pos = if empty { px(0.) } else { line.x_for_index(cursor) };
+        // Scroll so the caret stays inside the box (2 px for the caret itself).
+        let width = bounds.size.width;
+        let mut scroll = old_scroll;
+        if cursor_pos < scroll {
+            scroll = cursor_pos;
+        } else if cursor_pos + px(2.) > scroll + width {
+            scroll = cursor_pos + px(2.) - width;
+        }
+        scroll = scroll.min((line.width + px(2.) - width).max(px(0.))).max(px(0.));
+        self.input.update(cx, |input, _| input.scroll_x = scroll);
+        let left = bounds.left() - scroll;
+        let (selection, cursor) = if selected_range.is_empty() || empty {
             (
                 None,
                 Some(fill(
-                    Bounds::new(point(bounds.left() + cursor_pos, bounds.top()), size(px(2.), bounds.bottom() - bounds.top())),
+                    Bounds::new(point(left + cursor_pos, bounds.top()), size(px(2.), bounds.bottom() - bounds.top())),
                     self.cursor_color,
                 )),
             )
@@ -514,15 +582,15 @@ impl Element for TextElement {
             (
                 Some(fill(
                     Bounds::from_corners(
-                        point(bounds.left() + line.x_for_index(selected_range.start), bounds.top()),
-                        point(bounds.left() + line.x_for_index(selected_range.end), bounds.bottom()),
+                        point(left + line.x_for_index(selected_range.start), bounds.top()),
+                        point(left + line.x_for_index(selected_range.end), bounds.bottom()),
                     ),
                     rgba(0x4f8cff55),
                 )),
                 None,
             )
         };
-        PrepaintState { line: Some(line), cursor, selection }
+        PrepaintState { line: Some(line), cursor, selection, scroll }
     }
 
     fn paint(
@@ -537,19 +605,23 @@ impl Element for TextElement {
     ) {
         let focus_handle = self.input.read(cx).focus_handle.clone();
         window.handle_input(&focus_handle, ElementInputHandler::new(bounds, self.input.clone()), cx);
-        if let Some(selection) = prepaint.selection.take() {
-            window.paint_quad(selection)
-        }
         let Some(line) = prepaint.line.take() else { return };
-        // A failed paint loses this frame's text, nothing more.
-        if let Err(e) = line.paint(bounds.origin, window.line_height(), window, cx) {
-            eprintln!("dash: text paint failed: {e}");
-        }
-        if focus_handle.is_focused(window) {
-            if let Some(cursor) = prepaint.cursor.take() {
-                window.paint_quad(cursor);
+        let origin = point(bounds.left() - prepaint.scroll, bounds.top());
+        // Text scrolled sideways stays inside the box.
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            if let Some(selection) = prepaint.selection.take() {
+                window.paint_quad(selection)
             }
-        }
+            // A failed paint loses this frame's text, nothing more.
+            if let Err(e) = line.paint(origin, window.line_height(), window, cx) {
+                eprintln!("dash: text paint failed: {e}");
+            }
+            if focus_handle.is_focused(window) {
+                if let Some(cursor) = prepaint.cursor.take() {
+                    window.paint_quad(cursor);
+                }
+            }
+        });
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
@@ -597,7 +669,24 @@ impl Focusable for TextInput {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_range, utf8_offset};
+    use super::{clamp_range, surrounding_word, utf8_offset};
+
+    #[test]
+    fn double_click_selects_the_word() {
+        let text = "tmp, log  report_2024.pdf Отчёт";
+        let word = |at: usize| &text[surrounding_word(text, at)];
+        assert_eq!(word(1), "tmp");
+        assert_eq!(word(0), "tmp");
+        // Between a word and a comma: the word wins.
+        assert_eq!(word(3), "tmp");
+        assert_eq!(word(8), "log");
+        assert_eq!(word(9), "  ");
+        assert_eq!(word(12), "report_2024");
+        assert_eq!(word(22), "pdf");
+        assert_eq!(&"a, ,b"[surrounding_word("a, ,b", 3)], ",");
+        assert_eq!(word(text.len()), "Отчёт");
+        assert_eq!(surrounding_word("", 0), 0..0);
+    }
 
     #[test]
     fn ranges_are_clamped_to_safe_slices() {

@@ -121,6 +121,15 @@ impl Table {
 
 pub(super) use crate::preview::thousands;
 
+/// Name search leaves gone (deleted or moved away) out from now on; the
+/// index only learns of it a little later.
+async fn forget(gone: &[(usize, String)]) {
+    let paths: Vec<String> = gone.iter().map(|(_, path)| path.clone()).collect();
+    if !paths.is_empty() {
+        let _ = crate::host::runtime().spawn_blocking(move || dash_search::names::forget_paths(paths)).await;
+    }
+}
+
 /// One page of a name search, on the engine runtime.
 async fn fetch(options: NameQueryOptions) -> Result<NameSearchResult, String> {
     let host = crate::host::host();
@@ -624,7 +633,12 @@ impl Overlay {
                     if let Some(player) = player {
                         player.close();
                     }
-                    file_ops::rename_in_place(std::path::Path::new(&from), &name)
+                    let renamed = file_ops::rename_in_place(std::path::Path::new(&from), &name);
+                    if renamed.is_ok() {
+                        // The old name mustn't come back from the index meanwhile.
+                        dash_search::names::forget_paths(vec![from]);
+                    }
+                    renamed
                 })
                 .await
                 .map_err(|e| e.to_string())
@@ -649,7 +663,8 @@ impl Overlay {
                         }
                         let is_dir = this.table.cache.row(ix).is_some_and(|r| r.is_dir);
                         this.request_icons(vec![(new_path, is_dir)], cx);
-                        this.schedule_refresh(cx);
+                        // No refresh: the row already shows the new name, which
+                        // the index only learns of a little later.
                     }
                     Err(e) => this.table.notice = Some(format!("Couldn't rename: {e}").into()),
                 }
@@ -738,12 +753,14 @@ impl Overlay {
                 .filter(|(_, r)| std::fs::symlink_metadata(&r.path).is_err())
                 .map(|(ix, r)| (*ix, r.path.clone()))
                 .collect();
+            forget(&gone).await;
             let _ = this.update(cx, |this, cx| {
                 this.table.notice = Some(delete_notice(forever, &result, gone.len(), rows.len()).into());
                 if this.table.generation == generation {
                     this.rows_removed(&gone, cx);
                 } else {
-                    this.schedule_refresh(cx);
+                    // Search already leaves them out (see `forget`).
+                    this.reload_table(true, cx);
                 }
                 this.update_preview(cx);
                 cx.notify();
@@ -803,6 +820,7 @@ impl Overlay {
                     .filter(|(_, r)| std::fs::symlink_metadata(&r.path).is_err())
                     .map(|(ix, r)| (*ix, r.path.clone()))
                     .collect();
+                forget(&gone).await;
                 let _ = this.update(cx, |this, cx| {
                     this.table.notice = Some(match errors.first() {
                         None => format!("Moved {} to {shown}.", plural(gone.len())).into(),
@@ -811,7 +829,7 @@ impl Overlay {
                     if this.table.generation == generation {
                         this.rows_removed(&gone, cx);
                     } else {
-                        this.schedule_refresh(cx);
+                        this.reload_table(true, cx);
                     }
                     this.update_preview(cx);
                     cx.notify();

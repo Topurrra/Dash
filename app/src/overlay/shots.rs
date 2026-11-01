@@ -43,10 +43,11 @@ const SCENES: &[(&str, Scene)] = &[
     }),
     ("9-settings", |v, w, cx| {
         v.set_mode(Mode::Settings, w, cx);
-        v.settings.update(cx, |s, cx| s.show_section(0, cx));
+        v.settings.update(cx, |s, cx| s.show_section(0, false, cx));
     }),
-    ("10-settings-clipboard", |v, _, cx| v.settings.update(cx, |s, cx| s.show_section(1, cx))),
-    ("11-settings-general", |v, _, cx| v.settings.update(cx, |s, cx| s.show_section(2, cx))),
+    ("9b-settings-bottom", |v, _, cx| v.settings.update(cx, |s, cx| s.show_section(0, true, cx))),
+    ("10-settings-clipboard", |v, _, cx| v.settings.update(cx, |s, cx| s.show_section(1, false, cx))),
+    ("11-settings-general", |v, _, cx| v.settings.update(cx, |s, cx| s.show_section(2, false, cx))),
     // The preview pane off (not saved: the real preference stays).
     ("12-pane-off", |v, w, cx| {
         v.set_mode(Mode::Search, w, cx);
@@ -88,7 +89,39 @@ const SCENES: &[(&str, Scene)] = &[
         v.update_preview(cx);
         cx.notify();
     }),
+    ("21-before-drag", |v, w, cx| {
+        v.clip_view = ClipView::List;
+        v.set_mode(Mode::Search, w, cx);
+        files(v, "ext:jpg", cx);
+    }),
+    // Drags the list's scrollbar thumb down with mouse messages sent to this
+    // window only (the real pointer doesn't move).
+    ("22-scrollbar-dragged", |_, w, _| drag(w, (655, 142), (655, 420))),
 ];
+
+/// Presses at `from`, moves in steps to `to`, releases (client pixels).
+#[cfg(windows)]
+fn drag(window: &Window, from: (i32, i32), to: (i32, i32)) {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
+    let Some(hwnd) = window_handle(window) else { return };
+    let at = |x: i32, y: i32| LPARAM(((y as u16 as isize) << 16) | (x as u16 as isize));
+    const LEFT_DOWN: WPARAM = WPARAM(1);
+    // SAFETY: posting to this live window; the messages carry plain values.
+    unsafe {
+        let _ = PostMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), at(from.0, from.1));
+        let _ = PostMessageW(hwnd, WM_LBUTTONDOWN, LEFT_DOWN, at(from.0, from.1));
+        for step in 1..=12 {
+            let y = from.1 + (to.1 - from.1) * step / 12;
+            let x = from.0 + (to.0 - from.0) * step / 12;
+            let _ = PostMessageW(hwnd, WM_MOUSEMOVE, LEFT_DOWN, at(x, y));
+        }
+        let _ = PostMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), at(to.0, to.1));
+    }
+}
+
+#[cfg(not(windows))]
+fn drag(_: &Window, _: (i32, i32), _: (i32, i32)) {}
 
 /// Time for searches, previews and icons to arrive before each picture.
 const SETTLE: Duration = Duration::from_millis(1800);

@@ -431,6 +431,10 @@ impl Overlay {
                     if let Body::Media(path) = &p.body {
                         this.start_player(path.display().to_string(), cx);
                     }
+                    if let Body::Folder { items, .. } = &p.body {
+                        let wanted = items.iter().map(|i| (i.path.clone(), i.is_dir)).collect();
+                        this.request_icons(wanted, cx);
+                    }
                     match &p.body {
                         Body::Text { hit: Some(line), .. } => this.preview_scroll.scroll_to_item(line.saturating_sub(3)),
                         _ => this.preview_scroll.set_offset(Point::default()),
@@ -1070,9 +1074,74 @@ impl Overlay {
                 .child(img(path.clone()).id("pane-img").size_full().object_fit(ObjectFit::Contain))
                 .into_any_element(),
             Body::Media(_) => self.render_player(cx),
-            Body::Note(note) => {
-                let glyph = if note.as_ref() == "Folder" { Icon::Folder } else { Icon::File };
-                empty_state(glyph, note.clone(), None)
+            Body::Note(note) => empty_state(Icon::File, note.clone(), None),
+            Body::Folder { items, .. } if items.is_empty() => empty_state(Icon::Folder, "Empty folder", None),
+            Body::Folder { items, total } => {
+                let more = total.saturating_sub(items.len());
+                let rows: Vec<_> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, item)| {
+                        let path = item.path.clone();
+                        div()
+                            .id(("folder-item", ix))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(28.))
+                            .px_3()
+                            .mx_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()))
+                            // Double-click opens it.
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                    if event.click_count < 2 {
+                                        return;
+                                    }
+                                    match dash_search::search::open_search_result_path(crate::host::host(), path.clone()) {
+                                        Ok(()) => this.hide(window, cx),
+                                        Err(e) => {
+                                            this.error = Some(e);
+                                            cx.notify();
+                                        }
+                                    }
+                                }),
+                            )
+                            .child(match self.icon(&item.path, item.is_dir) {
+                                Some(shell) => img(shell).size(px(16.)).flex_none().into_any_element(),
+                                None => icon(if item.is_dir { Icon::Folder } else { Icon::File }, 15., theme::muted()).into_any_element(),
+                            })
+                            .child(div().flex_1().min_w_0().text_sm().text_color(theme::text_2()).one_line().child(item.name.clone()))
+                            .when(!item.is_dir, |d| {
+                                d.child(div().flex_none().text_xs().text_color(theme::muted()).child(human_size(item.size)))
+                            })
+                    })
+                    .collect();
+                let list = div()
+                    .id("pane-folder")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .py_2()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.preview_scroll)
+                    .children(rows)
+                    .when(more > 0, |d| {
+                        d.child(div().px_5().py_2().text_xs().text_color(theme::muted()).child(format!("and {} more", table::thousands(more))))
+                    });
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list)
+                    .child(scrollbar("pane-scrollbar", &self.preview_scroll))
+                    .into_any_element()
             }
             Body::Text { lines, code, hit, truncated, .. } => {
                 let (code, hit) = (*code, *hit);
@@ -1714,9 +1783,12 @@ fn strip_tags(html: &str) -> String {
 }
 
 fn reveal(path: &str) {
+    // Explorer wants `/select,"D:\a b\c"`: quoting the whole argument (what
+    // `arg` does when there's a space) makes it open Documents instead.
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("explorer").arg(format!("/select,{path}")).spawn();
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer").raw_arg(select_arg(path)).spawn();
     }
     // Finder selects the file; Linux file managers just open its folder.
     #[cfg(target_os = "macos")]
@@ -1726,6 +1798,21 @@ fn reveal(path: &str) {
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = std::path::Path::new(path).parent().map(open::that);
+    }
+}
+
+/// Explorer's "open the folder with this selected" argument, as one raw
+/// argument (a Windows path can't contain `"`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn select_arg(path: &str) -> String {
+    format!("/select,\"{path}\"")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn explorer_selects_paths_with_spaces() {
+        assert_eq!(super::select_arg(r"D:\My Files\a b.txt"), r#"/select,"D:\My Files\a b.txt""#);
     }
 }
 

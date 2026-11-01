@@ -49,6 +49,7 @@ pub fn link_handler(host: Arc<dyn Host>, runtime: tokio::runtime::Handle) -> Han
                 Ok(o) => done(runtime.block_on(crate::names::search_names(h, o))),
                 Err(e) => Err(e),
             },
+            "forget_paths" => done(arg(&a, "paths").map(crate::names::forget_paths)),
             "search_file_contents" => match arg(&a, "options") {
                 Ok(o) => done(runtime.block_on(s::search_file_contents(h, o))),
                 Err(e) => Err(e),

@@ -144,6 +144,21 @@ pub fn forbid_system_path<P: AsRef<Path>>(input: P) -> Result<PathBuf, String> {
 ///
 /// Returns the canonical PathBuf on success — callers can pass it
 /// directly to fs::read, image::open, etc. without re-canonicalizing.
+/// `path` without Windows' verbatim prefix (`\\?\D:\x` → `D:\x`,
+/// `\\?\UNC\server\share` → `\\server\share`), which canonicalizing adds and
+/// many apps don't understand when handed a file to open.
+pub fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        // Only drive paths; other verbatim forms (`\\?\Volume{…}`) need it.
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
 pub fn validate_user_path<P: AsRef<Path>>(input: P) -> Result<PathBuf, String> {
     let canonical = input
         .as_ref()
@@ -177,6 +192,15 @@ pub fn validate_user_write_target<P: AsRef<Path>>(input: P) -> Result<PathBuf, S
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn verbatim_prefix_is_dropped_for_opening() {
+        let plain = |p: &str| without_verbatim_prefix(Path::new(p)).display().to_string();
+        assert_eq!(plain(r"\\?\D:\My Files\a b.txt"), r"D:\My Files\a b.txt");
+        assert_eq!(plain(r"\\?\UNC\server\share\x.pdf"), r"\\server\share\x.pdf");
+        assert_eq!(plain(r"D:\x"), r"D:\x");
+        assert_eq!(plain(r"\\?\Volume{1234}\x"), r"\\?\Volume{1234}\x");
+    }
 
     // ─── forbid_system_path / validate_user_path tests ──────────────────
 
