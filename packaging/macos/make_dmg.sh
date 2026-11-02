@@ -41,6 +41,9 @@ cat > "$app/Contents/Info.plist" <<EOF
 EOF
 
 ln -s /Applications "$out/stage/Applications"
-hdiutil create -volname Dash -srcfolder "$out/stage" -ov -format UDZO "$out/$dmg"
+# hdiutil's own size guess is sometimes too small ("No space left on
+# device"): give it the folder's size plus room.
+size_mb=$(( $(du -sm "$out/stage" | cut -f1) * 12 / 10 + 20 ))
+hdiutil create -volname Dash -srcfolder "$out/stage" -size "${size_mb}m" -ov -format UDZO "$out/$dmg"
 (cd "$out" && shasum -a 256 "$dmg" > "$dmg.sha256")
 echo "$out/$dmg"
