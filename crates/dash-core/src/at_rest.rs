@@ -5,7 +5,8 @@
 //! in the system keychain (the macOS Keychain; the Secret Service on Linux,
 //! i.e. GNOME Keyring or `KWallet`). Either way a value written before
 //! encryption (no version byte) reads back unchanged, and the next write
-//! protects it.
+//! protects it. `DASH_NO_KEYCHAIN` set keeps the keychain out (tests on CI,
+//! where nobody can answer its access prompt) and values stay plain.
 
 #[cfg(windows)]
 pub use crate::dpapi::{protect, unprotect};
@@ -61,6 +62,9 @@ mod keychain {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if let Some(cipher) = CIPHER.get() {
             return Some(cipher);
+        }
+        if std::env::var_os("DASH_NO_KEYCHAIN").is_some() {
+            return None;
         }
         match load_or_create_key() {
             Ok(key) => Some(CIPHER.get_or_init(|| XChaCha20Poly1305::new(Key::from_slice(&key)))),

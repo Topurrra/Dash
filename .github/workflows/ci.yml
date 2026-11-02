@@ -45,6 +45,10 @@ jobs:
 
       - name: Tests
         run: cargo test --locked --workspace
+        # A runner's keychain can't answer macOS's access prompt; tests
+        # would wait on it forever.
+        env:
+          DASH_NO_KEYCHAIN: "1"
 
       # Formatting is the same everywhere: checked once.
       - name: Formatting

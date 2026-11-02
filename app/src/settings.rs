@@ -1185,7 +1185,7 @@ mod startup {
         result.ok().map_err(|e| e.message().clone())
     }
 
-    /// macOS: a LaunchAgent; Linux: an XDG autostart entry.
+    /// macOS: a `LaunchAgent`; Linux: an XDG autostart entry.
     #[cfg(not(windows))]
     fn entry() -> Option<std::path::PathBuf> {
         let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
@@ -1193,8 +1193,7 @@ mod startup {
             home.join("Library/LaunchAgents/app.dash.plist")
         } else {
             std::env::var_os("XDG_CONFIG_HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| home.join(".config"))
+                .map_or_else(|| home.join(".config"), std::path::PathBuf::from)
                 .join("autostart/dash.desktop")
         })
     }

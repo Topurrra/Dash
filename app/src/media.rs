@@ -92,7 +92,7 @@ impl Player {
             let spawned = std::thread::Builder::new().name("dash-audio".into()).spawn(move || {
                 if let Err(e) = sound::run(&path, &shared) {
                     shared.has_audio.store(NO, Ordering::SeqCst);
-                    *shared.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                    *shared.error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
                 }
             });
             threads.extend(spawned.ok());
@@ -224,9 +224,9 @@ mod sound {
             let paused = shared.paused.load(Ordering::SeqCst) || shared.ended.load(Ordering::SeqCst);
             if paused != sink.is_paused() {
                 if paused {
-                    sink.pause()
+                    sink.pause();
                 } else {
-                    sink.play()
+                    sink.play();
                 }
             }
             sink.set_volume(f32::from_bits(shared.volume.load(Ordering::SeqCst)));

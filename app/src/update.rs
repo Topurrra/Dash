@@ -227,7 +227,7 @@ fn run_installer(dmg: &std::path::Path) -> Result<(), String> {
     restart(start)
 }
 
-/// Puts the downloaded AppImage in place of the running one, then starts it.
+/// Puts the downloaded `AppImage` in place of the running one, then starts it.
 #[cfg(target_os = "linux")]
 fn run_installer(image: &std::path::Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;

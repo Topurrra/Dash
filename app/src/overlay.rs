@@ -2083,7 +2083,7 @@ fn reveal(path: &str) {
 
 /// Explorer's "open the folder with this selected" argument, as one raw
 /// argument (a Windows path can't contain `"`).
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "Explorer is Windows-only; the tests still use it"))]
 fn select_arg(path: &str) -> String {
     format!("/select,\"{path}\"")
 }
