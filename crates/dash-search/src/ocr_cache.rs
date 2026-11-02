@@ -33,8 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(windows)]
-use dash_core::dpapi;
+use dash_core::at_rest;
 
 pub const OCR_CACHE_FILE: &str = "ocr_cache.redb";
 
@@ -156,36 +155,22 @@ fn unpack_value(bytes: &[u8]) -> Option<(String, u64, u64)> {
     Some((text, last_used_at, created_at))
 }
 
-/// DPAPI-protect a packed cache value on Windows so extracted OCR text —
-/// which can hold IDs, receipts, or document scans — is encrypted at rest
-/// like the rest of the local DB. Returns `None` if protection fails so the
-/// caller skips the write rather than persisting plaintext. Non-Windows
-/// builds pass through (the app ships Windows-only).
+/// Encrypts a packed cache value (DPAPI on Windows, the keychain key
+/// elsewhere) so extracted OCR text — which can hold IDs, receipts, or
+/// document scans — is encrypted at rest like the rest of the local DB.
+/// Returns `None` if protection fails so the caller skips the write rather
+/// than persisting plaintext.
 fn encrypt_value(packed: &[u8]) -> Option<Vec<u8>> {
-    #[cfg(windows)]
-    {
-        dpapi::protect(packed).ok()
-    }
-    #[cfg(not(windows))]
-    {
-        Some(packed.to_vec())
-    }
+    at_rest::protect(packed).ok()
 }
 
-/// Reverse of `encrypt_value`. DPAPI's `unprotect` passes legacy plaintext
-/// entries through unchanged (no version byte), so caches written before this
-/// change keep working; a genuine decrypt failure returns `None`, which the
-/// caller treats as a cache miss (the file is simply re-OCR'd and re-stored,
-/// now encrypted).
+/// Reverse of `encrypt_value`. `unprotect` passes legacy plaintext entries
+/// through unchanged (no version byte), so caches written before this change
+/// keep working; a genuine decrypt failure returns `None`, which the caller
+/// treats as a cache miss (the file is simply re-OCR'd and re-stored, now
+/// encrypted).
 fn decrypt_value(stored: &[u8]) -> Option<Vec<u8>> {
-    #[cfg(windows)]
-    {
-        dpapi::unprotect(stored).ok()
-    }
-    #[cfg(not(windows))]
-    {
-        Some(stored.to_vec())
-    }
+    at_rest::unprotect(stored).ok()
 }
 
 fn now_secs() -> u64 {
@@ -284,7 +269,7 @@ pub fn store(ctx: &OcrCacheCtx, hash: &ContentHash, text: &str) {
     };
     let now = now_secs();
     let Some(value) = encrypt_value(&pack_value(text, now, now)) else {
-        // Never persist OCR text we couldn't DPAPI-protect — skip the cache
+        // Never persist OCR text we couldn't encrypt — skip the cache
         // write; the file is still indexed normally, only the dedup is lost.
         return;
     };

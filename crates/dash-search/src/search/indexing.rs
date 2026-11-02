@@ -966,6 +966,7 @@ pub(super) fn build_index_in_worker(
     // the staging index is discarded anyway — hard-kill the extractor
     // children (KILL_ON_JOB_CLOSE) rather than wait out the in-flight backlog.
     if should_stop_walker.load(Ordering::Relaxed) {
+        #[cfg_attr(not(windows), expect(clippy::drop_non_drop, reason = "only the Windows pool owns a Job Object"))]
         drop(pool);
     }
     // Join every indexer thread: on success they return once all extracted

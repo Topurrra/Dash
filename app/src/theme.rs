@@ -178,6 +178,7 @@ pub fn accent_soft() -> Rgba {
     pick(0x5b8d_ef33, 0x2f6f_e024)
 }
 /// The window's outline, drawn by Windows (`0x00BBGGRR`).
+#[cfg(windows)]
 pub fn window_border() -> u32 {
     if LIGHT.load(Ordering::Relaxed) {
         0x00cf_cfcf

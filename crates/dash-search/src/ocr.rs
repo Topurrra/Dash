@@ -145,6 +145,7 @@ fn wait_registered(id: &str, mut child: Child) -> std::io::Result<std::process::
 /// Build a `Command` for tesseract with the no-console-window flag applied on
 /// Windows. Centralized so every call site is consistent.
 fn tesseract_command(program: &str) -> Command {
+    #[cfg_attr(not(windows), expect(unused_mut, reason = "the creation flags are Windows-only"))]
     let mut command = Command::new(program);
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);

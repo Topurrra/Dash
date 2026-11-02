@@ -191,6 +191,7 @@ pub(super) fn launcher_candidate_roots() -> Vec<(PathBuf, &'static str)> {
 }
 
 pub(super) fn builtin_launcher_targets() -> Vec<(String, PathBuf)> {
+    #[cfg_attr(not(windows), expect(unused_mut, reason = "the built-in apps are Windows-only"))]
     let mut targets = Vec::new();
 
     #[cfg(target_os = "windows")]

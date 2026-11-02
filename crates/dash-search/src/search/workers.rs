@@ -264,6 +264,7 @@ pub(super) fn assign_to_workers_job(child: &std::process::Child) {
 pub(super) struct MemoryCappedJob;
 
 #[cfg(not(windows))]
+#[expect(clippy::unnecessary_wraps, clippy::unused_self, reason = "same signatures as the Windows type")]
 impl MemoryCappedJob {
     pub(super) fn new(_memory_limit_bytes: impl Into<Option<usize>>) -> Result<Self, String> {
         Ok(Self)
@@ -307,6 +308,12 @@ impl JobAssigner {
 pub(super) struct JobAssigner;
 
 #[cfg(not(windows))]
+#[expect(
+    clippy::unnecessary_wraps,
+    clippy::unused_self,
+    clippy::trivially_copy_pass_by_ref,
+    reason = "same signatures as the Windows type"
+)]
 impl JobAssigner {
     pub(super) fn assign(&self, _child: &std::process::Child) -> Result<(), String> {
         Ok(())

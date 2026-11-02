@@ -6,13 +6,16 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 use gpui::RenderImage;
 
 /// Times are in 100 ns units (Media Foundation's).
 const HNS_PER_SEC: u64 = 10_000_000;
 /// Largest frame kept for the pane; bigger videos are scaled down while decoding.
+#[cfg(windows)]
 const MAX_FRAME: (u32, u32) = (1280, 720);
 
 /// A duration in 100 ns units (saturating; real ones are far smaller).
@@ -20,6 +23,7 @@ fn hns(d: Duration) -> u64 {
     u64::try_from(d.as_nanos() / 100).unwrap_or(u64::MAX)
 }
 
+#[cfg(windows)]
 const UNKNOWN: u8 = 0;
 const YES: u8 = 1;
 const NO: u8 = 2;

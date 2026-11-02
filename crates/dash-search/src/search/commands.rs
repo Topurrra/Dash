@@ -714,7 +714,8 @@ pub(super) async fn launch_packaged_target(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        return Err("Packaged apps are Windows-only".to_string());
+        drop(app);
+        Err("Packaged apps are Windows-only".to_string())
     }
 
     #[cfg(target_os = "windows")]

@@ -171,6 +171,7 @@ pub fn delete_permanently(path: &Path) -> Result<(), String> {
 
 /// Paths as one UTF-16 buffer, each ending in a NUL and the list in another
 /// (what `SHFILEOPSTRUCTW.pFrom` wants).
+#[cfg(any(windows, test))]
 pub fn double_null_list(paths: &[String]) -> Vec<u16> {
     let mut out = Vec::new();
     for p in paths {
