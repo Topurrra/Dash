@@ -90,11 +90,7 @@ pub(super) fn build_launch_target_cache() -> LaunchTargetCache {
 
             #[cfg(target_os = "macos")]
             if file_type.is_dir()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| ext.eq_ignore_ascii_case("app"))
-                    .unwrap_or(false)
+                && path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
             {
                 add_launch_target_record(&mut records, &mut seen_paths, path, source, "bundle");
                 continue;

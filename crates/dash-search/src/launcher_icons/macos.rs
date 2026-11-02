@@ -1,4 +1,4 @@
-//! Icons on macOS: NSWorkspace's icon for a path (apps, files) or for a
+//! Icons on macOS: `NSWorkspace`'s icon for a path (apps, files) or for a
 //! file type (folders, extensions). It comes as a TIFF with one page per
 //! size; the page nearest above `ICON_PX` is used.
 
