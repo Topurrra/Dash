@@ -64,7 +64,8 @@ struct State {
     role: Role,
     dir: PathBuf,
     app: String,
-    _lock: Option<File>,
+    /// The owner lock, held for as long as this process owns the engines.
+    owner_lock: Option<File>,
     client: Option<Arc<Client>>,
     subscribers: Vec<Arc<Mutex<TcpStream>>>,
     when_owner: Vec<Box<dyn FnOnce() + Send>>,
@@ -77,7 +78,7 @@ fn state() -> &'static Mutex<State> {
             role: Role::Alone,
             dir: PathBuf::new(),
             app: String::new(),
-            _lock: None,
+            owner_lock: None,
             client: None,
             subscribers: Vec::new(),
             when_owner: Vec::new(),
@@ -86,7 +87,7 @@ fn state() -> &'static Mutex<State> {
 }
 
 fn lock_state() -> std::sync::MutexGuard<'static, State> {
-    state().lock().unwrap_or_else(|p| p.into_inner())
+    state().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn handlers() -> &'static Mutex<Vec<Handler>> {
@@ -153,7 +154,7 @@ fn run_prepare() {
 
 /// Becomes a follower of whoever owns `dir`, and takes over when it's gone.
 fn follow(dir: &Path) {
-    let owner = read_owner_file(dir).map(|o| format!("{} pid {}", o.app, o.pid)).unwrap_or_else(|| "unknown".into());
+    let owner = read_owner_file(dir).map_or_else(|| "unknown".into(), |o| format!("{} pid {}", o.app, o.pid));
     log(dir, &format!("follows {owner}"));
     lock_state().role = Role::Follower;
     connect_follower();
@@ -205,18 +206,18 @@ fn become_owner(lock: File) {
             eprintln!("dash-link: can't listen: {e}");
             let mut st = lock_state();
             st.role = Role::Owner;
-            st._lock = Some(lock);
+            st.owner_lock = Some(lock);
             st.client = None;
             return;
         }
     };
-    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    let port = listener.local_addr().map_or(0, |a| a.port());
     let info = OwnerInfo { app, pid: std::process::id(), port, token: token.clone() };
     write_owner_file(&dir, &info);
     {
         let mut st = lock_state();
         st.role = Role::Owner;
-        st._lock = Some(lock);
+        st.owner_lock = Some(lock);
         st.client = None;
     }
     let _ = std::thread::Builder::new().name("dash-link-server".into()).spawn(move || {
@@ -225,7 +226,7 @@ fn become_owner(lock: File) {
             let _ = std::thread::Builder::new().name("dash-link-conn".into()).spawn(move || serve(stream, &token));
         }
     });
-    let _ = std::thread::Builder::new().name("dash-link-guard".into()).spawn(move || guard_ownership(dir, info));
+    let _ = std::thread::Builder::new().name("dash-link-guard".into()).spawn(move || guard_ownership(&dir, &info));
 }
 
 /// What a look at the owner lock found.
@@ -283,7 +284,7 @@ fn check_ownership(dir: &Path, me: u32, ours: Option<&File>) -> Check {
 /// The owner's watch on its own lock: two processes must never both run
 /// the engines (two writers on one index). A lock found free is taken
 /// again; another owner makes this one step down.
-fn guard_ownership(dir: PathBuf, mine: OwnerInfo) {
+fn guard_ownership(dir: &Path, mine: &OwnerInfo) {
     loop {
         std::thread::sleep(GUARD_EVERY);
         if role() != Role::Owner {
@@ -291,33 +292,32 @@ fn guard_ownership(dir: PathBuf, mine: OwnerInfo) {
         }
         let check = {
             let st = lock_state();
-            check_ownership(&dir, mine.pid, st._lock.as_ref())
+            check_ownership(dir, mine.pid, st.owner_lock.as_ref())
         };
         match check {
             Check::Held { renamed: false } => {}
             Check::Held { renamed: true } => {
-                log(&dir, "owner.json named a process without the owner lock; named this owner again");
-                write_owner_file(&dir, &mine);
+                log(dir, "owner.json named a process without the owner lock; named this owner again");
+                write_owner_file(dir, mine);
             }
             Check::Retaken(lock) => {
-                log(&dir, "owner lock wasn't held by this owner; taken again");
-                lock_state()._lock = Some(lock);
-                if read_owner_file(&dir).is_none_or(|o| o.pid != mine.pid) {
-                    write_owner_file(&dir, &mine);
+                log(dir, "owner lock wasn't held by this owner; taken again");
+                lock_state().owner_lock = Some(lock);
+                if read_owner_file(dir).is_none_or(|o| o.pid != mine.pid) {
+                    write_owner_file(dir, mine);
                 }
             }
             Check::Lost(other) => {
-                let other =
-                    other.map(|o| format!("{} pid {}", o.app, o.pid)).unwrap_or_else(|| "another process".into());
-                log(&dir, &format!("{other} holds the owner lock; this one steps down"));
+                let other = other.map_or_else(|| "another process".into(), |o| format!("{} pid {}", o.app, o.pid));
+                log(dir, &format!("{other} holds the owner lock; this one steps down"));
                 // From now on engine calls go to that owner, and this
                 // process takes over only once it's gone.
                 {
                     let mut st = lock_state();
-                    st._lock = None;
+                    st.owner_lock = None;
                     st.client = None;
                 }
-                follow(&dir);
+                follow(dir);
                 if let Some(listener) = LISTENER.get() {
                     listener(LOST_OWNERSHIP_EVENT, Value::Null);
                 }
@@ -343,7 +343,7 @@ pub fn log(dir: &Path, message: &str) {
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX_BYTES) {
         let _ = std::fs::rename(&path, logs.join(format!("{LOG_FILE}.old")));
     }
-    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(file, "{ms} pid {} {message}", std::process::id());
     }
@@ -361,7 +361,8 @@ struct Request {
 /// of stream, a read error or timeout, or a line that is too long.
 fn read_capped_line(reader: &mut impl BufRead, max: usize) -> Option<String> {
     let mut line = String::new();
-    let read = reader.by_ref().take(max as u64 + 1).read_line(&mut line).ok()?;
+    let read =
+        reader.by_ref().take(u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1)).read_line(&mut line).ok()?;
     if read == 0 || read > max {
         return None;
     }
@@ -389,7 +390,7 @@ fn serve(stream: TcpStream, token: &str) {
             lock_state().subscribers.push(Arc::new(Mutex::new(writer)));
             return;
         }
-        let answer = dispatch(&request.op, request.args);
+        let answer = dispatch(&request.op, &request.args);
         let reply = match answer {
             Ok(value) => json!({ "ok": value }),
             Err(error) => json!({ "err": error }),
@@ -400,7 +401,7 @@ fn serve(stream: TcpStream, token: &str) {
     }
 }
 
-fn dispatch(op: &str, args: Value) -> Result<Value, String> {
+fn dispatch(op: &str, args: &Value) -> Result<Value, String> {
     let handlers: Vec<Handler> = handlers().lock().unwrap_or_else(|p| p.into_inner()).clone();
     for handler in handlers {
         if let Some(result) = handler(op, args.clone()) {
@@ -424,7 +425,7 @@ pub fn broadcast(event: &str, payload: &Value) {
     let line = json!({ "event": event, "payload": payload }).to_string();
     let failed: Vec<Arc<Mutex<TcpStream>>> = subscribers
         .into_iter()
-        .filter(|s| writeln!(s.lock().unwrap_or_else(|p| p.into_inner()), "{line}").is_err())
+        .filter(|s| writeln!(s.lock().unwrap_or_else(std::sync::PoisonError::into_inner), "{line}").is_err())
         .collect();
     if !failed.is_empty() {
         lock_state().subscribers.retain(|s| !failed.iter().any(|f| Arc::ptr_eq(s, f)));
@@ -474,7 +475,7 @@ struct Client {
 
 impl Client {
     fn call(&self, op: &str, args: Value) -> Result<Value, CallError> {
-        let mut conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut conn = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if conn.is_none() {
             let stream = connect(&self.info)
                 .map_err(|e| CallError::Unreachable(format!("{} isn't answering ({e})", self.info.app)))?;
@@ -531,19 +532,19 @@ fn attach(stale: Option<&Arc<Client>>) -> Option<Arc<Client>> {
         // Another thread attached first: use its client.
         if let Some(current) = &st.client {
             if stale.is_none_or(|s| !Arc::ptr_eq(current, s)) {
-                return Some(current.clone());
+                return Some(Arc::clone(current));
             }
         }
-        st.client = Some(client.clone());
+        st.client = Some(Arc::clone(&client));
     }
-    subscribe(client.clone());
+    subscribe(Arc::clone(&client));
     Some(client)
 }
 
 fn connect(info: &OwnerInfo) -> Result<TcpStream, String> {
     let stream = TcpStream::connect_timeout(&([127, 0, 0, 1], info.port).into(), Duration::from_secs(2))
         .map_err(|e| e.to_string())?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
+    let _ = stream.set_read_timeout(Some(Duration::from_mins(2)));
     let _ = stream.set_nodelay(true);
     Ok(stream)
 }
@@ -591,9 +592,13 @@ fn subscribe(client: Arc<Client>) {
 
 /// 128 bits from the OS's secure random source.
 fn random_token() -> Result<String, String> {
+    use std::fmt::Write as _;
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| format!("no secure random source: {e}"))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    Ok(bytes.iter().fold(String::with_capacity(32), |mut hex, b| {
+        let _ = write!(hex, "{b:02x}");
+        hex
+    }))
 }
 
 #[cfg(test)]
@@ -688,6 +693,8 @@ mod tests {
     /// Two processes: this test re-runs itself as the owner, then follows it.
     #[test]
     fn follower_calls_owner_hears_events_and_takes_over() {
+        static TICKED: AtomicBool = AtomicBool::new(false);
+        static TOOK_OVER: AtomicBool = AtomicBool::new(false);
         if let Ok(dir) = std::env::var("DASH_LINK_OWNER_DIR") {
             register(Arc::new(|op: &str, a: Value| {
                 (op == "add").then(|| Ok(json!(a["a"].as_i64().unwrap_or(0) + a["b"].as_i64().unwrap_or(0))))
@@ -717,8 +724,6 @@ mod tests {
         };
         assert!(wait(&|| owner(&dir).is_some()), "owner started");
 
-        static TICKED: AtomicBool = AtomicBool::new(false);
-        static TOOK_OVER: AtomicBool = AtomicBool::new(false);
         let first = claim(
             &dir,
             "follower",
@@ -736,7 +741,7 @@ mod tests {
         assert!(wait(&|| TICKED.load(Ordering::SeqCst)), "owner's events arrive");
 
         let started = Arc::new(AtomicBool::new(false));
-        let flag = started.clone();
+        let flag = Arc::clone(&started);
         when_owner(move || flag.store(true, Ordering::SeqCst));
         assert!(!started.load(Ordering::SeqCst), "waits while following");
 

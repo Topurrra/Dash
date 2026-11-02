@@ -3,15 +3,15 @@
 use super::*;
 
 pub(crate) fn search_local_files_inner(
-    app: std::sync::Arc<dyn dash_core::Host>,
-    options: FileSearchQueryOptions,
+    app: &std::sync::Arc<dyn dash_core::Host>,
+    options: &FileSearchQueryOptions,
 ) -> Result<FileSearchQueryResult, String> {
     // Load the content index if available — file search merges content hits
     // when it exists. A failure here is NOT fatal: the most common cause is a
     // content-index rebuild in progress, and file search runs off the separate,
     // already-built filename index. Degrade to that instead of failing the
     // whole query with the content index's "rebuilding" message.
-    let _ = ensure_engine_loaded(&app);
+    let _ = ensure_engine_loaded(app);
 
     let query_text = options.query.trim().to_string();
     if query_text.is_empty() {
@@ -30,7 +30,7 @@ pub(crate) fn search_local_files_inner(
     // The filename index is searchable on its own — load it so file search
     // works even when no content index has been built (the common case for a
     // user who only set up the File Search tab).
-    ensure_filename_engine_loaded(&app);
+    ensure_filename_engine_loaded(app);
 
     // Take what the query needs (all cheap clones) and release the engine
     // lock, so a long query doesn't block other searches or the indexer.
@@ -41,7 +41,7 @@ pub(crate) fn search_local_files_inner(
             // filename index alone. Content search legitimately still requires the
             // content index and reports "not ready" through its own command.
             drop(guard);
-            return search_local_files_via_filename_index(&app, &options, started_at);
+            return search_local_files_via_filename_index(app, options, started_at);
         };
         // Reader auto-reloads via OnCommitWithDelay policy (background thread). The
         // previous explicit `reload_search_reader_if_due` was blocking the search
@@ -96,7 +96,7 @@ pub(crate) fn search_local_files_inner(
         && !natural_extension_filters.is_empty()
         && effective_extension_filters.is_empty()
     {
-        let took_ms = started_at.elapsed().map(|d| d.as_millis()).unwrap_or(0);
+        let took_ms = started_at.elapsed().map_or(0, |d| d.as_millis());
         return Ok(FileSearchQueryResult {
             query: query_text,
             total_hits: 0,
@@ -139,7 +139,7 @@ pub(crate) fn search_local_files_inner(
     // into every result's score (Search #13). Loading it before the passes is
     // what lets the unified scorer see frecency, instead of it being bolted on
     // afterwards in a separate post-pass loop.
-    let frecency = crate::frecency::snapshot(&app);
+    let frecency = crate::frecency::snapshot(app);
 
     let fetch_results = |query: &dyn Query,
                          aggressive_fallback: bool,
@@ -276,12 +276,11 @@ pub(crate) fn search_local_files_inner(
                 }
             }
         }
-        match native_result {
-            Some(r) => r,
-            None => {
-                pass1_fired = true;
-                fetch_results(query.as_ref(), false, false)?
-            }
+        if let Some(r) = native_result {
+            r
+        } else {
+            pass1_fired = true;
+            fetch_results(query.as_ref(), false, false)?
         }
     };
     let t_pass_main = t_start.elapsed();
@@ -393,11 +392,12 @@ pub(crate) fn search_local_files_inner(
     });
 
     let results = matched.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
-    let took_ms = started_at.elapsed().map(|d| d.as_millis()).unwrap_or(0);
+    let took_ms = started_at.elapsed().map_or(0, |d| d.as_millis());
     let t_total = t_start.elapsed();
 
     // Per-phase debug timing — printed to stderr, visible in `cargo tauri dev` console.
     // Format chosen so each line is grep-able. Remove or gate behind env var when done measuring.
+    #[expect(clippy::as_conversions, clippy::cast_precision_loss, reason = "debug timings in ms; rounding is fine")]
     let us = |d: std::time::Duration| (d.as_micros() as f64) / 1000.0;
     let pass_main_ms = us(t_pass_main) - us(t_query_built);
     let pass_prefix_ms = us(t_pass_prefix) - us(t_pass_main);
@@ -473,7 +473,7 @@ pub(super) fn build_decompound_query_string(keywords: &[String]) -> Option<Strin
 /// builders and `build_result_item`. v1 uses a straight top-N fetch per pass
 /// (no cap-scan) — the combined index carries the rigorous filtered passes, the
 /// filename index adds whole-disk breadth.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "each argument is a separate part of one search request")]
 pub(super) fn search_filename_index(
     handle: &FilenameIndexHandle,
     natural_language: bool,
@@ -666,19 +666,17 @@ pub(super) fn search_local_files_via_filename_index(
     let natural_plan =
         if natural_language { build_natural_query_plan(&query_text) } else { NaturalQueryPlan::default() };
 
-    let effective_extension_filters =
-        match resolve_extension_filters(&manual_extension_filters, &natural_plan.extension_filters) {
-            Some(filters) => filters,
-            None => {
-                return Ok(FileSearchQueryResult {
-                    query: query_text,
-                    total_hits: 0,
-                    returned: 0,
-                    took_ms: started_at.elapsed().map(|d| d.as_millis()).unwrap_or(0),
-                    results: Vec::new(),
-                });
-            }
-        };
+    let Some(effective_extension_filters) =
+        resolve_extension_filters(&manual_extension_filters, &natural_plan.extension_filters)
+    else {
+        return Ok(FileSearchQueryResult {
+            query: query_text,
+            total_hits: 0,
+            returned: 0,
+            took_ms: started_at.elapsed().map_or(0, |d| d.as_millis()),
+            results: Vec::new(),
+        });
+    };
 
     let query_keywords =
         if natural_language { natural_plan.query_keywords.clone() } else { extract_query_keywords(&query_text) };
@@ -716,15 +714,15 @@ pub(super) fn search_local_files_via_filename_index(
 
     let total_hits = matched.len();
     let results = matched.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
-    let took_ms = started_at.elapsed().map(|d| d.as_millis()).unwrap_or(0);
+    let took_ms = started_at.elapsed().map_or(0, |d| d.as_millis());
     Ok(FileSearchQueryResult { query: query_text, total_hits, returned: results.len(), took_ms, results })
 }
 
 pub(super) fn search_file_contents_inner(
-    app: std::sync::Arc<dyn dash_core::Host>,
-    options: FileSearchQueryOptions,
+    app: &std::sync::Arc<dyn dash_core::Host>,
+    options: &FileSearchQueryOptions,
 ) -> Result<ContentSearchQueryResult, String> {
-    ensure_engine_loaded(&app)?;
+    ensure_engine_loaded(app)?;
 
     let query_text = options.query.trim().to_string();
     if query_text.is_empty() {
@@ -758,7 +756,8 @@ pub(super) fn search_file_contents_inner(
         return Err("Content indexing is disabled. Enable content indexing and rebuild the search index.".to_string());
     }
 
-    let max_content_bytes = (max_content_kb.unwrap_or(DEFAULT_MAX_CONTENT_KB) as usize)
+    let max_content_bytes = usize::try_from(max_content_kb.unwrap_or(DEFAULT_MAX_CONTENT_KB))
+        .unwrap_or(usize::MAX)
         .saturating_mul(1024)
         .clamp(8 * 1024, 2 * 1024 * 1024);
 
@@ -785,7 +784,7 @@ pub(super) fn search_file_contents_inner(
     };
     if !extension_filters.is_empty() && !natural_extension_filters.is_empty() && effective_extension_filters.is_empty()
     {
-        let took_ms = started_at.elapsed().map(|d| d.as_millis()).unwrap_or(0);
+        let took_ms = started_at.elapsed().map_or(0, |d| d.as_millis());
         return Ok(ContentSearchQueryResult {
             query: query_text,
             total_hits: 0,
@@ -818,7 +817,7 @@ pub(super) fn search_file_contents_inner(
 
     // Frecency snapshot — loaded once so `build_content_result_item` can fuse
     // open-history into each result's score (Search #13).
-    let frecency = crate::frecency::snapshot(&app);
+    let frecency = crate::frecency::snapshot(app);
 
     // Semantic search (beta): embed the query and find the stored vectors closest
     // in meaning. `semantic_scores` (path_lower → cosine) re-ranks keyword hits;
@@ -838,7 +837,7 @@ pub(super) fn search_file_contents_inner(
     let mut semantic_scores: HashMap<String, f32> = HashMap::new();
     let mut semantic_active = false;
     let semantic_candidates: Vec<(String, f32)> = if semantic_search_enabled && crate::embedding::is_available() {
-        match crate::embedding::embed(&query_text).zip(search_index_dir(&app).ok()) {
+        match crate::embedding::embed(&query_text).zip(search_index_dir(app).ok()) {
             Some((qvec, state_dir)) => {
                 // The meaning pass genuinely ran (toggle on, model loaded, query
                 // embedded) — record it so the UI can show "semantic on" even when
@@ -995,7 +994,7 @@ pub(super) fn search_file_contents_inner(
     });
 
     let results = matched.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
-    let took_ms = started_at.elapsed().map(|d| d.as_millis()).unwrap_or(0);
+    let took_ms = started_at.elapsed().map_or(0, |d| d.as_millis());
 
     Ok(ContentSearchQueryResult {
         query: query_text,
@@ -1070,11 +1069,10 @@ pub(super) fn try_open_filename_index(state_dir: &Path) -> Option<FilenameIndexH
     if !dir.exists() {
         return None;
     }
-    match open_active_filename_index(&dir) {
-        Ok(handle) => Some(handle),
-        Err(_) => {
-            quarantine_corrupt_index(&dir, FILENAME_CORRUPT_INDEX_PREFIX);
-            None
-        }
+    if let Ok(handle) = open_active_filename_index(&dir) {
+        Some(handle)
+    } else {
+        quarantine_corrupt_index(&dir, FILENAME_CORRUPT_INDEX_PREFIX);
+        None
     }
 }

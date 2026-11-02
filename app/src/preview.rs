@@ -75,7 +75,13 @@ fn music(path: &Path, details: &mut Vec<(&'static str, SharedString)>) -> Option
         details.push(("Bitrate", format!("{kbps} kbps").into()));
     }
     if let Some(hz) = props.sample_rate() {
-        details.push(("Sample rate", format!("{:.1} kHz", hz as f32 / 1000.).into()));
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_precision_loss,
+            reason = "sample rates are far below 2^24 Hz, so exact as f32"
+        )]
+        let khz = hz as f32 / 1000.;
+        details.push(("Sample rate", format!("{khz:.1} kHz").into()));
     }
     let tag = file.primary_tag().or_else(|| file.first_tag());
     let text = |value: Option<std::borrow::Cow<str>>| {
@@ -85,7 +91,7 @@ fn music(path: &Path, details: &mut Vec<(&'static str, SharedString)>) -> Option
         Some(t) => (text(t.title()), text(t.artist()), text(t.album())),
         None => (None, None, None),
     };
-    if let Some(year) = tag.and_then(|t| t.year()) {
+    if let Some(year) = tag.and_then(lofty::tag::Accessor::year) {
         details.push(("Year", year.to_string().into()));
     }
     let cover = tag.and_then(|t| t.pictures().first()).and_then(|picture| {
@@ -107,7 +113,7 @@ fn music(path: &Path, details: &mut Vec<(&'static str, SharedString)>) -> Option
 /// Reads `path` for the pane. `query` marks the first line that matches.
 pub fn load(path: String, query: &str) -> Preview {
     let p = Path::new(&path);
-    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+    let name = p.file_name().map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
     let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     let meta = std::fs::metadata(p);
     let mut details: Vec<(&'static str, SharedString)> = Vec::new();
@@ -176,7 +182,7 @@ fn folder_items(folder: &Path) -> (Vec<FolderItem>, usize) {
     all.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     all.truncate(FOLDER_ITEMS);
     for item in all.iter_mut().filter(|i| !i.is_dir) {
-        item.size = std::fs::metadata(&item.path).map(|m| m.len()).unwrap_or(0);
+        item.size = std::fs::metadata(&item.path).map_or(0, |m| m.len());
     }
     (all, total)
 }
@@ -188,7 +194,11 @@ const PREVIEW_BYTES: usize = 256 * 1024;
 fn sniff_text(path: &Path) -> Option<String> {
     use std::io::Read;
     let mut bytes = Vec::new();
-    std::fs::File::open(path).ok()?.take(PREVIEW_BYTES as u64).read_to_end(&mut bytes).ok()?;
+    std::fs::File::open(path)
+        .ok()?
+        .take(u64::try_from(PREVIEW_BYTES).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .ok()?;
     looks_like_text(bytes)
 }
 
@@ -248,6 +258,11 @@ pub fn thousands(n: usize) -> String {
     out
 }
 
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "shown to one decimal at most, so f64 is precise enough"
+)]
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
@@ -324,9 +339,9 @@ mod tests {
         let preview = load(file.display().to_string(), "");
         assert!(matches!(preview.body, Body::Media(_)));
         let music = preview.music.expect("music");
-        assert_eq!(music.title.as_ref().map(|s| s.as_ref()), Some("Test Title"));
-        assert_eq!(music.artist.as_ref().map(|s| s.as_ref()), Some("Test Artist"));
-        assert_eq!(music.album.as_ref().map(|s| s.as_ref()), Some("Test Album"));
+        assert_eq!(music.title.as_ref().map(std::convert::AsRef::as_ref), Some("Test Title"));
+        assert_eq!(music.artist.as_ref().map(std::convert::AsRef::as_ref), Some("Test Artist"));
+        assert_eq!(music.album.as_ref().map(std::convert::AsRef::as_ref), Some("Test Album"));
         assert!(music.cover.is_some(), "cover read");
         assert!(preview.details.iter().any(|(k, _)| *k == "Sample rate"));
         let _ = std::fs::remove_dir_all(&dir);

@@ -11,19 +11,36 @@ edition = "2021"
 publish = false
 license = "GPL-3.0-or-later"
 
-# Correctness first (from BeautifulRust's set): what can panic, lose data in a
-# cast, or hide an unsafe assumption. Style and pedantic lints come later.
+# BeautifulRust's set: correctness (what can panic, lose data in a cast, or
+# hide an unsafe assumption) and style / pedantic.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
 cast_possible_truncation = "warn"
 cast_sign_loss = "warn"
+as_conversions = "warn"
+clone_on_ref_ptr = "warn"
+string_add = "warn"
+allow_attributes_without_reason = "warn"
+missing_assert_message = "warn"
 dbg_macro = "warn"
 todo = "warn"
+# Off on purpose: the search/ parts see each other through `use super::*`;
+# splitting the long index-build functions is a refactor of its own; the
+# last two are noise (BeautifulRust turns them off too).
+wildcard_imports = "allow"
+too_many_lines = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+# Its fix, `assert_eq!(x, [] as [T; 0])`, is an `as` cast `as_conversions`
+# then flags; `assert!(x.is_empty())` stays.
+assert_is_empty = "allow"
 
 [workspace.dependencies]
 dash-core = { path = "crates/dash-core" }

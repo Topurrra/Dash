@@ -8,7 +8,7 @@
 //! live-grep path scans the folder right now — zero setup, ~1 GB/s on
 //! a modern SSD — and streams matches as they're found.
 //!
-//! Engine: `grep-searcher` + `grep-regex` (BurntSushi crates that
+//! Engine: `grep-searcher` + `grep-regex` (`BurntSushi` crates that
 //! power ripgrep). Walk: `ignore::WalkBuilder` (already a KIL dep —
 //! respects `.gitignore`, `.ignore`, hidden files by default).
 //!
@@ -19,7 +19,7 @@
 //! the caller can show a final status line.
 //!
 //! Cancellation: standard Wave 2.5 pattern — `CANCELLED_LIVE_GREP`
-//! HashSet keyed by operation ID; checked at each walker entry. The
+//! `HashSet` keyed by operation ID; checked at each walker entry. The
 //! `cancel_live_grep` Tauri command sets the flag.
 
 use grep_matcher::Matcher;
@@ -37,13 +37,15 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 static CANCELLED_LIVE_GREP: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// # Errors
+/// When the cancel registry lock fails.
 pub fn cancel_live_grep(operation_id: String) -> Result<(), String> {
     CANCELLED_LIVE_GREP.lock().map_err(|_| "Cancel registry lock failed".to_string())?.insert(operation_id);
     Ok(())
 }
 
 fn is_live_grep_cancelled(op_id: &str) -> bool {
-    CANCELLED_LIVE_GREP.lock().ok().map(|s| s.contains(op_id)).unwrap_or(false)
+    CANCELLED_LIVE_GREP.lock().is_ok_and(|s| s.contains(op_id))
 }
 
 fn clear_live_grep_cancel(op_id: &str) {
@@ -82,7 +84,7 @@ pub struct LiveGrepOptions {
     pub literal: bool,
     /// Hard cap on total matches emitted across ALL folders. Defaults
     /// to 500 to keep the UI responsive — a "find every match in
-    /// node_modules" query could otherwise emit millions of events.
+    /// `node_modules`" query could otherwise emit millions of events.
     #[serde(default = "default_max_matches")]
     pub max_matches: usize,
     /// Skip files larger than this byte count. Defaults to 50 MB.
@@ -139,6 +141,8 @@ pub struct LiveGrepSummary {
 
 // ── The command ────────────────────────────────────────────────────────
 
+/// # Errors
+/// When the query isn't a valid regex or the worker fails.
 pub async fn live_grep_in_folders(
     app: std::sync::Arc<dyn dash_core::Host>,
     options: LiveGrepOptions,
@@ -163,7 +167,7 @@ pub async fn live_grep_in_folders(
             .build(&pattern)
             .map_err(|e| format!("Invalid regex: {e}"))?;
 
-        let event_name = format!("live-grep-hit-{}", op_id);
+        let event_name = format!("live-grep-hit-{op_id}");
         // Wave 3.3.2 (v1 production polish, 2026-05-27): walk each
         // configured folder in PARALLEL via rayon. With 3 indexed
         // folders on a modern SSD this turns ~750ms wall-clock-before-
@@ -215,11 +219,11 @@ pub async fn live_grep_in_folders(
 
                 files_scanned.fetch_add(1, Ordering::Relaxed);
                 let path_str = path.to_string_lossy().to_string();
-                let app_handle = app.clone();
+                let app_handle = Arc::clone(&app);
                 let event_name_local = event_name.clone();
-                let matcher_for_sink = matcher_arc.clone();
-                let total_ref = total_matches.clone();
-                let truncated_ref = truncated.clone();
+                let matcher_for_sink = Arc::clone(&matcher_arc);
+                let total_ref = Arc::clone(&total_matches);
+                let truncated_ref = Arc::clone(&truncated);
 
                 let _ = searcher.search_path(
                     matcher_arc.as_ref(),

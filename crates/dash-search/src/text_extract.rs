@@ -5,7 +5,7 @@
 //! suitable for Tantivy tokenization. Every extractor honors `max_bytes` as
 //! a hard upper bound so a 500-page PDF doesn't blow up the index.
 //!
-//! Supported formats (beyond plain text): PDF (PDFium primary — lazy-loading +
+//! Supported formats (beyond plain text): PDF (`PDFium` primary — lazy-loading +
 //! accurate Unicode; lopdf per-page fallback), DOCX / PPTX /
 //! ODT / ODP / ODS (ZIP archives — `quick-xml` streamed straight off the
 //! decompressing entry), XLSX (`quick-xml` streamed over the shared-string
@@ -30,6 +30,7 @@ use pdfium_render::prelude::*;
 /// `min(tier_limit, user_max_bytes)` so users can throttle everything down
 /// to save disk space, but raising it past the tier's natural limit has no
 /// effect (the tier caps win).
+#[expect(clippy::match_same_arms, reason = "one arm per file family keeps the tiers readable")]
 fn tier_bytes_for_path(path: &Path) -> usize {
     let ext = path.extension().and_then(|v| v.to_str()).unwrap_or_default().to_lowercase();
 
@@ -116,9 +117,9 @@ struct HeavyExtractionPermit;
 
 impl HeavyExtractionPermit {
     fn acquire() -> Self {
-        let mut active = HEAVY_EXTRACTION_GATE.active.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut active = HEAVY_EXTRACTION_GATE.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         while *active >= MAX_CONCURRENT_HEAVY_EXTRACTIONS {
-            active = HEAVY_EXTRACTION_GATE.slot_freed.wait(active).unwrap_or_else(|poisoned| poisoned.into_inner());
+            active = HEAVY_EXTRACTION_GATE.slot_freed.wait(active).unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         *active += 1;
         HeavyExtractionPermit
@@ -128,7 +129,7 @@ impl HeavyExtractionPermit {
 impl Drop for HeavyExtractionPermit {
     fn drop(&mut self) {
         {
-            let mut active = HEAVY_EXTRACTION_GATE.active.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut active = HEAVY_EXTRACTION_GATE.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             *active = active.saturating_sub(1);
         }
         HEAVY_EXTRACTION_GATE.slot_freed.notify_one();
@@ -199,7 +200,7 @@ pub fn extract_text_for_indexing(path: &Path, user_max_bytes: usize) -> Option<S
 /// monolithic `is_supported_extension(path)` predicate with the two
 /// focused helpers below (`is_text_or_doc_extension` and
 /// `is_ocr_image_extension`). The walker now combines them with the
-/// FileSearchIndexOptions OCR config in `should_index_for_content`,
+/// `FileSearchIndexOptions` OCR config in `should_index_for_content`,
 /// so this module no longer owns a single-step "is this indexable?"
 /// check — that question only makes sense WITH the OCR config in
 /// scope, and the walker has it.
@@ -323,7 +324,8 @@ fn looks_binary(bytes: &[u8]) -> bool {
             control += 1;
         }
     }
-    control as f32 / sample_len as f32 > 0.15
+    // More than 15% control bytes.
+    control * 100 > sample_len * 15
 }
 
 /// Read at most `cap` bytes from the start of a file. Used by extractors whose
@@ -332,7 +334,7 @@ fn looks_binary(bytes: &[u8]) -> bool {
 fn read_capped(path: &Path, cap: usize) -> Option<Vec<u8>> {
     let file = fs::File::open(path).ok()?;
     let mut buf = Vec::new();
-    file.take(cap as u64).read_to_end(&mut buf).ok()?;
+    file.take(u64::try_from(cap).unwrap_or(u64::MAX)).read_to_end(&mut buf).ok()?;
     Some(buf)
 }
 
@@ -340,7 +342,7 @@ fn read_capped(path: &Path, cap: usize) -> Option<Vec<u8>> {
 /// the OCR-on-Index config to extractor children. Used by
 /// `search.rs::spawn_extractor_child` to call `.env()` on the spawn Command
 /// — children inherit them and `OcrIndexConfig::from_env()` below reads
-/// them once into a thread_local on first use. Empty when OCR is disabled,
+/// them once into a `thread_local` on first use. Empty when OCR is disabled,
 /// so spawn sites can unconditionally call `apply_to` without paying for
 /// the env setup when the user hasn't opted in.
 #[derive(Debug, Clone, Default)]
@@ -484,7 +486,7 @@ impl OcrIndexConfig {
             .ok()
             .unwrap_or_default()
             .lines()
-            .map(|s| s.trim())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .collect();
@@ -526,7 +528,7 @@ impl OcrIndexConfig {
         self.folders.iter().any(|root| {
             let root_str = root.to_string_lossy().to_lowercase().replace('\\', "/");
             let root_str = root_str.trim_end_matches('/');
-            path_str == root_str || path_str.starts_with(&format!("{}/", root_str))
+            path_str == root_str || path_str.starts_with(&format!("{root_str}/"))
         })
     }
 }
@@ -553,7 +555,7 @@ fn with_ocr_config<R>(f: impl FnOnce(&OcrIndexConfig) -> R) -> R {
 /// printed-to-PDF). When OCR-on-Index is enabled and the path is in a
 /// configured folder, this renders pages via pdfium and runs each one
 /// through Tesseract. Strictly capped: max pages per file, single
-/// HeavyExtractionPermit held across the whole loop so concurrent walker
+/// `HeavyExtractionPermit` held across the whole loop so concurrent walker
 /// threads can't pile up tesseract processes.
 ///
 /// Returns the OCR'd text on success, None when OCR is disabled, the
@@ -561,14 +563,18 @@ fn with_ocr_config<R>(f: impl FnOnce(&OcrIndexConfig) -> R) -> R {
 /// abort the loop — partial OCR is better than nothing.
 fn ocr_fallback_for_pdf(path: &Path, max_bytes: usize) -> Option<String> {
     use rayon::prelude::*;
-    let config = with_ocr_config(|c| c.clone());
-    if !config.applies_to(path) {
-        return None;
-    }
     // 200 DPI is the sweet spot for Tesseract — empirically yields ~95%
     // accuracy on receipts/contracts while keeping the bitmap under
     // ~5 MB for typical letter-sized pages.
     const OCR_RENDER_DPI: u32 = 200;
+    struct RenderedPage {
+        index: u32,
+        temp_path: PathBuf,
+    }
+    let config = with_ocr_config(std::clone::Clone::clone);
+    if !config.applies_to(path) {
+        return None;
+    }
     let temp_dir = std::env::temp_dir();
     let pid = std::process::id();
 
@@ -587,11 +593,7 @@ fn ocr_fallback_for_pdf(path: &Path, max_bytes: usize) -> Option<String> {
     // Phase 1: render pages to temp PNGs serially. Stop at the
     // configured max_pages OR when we hit the document's end (the
     // first None signals "past end").
-    struct RenderedPage {
-        index: u32,
-        temp_path: PathBuf,
-    }
-    let mut rendered: Vec<RenderedPage> = Vec::with_capacity(config.max_pages as usize);
+    let mut rendered: Vec<RenderedPage> = Vec::with_capacity(usize::try_from(config.max_pages).unwrap_or(0));
     for page_index in 0..config.max_pages {
         // pdfium page indexes are u16; there is no page past that to render.
         let Ok(pdfium_index) = u16::try_from(page_index) else {
@@ -601,7 +603,7 @@ fn ocr_fallback_for_pdf(path: &Path, max_bytes: usize) -> Option<String> {
             break;
         };
         let temp_path =
-            temp_dir.join(format!("dash-ocr-{pid}-{}-{}.png", std::ptr::addr_of!(config) as usize, page_index));
+            temp_dir.join(format!("dash-ocr-{pid}-{}-{}.png", std::ptr::addr_of!(config).addr(), page_index));
         if fs::write(&temp_path, &png_bytes).is_err() {
             continue;
         }
@@ -662,7 +664,7 @@ impl Drop for TempPngFile {
 /// image extensions in `is_ocr_image_extension`. Returns None when OCR
 /// is disabled or the path isn't in a configured folder — that's the
 /// "opt-out fast path" — so a user who hasn't enabled OCR pays only
-/// for one env-var read per image (the thread_local caches it after
+/// for one env-var read per image (the `thread_local` caches it after
 /// the first read).
 ///
 /// Format handling:
@@ -681,7 +683,7 @@ impl Drop for TempPngFile {
 /// text, and OCR'ing them wastes 1-2 seconds per file on a large
 /// Downloads folder.
 fn extract_image_text_via_ocr(path: &Path, max_bytes: usize) -> Option<String> {
-    let config = with_ocr_config(|c| c.clone());
+    let config = with_ocr_config(std::clone::Clone::clone);
     if !config.applies_to(path) {
         return None;
     }
@@ -706,9 +708,9 @@ fn extract_image_text_via_ocr(path: &Path, max_bytes: usize) -> Option<String> {
                 return None;
             }
             if config.max_aspect_ratio > 0.0 {
-                let long = w.max(h) as f32;
-                let short = w.min(h).max(1) as f32;
-                if (long / short) > config.max_aspect_ratio {
+                let long = f64::from(w.max(h));
+                let short = f64::from(w.min(h).max(1));
+                if (long / short) > f64::from(config.max_aspect_ratio) {
                     return None;
                 }
             }
@@ -720,48 +722,46 @@ fn extract_image_text_via_ocr(path: &Path, max_bytes: usize) -> Option<String> {
     }
 
     let ocr_target: PathBuf;
-    let _cleanup;
+    let cleanup;
 
     match ext.as_str() {
         "webp" => {
             // Convert WEBP → temp PNG (Tesseract doesn't read WEBP). Panic-
             // guarded — a malformed WEBP must never crash the extractor
             // subprocess.
-            let png_bytes = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(Some(png_bytes)) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                use std::io::Cursor;
                 let dyn_image = image::open(path).ok()?;
                 let mut buf: Vec<u8> = Vec::new();
-                use std::io::Cursor;
                 dyn_image.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).ok()?;
                 Some(buf)
-            })) {
-                Ok(Some(b)) => b,
-                _ => return None,
+            })) else {
+                return None;
             };
             let temp_dir = std::env::temp_dir();
             let pid = std::process::id();
-            let temp_path = temp_dir.join(format!("dash-ocr-img-{pid}-{}.png", std::ptr::addr_of!(config) as usize,));
+            let temp_path = temp_dir.join(format!("dash-ocr-img-{pid}-{}.png", std::ptr::addr_of!(config).addr()));
             if fs::write(&temp_path, &png_bytes).is_err() {
                 return None;
             }
             // Clone the path: one copy for the OCR target, one held by
             // the RAII guard so the file is removed even on a Tesseract
             // panic.
-            _cleanup = Some(TempPngFile(temp_path.clone()));
+            cleanup = Some(TempPngFile(temp_path.clone()));
             ocr_target = temp_path;
         }
         // Tesseract reads these directly.
         "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" => {
-            _cleanup = None;
+            cleanup = None;
             ocr_target = path.to_path_buf();
         }
         _ => return None,
     }
 
-    let text = match ocr_with_timeout(&ocr_target, &config.langs, config.per_file_timeout_secs) {
-        Ok(t) => t,
-        Err(_) => return None,
+    let Ok(text) = ocr_with_timeout(&ocr_target, &config.langs, config.per_file_timeout_secs) else {
+        return None;
     };
-    drop(_cleanup);
+    drop(cleanup);
     let mut text = text.trim().to_string();
     if text.is_empty() {
         return None;
@@ -785,30 +785,30 @@ fn read_image_dimensions(path: &Path) -> Option<(u32, u32)> {
 /// Wave 8.2 (2026-05-28): wrap an OCR call with a per-file timeout.
 ///
 /// Re-uses the existing OCR cancellation infrastructure: generates a
-/// unique operation_id, hands it to `ocr_image_file` so the spawned
-/// Tesseract Child is stashed in OCR_CHILDREN, and spawns a watchdog
+/// unique `operation_id`, hands it to `ocr_image_file` so the spawned
+/// Tesseract Child is stashed in `OCR_CHILDREN`, and spawns a watchdog
 /// thread that calls `cancel_ocr_operation(op_id)` after the timeout
 /// elapses. `cancel_ocr_operation` kills the child if it's still
 /// running; the OCR call then returns "Cancelled" which we re-map to
 /// a clear timeout error.
 ///
 /// `timeout_secs == 0` means "no timeout" — falls through to the
-/// existing untimed path with operation_id = None.
+/// existing untimed path with `operation_id` = None.
 ///
 /// The watchdog waits on a channel that is closed when OCR returns, so
 /// it exits as soon as the work is done instead of sleeping the full
 /// timeout.
 fn ocr_with_timeout(image_path: &Path, langs: &str, timeout_secs: u32) -> Result<String, String> {
-    if timeout_secs == 0 {
-        return super::ocr::ocr_image_file(image_path, langs, false, None, &None);
-    }
     // A counter, not the clock: parallel PDF pages can start in the same
     // nanosecond and must not share an id.
     static NEXT_OCR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if timeout_secs == 0 {
+        return super::ocr::ocr_image_file(image_path, langs, false, None, &None);
+    }
     let op_id =
         format!("ocr-{}-{}", std::process::id(), NEXT_OCR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let op_id_for_watchdog = op_id.clone();
-    let timeout = std::time::Duration::from_secs(timeout_secs as u64);
+    let timeout = std::time::Duration::from_secs(u64::from(timeout_secs));
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(timeout) {
@@ -827,12 +827,12 @@ fn ocr_with_timeout(image_path: &Path, langs: &str, timeout_secs: u32) -> Result
 
 // ─── PDF extractor (PDFium primary, lopdf fallback) ────────────────────────
 
-/// Extract a PDF's text for indexing. PDFium runs first — it lazy-loads (only
+/// Extract a PDF's text for indexing. `PDFium` runs first — it lazy-loads (only
 /// the pages it reads, so memory stays bounded even on a 250 MB book) and reads
 /// correct Unicode where lopdf silently returns nothing (e.g. Georgian CID/Type0
-/// fonts — verified on a real corpus). If PDFium is unavailable (no `pdfium.dll`)
+/// fonts — verified on a real corpus). If `PDFium` is unavailable (no `pdfium.dll`)
 /// or yields nothing, we fall back to the original lopdf path, so there is no
-/// regression on files PDFium can't open.
+/// regression on files `PDFium` can't open.
 fn extract_pdf_text(path: &Path, max_bytes: usize) -> Option<String> {
     if let Some(text) = pdfium_extract_pdf_text(path, max_bytes) {
         return Some(text);
@@ -850,9 +850,9 @@ fn extract_pdf_text(path: &Path, max_bytes: usize) -> Option<String> {
     ocr_fallback_for_pdf(path, max_bytes)
 }
 
-/// Process-wide PDFium handle, bound once per thread and reused. The extractor
+/// Process-wide `PDFium` handle, bound once per thread and reused. The extractor
 /// worker is single-threaded (it reads one path at a time off stdin), and a
-/// `thread_local` sidesteps PDFium's non-thread-safety without any locking. The
+/// `thread_local` sidesteps `PDFium`'s non-thread-safety without any locking. The
 /// three states avoid re-attempting a failed bind (e.g. missing DLL) per file.
 enum PdfiumSlot {
     Untried,
@@ -867,7 +867,7 @@ thread_local! {
 /// Bind to `pdfium.dll`. Tries the copy beside the current executable first
 /// (bundled there via tauri.conf.json `bundle.resources`, like the Vosk DLLs —
 /// works in both the main process and the same-exe extractor worker), then the
-/// OS library search path. Returns None when no PDFium library is present.
+/// OS library search path. Returns None when no `PDFium` library is present.
 fn bind_pdfium() -> Option<Pdfium> {
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
     let bindings = exe_dir
@@ -876,7 +876,7 @@ fn bind_pdfium() -> Option<Pdfium> {
     Some(Pdfium::new(bindings))
 }
 
-/// PDFium extraction. Returns None on any failure (no DLL, can't open — e.g.
+/// `PDFium` extraction. Returns None on any failure (no DLL, can't open — e.g.
 /// encrypted, or genuinely no text) so the caller can fall back to lopdf.
 fn pdfium_extract_pdf_text(path: &Path, max_bytes: usize) -> Option<String> {
     PDFIUM.with(|slot| {
@@ -925,10 +925,10 @@ fn pdfium_extract_pdf_text(path: &Path, max_bytes: usize) -> Option<String> {
 }
 
 /// Wave 8 / task #88 (2026-05-28): render a single PDF page to PNG bytes via
-/// the SAME thread_local PDFium handle used by text extraction. No std::sync::Arc<dyn dash_core::Host>,
-/// no WinRT — works inside the extractor subprocess where the legacy
+/// the SAME `thread_local` `PDFium` handle used by text extraction. No `std::sync::Arc`<dyn dash_core::Host>,
+/// no `WinRT` — works inside the extractor subprocess where the legacy
 /// `render_windows_pdf_page_bytes()` in `commands/pdf.rs` could not (it needs
-/// the Tauri main-thread WinRT apartment).
+/// the Tauri main-thread `WinRT` apartment).
 ///
 /// Used by the OCR-on-Index fallback: when `pdfium_extract_pdf_text` returns
 /// no text from a PDF (image-only / scan-only file) AND the user opted in,
@@ -938,11 +938,12 @@ fn pdfium_extract_pdf_text(path: &Path, max_bytes: usize) -> Option<String> {
 ///
 /// `dpi` is clamped to a sane [72, 400] range — anything above ~300 inflates
 /// memory linearly without measurably improving OCR accuracy. Returns None on
-/// any failure (no PDFium library, can't open document, render error, encode
+/// any failure (no `PDFium` library, can't open document, render error, encode
 /// error) so the caller can skip the page and continue indexing.
 fn pdfium_render_page_to_png(path: &Path, page_index: u16, dpi: u32) -> Option<Vec<u8>> {
     use std::io::Cursor;
-    let clamped_dpi = dpi.clamp(72, 400);
+    // 72..=400 fits a u16, so it converts to f32 exactly.
+    let clamped_dpi = u16::try_from(dpi.clamp(72, 400)).unwrap_or(400);
     PDFIUM.with(|slot| {
         {
             let mut state = slot.borrow_mut();
@@ -966,13 +967,15 @@ fn pdfium_render_page_to_png(path: &Path, page_index: u16, dpi: u32) -> Option<V
             let page = pages.get(page_index).ok()?;
             // PdfPoints are in PDF points (1pt = 1/72 inch). Scale to the
             // requested DPI before allocating the bitmap.
-            let scale = clamped_dpi as f32 / 72.0;
+            let scale = f32::from(clamped_dpi) / 72.0;
             #[expect(
+                clippy::as_conversions,
                 clippy::cast_possible_truncation,
                 reason = "rounded and at least 1; `as` saturates instead of wrapping for an absurd page size"
             )]
             let width_px = (page.width().value * scale).round().max(1.0) as i32;
             #[expect(
+                clippy::as_conversions,
                 clippy::cast_possible_truncation,
                 reason = "rounded and at least 1; `as` saturates instead of wrapping for an absurd page size"
             )]
@@ -1004,7 +1007,7 @@ fn lopdf_extract_pdf_text(path: &Path, max_bytes: usize) -> Option<String> {
     // Iterate pages in order. Stop early once we hit the byte cap so a 500-page
     // report doesn't waste seconds extracting text we'll never index.
     let mut page_nums: Vec<u32> = pages.keys().copied().collect();
-    page_nums.sort();
+    page_nums.sort_unstable();
 
     for page_num in page_nums {
         if text.len() >= max_bytes {
@@ -1012,7 +1015,7 @@ fn lopdf_extract_pdf_text(path: &Path, max_bytes: usize) -> Option<String> {
         }
         let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doc.extract_text(&[page_num])))
             .ok()
-            .and_then(|r| r.ok());
+            .and_then(std::result::Result::ok);
 
         if let Some(page_text) = extracted {
             if !page_text.is_empty() {
@@ -1052,6 +1055,10 @@ fn extract_docx_text(path: &Path, max_bytes: usize) -> Option<String> {
 
 // ─── PPTX extractor (zip + every slide) ────────────────────────────────────
 
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "zip part names, not file paths; OOXML writes them in lower case"
+)]
 fn extract_pptx_text(path: &Path, max_bytes: usize) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let mut archive = zip::ZipArchive::new(file).ok()?;
@@ -1243,11 +1250,11 @@ fn extract_rtf_text(path: &Path, max_bytes: usize) -> Option<String> {
                     // Translate / handle specific keywords.
                     match word.as_str() {
                         // Soft separators — emit a space so words don't run together.
-                        "par" | "line" | "tab" | "page" | "sect" | "cell" | "row" if skip_until_depth.is_none() => {
-                            out.push(' ');
-                        }
+                        "par" | "line" | "tab" | "page" | "sect" | "cell" | "row"
                         // Non-breaking space / hyphens.
-                        "nbsp" | "~" if skip_until_depth.is_none() => {
+                        | "nbsp" | "~"
+                            if skip_until_depth.is_none() =>
+                        {
                             out.push(' ');
                         }
                         // Metadata / binary destinations — skip the entire group.
@@ -1321,7 +1328,7 @@ fn cp1252_to_char(byte: u8) -> char {
         0x9C => 'œ',
         0x9E => 'ž',
         0x9F => 'Ÿ',
-        _ => byte as char,
+        _ => char::from(byte),
     }
 }
 
@@ -1396,7 +1403,7 @@ fn append_xlsx_sheet_names(reader: impl std::io::BufRead, out: &mut String, max_
             break;
         }
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.local_name().as_ref() == b"sheet" => {
+            Ok(Event::Empty(e) | Event::Start(e)) if e.local_name().as_ref() == b"sheet" => {
                 if let Ok(Some(attr)) = e.try_get_attribute("name") {
                     // Sheet names are plain text (entities are vanishingly rare
                     // in them), so a direct UTF-8 decode of the raw value is
@@ -1451,8 +1458,7 @@ fn strip_xml_reader_to_text(reader: impl std::io::BufRead, out: &mut String, max
                     }
                 }
             }
-            Ok(Event::Eof) => break,
-            Err(_) => break,
+            Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
         buf.clear();

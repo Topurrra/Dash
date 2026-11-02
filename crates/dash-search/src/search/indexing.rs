@@ -110,7 +110,7 @@ pub(super) struct ExistingDocLookup {
 
 /// Snapshot of the previous index used during a staging rebuild. The reader
 /// is kept alive for the duration of the build so per-file content lookups
-/// can resolve via doc_address without re-extracting from disk.
+/// can resolve via `doc_address` without re-extracting from disk.
 pub(super) struct ExistingIndexCache {
     pub(super) searcher: tantivy::Searcher,
     pub(super) fields: SearchFields,
@@ -320,26 +320,21 @@ pub(super) fn run_content_indexer(
         if should_stop.load(Ordering::Relaxed) {
             continue;
         }
-        let metadata = match fs::metadata(&result.path) {
-            Ok(value) => value,
-            Err(_) => {
-                // The file vanished between discovery and extraction.
-                skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+        let Ok(metadata) = fs::metadata(&result.path) else {
+            // The file vanished between discovery and extraction.
+            skipped.fetch_add(1, Ordering::Relaxed);
+            continue;
         };
         let modified_ms = metadata
             .modified()
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
+            .map_or(0, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
         let created_ms = metadata
             .created()
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(modified_ms);
+            .map_or(modified_ms, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
         let entry = Path::new(&result.path);
         let file_name = entry.file_name().and_then(|value| value.to_str()).unwrap_or_default().to_string();
         let extension = entry.extension().and_then(|value| value.to_str()).unwrap_or_default().to_lowercase();
@@ -438,12 +433,11 @@ pub(super) fn content_index_unchanged(
                 // through to the normal build so its cancel handling runs.
                 return false;
             }
-            let entry = match entry_result {
-                Ok(value) => value,
-                Err(_) => return false,
+            let Ok(entry) = entry_result else {
+                return false;
             };
             let path = entry.path();
-            let is_file = entry.file_type().map(|value| value.is_file()).unwrap_or(false);
+            let is_file = entry.file_type().is_some_and(|value| value.is_file());
             // Folders carry no content document; the content index holds text
             // files only, so only those participate in the comparison.
             if !is_file {
@@ -455,17 +449,15 @@ pub(super) fn content_index_unchanged(
             if !should_index_for_content(path, options) {
                 continue;
             }
-            let metadata = match fs::metadata(path) {
-                Ok(value) => value,
-                Err(_) => return false,
+            let Ok(metadata) = fs::metadata(path) else {
+                return false;
             };
             let size = metadata.len();
             let modified_ms = metadata
                 .modified()
                 .ok()
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-                .unwrap_or(0);
+                .map_or(0, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
             let path_lower = path.to_string_lossy().to_lowercase();
             match cache.map.get(&path_lower) {
                 Some(doc) if doc.modified_ms == modified_ms && doc.size == size => {
@@ -480,7 +472,7 @@ pub(super) fn content_index_unchanged(
     // Every discovered text file matched the cache (no additions, no changes).
     // The count check catches deletions: if a file in the previous index is gone
     // from disk, `matched` falls short of the cache size and we must rebuild.
-    matched == cache.map.len() as u64
+    matched == u64::try_from(cache.map.len()).unwrap_or(u64::MAX)
 }
 
 pub(super) fn build_index_in_worker(
@@ -523,7 +515,7 @@ pub(super) fn build_index_in_worker(
     let existing_cache = load_existing_index_for_reuse(&active_dir);
     if let Some(cache) = &existing_cache {
         if content_index_unchanged(options, cache, cancel_path) {
-            let doc_count = cache.map.len() as u64;
+            let doc_count = u64::try_from(cache.map.len()).unwrap_or(u64::MAX);
             let now_ms = unix_now_ms();
             let rebuild_schedule = read_search_config_for_state(state_dir)
                 .ok()
@@ -592,8 +584,10 @@ pub(super) fn build_index_in_worker(
         )?;
     }
 
-    let max_content_bytes =
-        (options.max_content_kb.unwrap_or(DEFAULT_MAX_CONTENT_KB) as usize).saturating_mul(1024).max(8 * 1024);
+    let max_content_bytes = usize::try_from(options.max_content_kb.unwrap_or(DEFAULT_MAX_CONTENT_KB))
+        .unwrap_or(usize::MAX)
+        .saturating_mul(1024)
+        .max(8 * 1024);
     // commit_every is intentionally unused in the parallel build — see the
     // comment below where we walk in parallel. Tantivy auto-flushes when its
     // memory budget fills, so we rely on a single final commit instead.
@@ -704,9 +698,9 @@ pub(super) fn build_index_in_worker(
         max_content_bytes,
         extractor_memory_cap,
         &performance_mode,
-        Arc::clone(&should_stop_walker),
-        ocr_env,
-        cache_ctx,
+        &should_stop_walker,
+        &ocr_env,
+        cache_ctx.as_ref(),
     )
     .map_err(|error| {
         let _ = fs::remove_dir_all(staging_dir);
@@ -808,7 +802,7 @@ pub(super) fn build_index_in_worker(
                     return ignore::WalkState::Quit;
                 }
 
-                if current_scanned > MAX_INDEXED_FILES as u64 {
+                if current_scanned > u64::try_from(MAX_INDEXED_FILES).unwrap_or(u64::MAX) {
                     if let Ok(mut guard) = first_error.lock() {
                         if guard.is_none() {
                             *guard =
@@ -819,18 +813,15 @@ pub(super) fn build_index_in_worker(
                     return ignore::WalkState::Quit;
                 }
 
-                let entry = match entry_result {
-                    Ok(value) => value,
-                    Err(_) => {
-                        skipped_files_atomic.fetch_add(1, Ordering::Relaxed);
-                        return ignore::WalkState::Continue;
-                    }
+                let Ok(entry) = entry_result else {
+                    skipped_files_atomic.fetch_add(1, Ordering::Relaxed);
+                    return ignore::WalkState::Continue;
                 };
 
                 let path = entry.path();
                 let file_type = entry.file_type();
-                let is_file = file_type.map(|value| value.is_file()).unwrap_or(false);
-                let is_dir = file_type.map(|value| value.is_dir()).unwrap_or(false);
+                let is_file = file_type.is_some_and(|value| value.is_file());
+                let is_dir = file_type.is_some_and(|value| value.is_dir());
                 if !is_file && !is_dir {
                     return ignore::WalkState::Continue;
                 }
@@ -853,12 +844,9 @@ pub(super) fn build_index_in_worker(
                     return ignore::WalkState::Continue;
                 }
 
-                let metadata = match fs::metadata(path) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        skipped_files_atomic.fetch_add(1, Ordering::Relaxed);
-                        return ignore::WalkState::Continue;
-                    }
+                let Ok(metadata) = fs::metadata(path) else {
+                    skipped_files_atomic.fetch_add(1, Ordering::Relaxed);
+                    return ignore::WalkState::Continue;
                 };
 
                 let file_path = path.to_string_lossy().to_string();
@@ -874,14 +862,12 @@ pub(super) fn build_index_in_worker(
                     .modified()
                     .ok()
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-                    .unwrap_or(0);
+                    .map_or(0, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
                 let created_ms = metadata
                     .created()
                     .ok()
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-                    .unwrap_or(modified_ms);
+                    .map_or(modified_ms, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
 
                 // Reuse-cache check — if this document's (mtime, size) match
                 // the previous index, its already-extracted content is reused
@@ -891,67 +877,64 @@ pub(super) fn build_index_in_worker(
                     .as_ref()
                     .as_ref()
                     .and_then(|cache| reuse_cached_content(cache, &file_path.to_lowercase(), modified_ms, size));
-                match cached {
-                    Some(content) => {
-                        reused_count_atomic.fetch_add(1, Ordering::Relaxed);
-                        let meta = ContentDocMeta {
-                            file_path: &file_path,
-                            file_name: &file_name,
-                            extension: &extension,
-                            entry_type,
-                            size,
-                            modified_ms,
-                            created_ms,
-                        };
-                        if let Err(error) = add_content_document(&writer, fields, &meta, &content) {
-                            if let Ok(mut guard) = first_error.lock() {
-                                if guard.is_none() {
-                                    *guard = Some(error);
-                                }
+                if let Some(content) = cached {
+                    reused_count_atomic.fetch_add(1, Ordering::Relaxed);
+                    let meta = ContentDocMeta {
+                        file_path: &file_path,
+                        file_name: &file_name,
+                        extension: &extension,
+                        entry_type,
+                        size,
+                        modified_ms,
+                        created_ms,
+                    };
+                    if let Err(error) = add_content_document(&writer, fields, &meta, &content) {
+                        if let Ok(mut guard) = first_error.lock() {
+                            if guard.is_none() {
+                                *guard = Some(error);
                             }
-                            should_stop.store(true, Ordering::Relaxed);
-                            return ignore::WalkState::Quit;
                         }
-                        let new_indexed = indexed_files_atomic.fetch_add(1, Ordering::Relaxed) + 1;
-                        report_index_progress(
-                            &status_path,
-                            new_indexed,
-                            &scanned_entries_atomic,
-                            &skipped_files_atomic,
-                            &last_progress,
-                            throttle_ms,
-                        );
+                        should_stop.store(true, Ordering::Relaxed);
+                        return ignore::WalkState::Quit;
                     }
-                    None => {
-                        // Reuse-cache miss — hand the path to the extractor
-                        // pool. `try_send` (not blocking `send`) so a walk
-                        // thread never parks inside a full channel: when the
-                        // pipeline is the bottleneck the walk must still be
-                        // able to notice a cancellation request rather than
-                        // stalling on the send for the whole build.
-                        let mut pending = path.to_path_buf();
-                        loop {
-                            match path_tx.try_send(pending) {
-                                Ok(()) => break,
-                                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
-                                    if should_stop.load(Ordering::Relaxed) || cancel_path.exists() {
-                                        should_stop.store(true, Ordering::Relaxed);
-                                        return ignore::WalkState::Quit;
-                                    }
-                                    pending = returned;
-                                    thread::sleep(Duration::from_millis(20));
-                                }
-                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                                    // The pool's receiver is gone — all extractor
-                                    // children were killed (likely OOM) and the
-                                    // respawn budget was exhausted. Record this
-                                    // separately from a user cancel so the final
-                                    // status write can emit an actionable error
-                                    // instead of a misleading "success".
-                                    pool_died.store(true, Ordering::Relaxed);
+                    let new_indexed = indexed_files_atomic.fetch_add(1, Ordering::Relaxed) + 1;
+                    report_index_progress(
+                        &status_path,
+                        new_indexed,
+                        &scanned_entries_atomic,
+                        &skipped_files_atomic,
+                        &last_progress,
+                        throttle_ms,
+                    );
+                } else {
+                    // Reuse-cache miss — hand the path to the extractor
+                    // pool. `try_send` (not blocking `send`) so a walk
+                    // thread never parks inside a full channel: when the
+                    // pipeline is the bottleneck the walk must still be
+                    // able to notice a cancellation request rather than
+                    // stalling on the send for the whole build.
+                    let mut pending = path.to_path_buf();
+                    loop {
+                        match path_tx.try_send(pending) {
+                            Ok(()) => break,
+                            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                                if should_stop.load(Ordering::Relaxed) || cancel_path.exists() {
                                     should_stop.store(true, Ordering::Relaxed);
                                     return ignore::WalkState::Quit;
                                 }
+                                pending = returned;
+                                thread::sleep(Duration::from_millis(20));
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                // The pool's receiver is gone — all extractor
+                                // children were killed (likely OOM) and the
+                                // respawn budget was exhausted. Record this
+                                // separately from a user cancel so the final
+                                // status write can emit an actionable error
+                                // instead of a misleading "success".
+                                pool_died.store(true, Ordering::Relaxed);
+                                should_stop.store(true, Ordering::Relaxed);
+                                return ignore::WalkState::Quit;
                             }
                         }
                     }
@@ -970,7 +953,9 @@ pub(super) fn build_index_in_worker(
     // do the slow work and outlive it, and nothing else polls the cancel
     // sentinel. Watch it here so a cancel pressed during extraction/indexing is
     // honoured within ~150 ms instead of waiting out the whole backlog.
-    while !should_stop_walker.load(Ordering::Relaxed) && !indexer_handles.iter().all(|handle| handle.is_finished()) {
+    while !should_stop_walker.load(Ordering::Relaxed)
+        && !indexer_handles.iter().all(std::thread::JoinHandle::is_finished)
+    {
         if cancel_path.exists() {
             should_stop_walker.store(true, Ordering::Relaxed);
         } else {
@@ -1038,7 +1023,7 @@ pub(super) fn build_index_in_worker(
     // index over a full one — so there we keep the existing index intact and
     // discard the partial staging (the pre-Phase-2 behavior).
     let prior_active_count = match &*existing_cache {
-        Some(cache) => cache.map.len() as u64,
+        Some(cache) => u64::try_from(cache.map.len()).unwrap_or(u64::MAX),
         None => 0,
     };
     if resumable_interrupt && indexed_files < prior_active_count {
@@ -1102,12 +1087,19 @@ pub(super) fn build_index_in_worker(
         match crate::ocr_cache::gc(&cache_path, crate::ocr_cache::DEFAULT_TTL_DAYS, crate::ocr_cache::DEFAULT_MAX_BYTES)
         {
             Ok(stats) if stats.entries_before > 0 => {
+                #[expect(
+                    clippy::as_conversions,
+                    clippy::cast_precision_loss,
+                    reason = "log line in MB; approximate is fine"
+                )]
+                let (after_mb, before_mb) =
+                    (stats.bytes_after as f64 / 1_048_576.0, stats.bytes_before as f64 / 1_048_576.0);
                 eprintln!(
                     "ocr_cache: GC kept {}/{} entries ({:.1} MB / {:.1} MB), dropped {} TTL + {} LRU",
                     stats.entries_after,
                     stats.entries_before,
-                    stats.bytes_after as f64 / 1_048_576.0,
-                    stats.bytes_before as f64 / 1_048_576.0,
+                    after_mb,
+                    before_mb,
                     stats.ttl_dropped,
                     stats.lru_dropped,
                 );
@@ -1258,7 +1250,7 @@ pub(super) fn build_filename_index_in_worker(
                     return ignore::WalkState::Quit;
                 }
 
-                if current_scanned > MAX_INDEXED_FILES as u64 {
+                if current_scanned > u64::try_from(MAX_INDEXED_FILES).unwrap_or(u64::MAX) {
                     if let Ok(mut guard) = first_error.lock() {
                         if guard.is_none() {
                             *guard = Some(format!(
@@ -1270,18 +1262,15 @@ pub(super) fn build_filename_index_in_worker(
                     return ignore::WalkState::Quit;
                 }
 
-                let entry = match entry_result {
-                    Ok(value) => value,
-                    Err(_) => {
-                        skipped_files_atomic.fetch_add(1, Ordering::Relaxed);
-                        return ignore::WalkState::Continue;
-                    }
+                let Ok(entry) = entry_result else {
+                    skipped_files_atomic.fetch_add(1, Ordering::Relaxed);
+                    return ignore::WalkState::Continue;
                 };
 
                 let path = entry.path();
                 let file_type = entry.file_type();
-                let is_file = file_type.map(|value| value.is_file()).unwrap_or(false);
-                let is_dir = file_type.map(|value| value.is_dir()).unwrap_or(false);
+                let is_file = file_type.is_some_and(|value| value.is_file());
+                let is_dir = file_type.is_some_and(|value| value.is_dir());
                 if !is_file && !is_dir {
                     return ignore::WalkState::Continue;
                 }
@@ -1290,12 +1279,9 @@ pub(super) fn build_filename_index_in_worker(
                     return ignore::WalkState::Continue;
                 }
 
-                let metadata = match fs::metadata(path) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        skipped_files_atomic.fetch_add(1, Ordering::Relaxed);
-                        return ignore::WalkState::Continue;
-                    }
+                let Ok(metadata) = fs::metadata(path) else {
+                    skipped_files_atomic.fetch_add(1, Ordering::Relaxed);
+                    return ignore::WalkState::Continue;
                 };
 
                 let file_path = path.to_string_lossy().to_string();
@@ -1311,14 +1297,12 @@ pub(super) fn build_filename_index_in_worker(
                     .modified()
                     .ok()
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-                    .unwrap_or(0);
+                    .map_or(0, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
                 let created_ms = metadata
                     .created()
                     .ok()
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-                    .unwrap_or(modified_ms);
+                    .map_or(modified_ms, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
                 let parent_path = path.parent().map(|parent| parent.to_string_lossy().to_string()).unwrap_or_default();
 
                 let document = doc!(
@@ -1461,6 +1445,13 @@ pub(super) fn run_index_worker_watch_mode_inner(
     status_path: &Path,
     cancel_path: &Path,
 ) -> Result<(), String> {
+    // Minimum gap between batch applies. Events accumulate in the channel during
+    // this wait and are processed together — fewer index opens, less CPU overall.
+    const MIN_APPLY_INTERVAL_MS: u128 = 5_000;
+    // Periodic full reconciliation, plus the loop-gap above which we assume the
+    // process was suspended (sleep/hibernate) and reconcile immediately.
+    const RECONCILE_INTERVAL_MS: u128 = 6 * 60 * 60 * 1_000;
+    const SLEEP_GAP_THRESHOLD_MS: u128 = 2 * 60 * 1_000;
     let options_bytes =
         fs::read(options_path).map_err(|error| format!("Cannot read watcher worker options: {error}"))?;
     let options: FileSearchIndexOptions = serde_json::from_slice(&options_bytes)
@@ -1483,8 +1474,7 @@ pub(super) fn run_index_worker_watch_mode_inner(
         return Err("Search index is not ready for watching".to_string());
     }
 
-    let indexed_files =
-        read_search_config_for_state(state_dir).ok().flatten().map(|config| config.indexed_files).unwrap_or(0);
+    let indexed_files = read_search_config_for_state(state_dir).ok().flatten().map_or(0, |config| config.indexed_files);
     let strategy = watcher_strategy_for_index_size(indexed_files);
     let notify_roots = options.roots.clone();
 
@@ -1496,10 +1486,10 @@ pub(super) fn run_index_worker_watch_mode_inner(
         if let Ok(ref event) = result {
             use notify::event::ModifyKind;
             match &event.kind {
-                EventKind::Access(_) => return,
-                EventKind::Modify(ModifyKind::Metadata(_)) => return,
-                EventKind::Modify(ModifyKind::Other) => return,
-                EventKind::Any | EventKind::Other => return,
+                EventKind::Access(_)
+                | EventKind::Modify(ModifyKind::Metadata(_) | ModifyKind::Other)
+                | EventKind::Any
+                | EventKind::Other => return,
                 _ => {}
             }
         }
@@ -1524,13 +1514,6 @@ pub(super) fn run_index_worker_watch_mode_inner(
         );
     }
 
-    // Minimum gap between batch applies. Events accumulate in the channel during
-    // this wait and are processed together — fewer index opens, less CPU overall.
-    const MIN_APPLY_INTERVAL_MS: u128 = 5_000;
-    // Periodic full reconciliation, plus the loop-gap above which we assume the
-    // process was suspended (sleep/hibernate) and reconcile immediately.
-    const RECONCILE_INTERVAL_MS: u128 = 6 * 60 * 60 * 1_000;
-    const SLEEP_GAP_THRESHOLD_MS: u128 = 2 * 60 * 1_000;
     let mut last_apply_ms: u128 = 0;
     let mut last_reconcile_ms: u128 = unix_now_ms();
     let mut last_loop_iter_ms: u128 = unix_now_ms();
@@ -1649,7 +1632,7 @@ pub(super) fn collect_watcher_events(
 ) {
     let started_at = unix_now_ms();
     while pending.len() < strategy.max_batch
-        && unix_now_ms().saturating_sub(started_at) < strategy.debounce_ms as u128
+        && unix_now_ms().saturating_sub(started_at) < u128::from(strategy.debounce_ms)
         && !cancel_path.exists()
     {
         match rx.try_recv() {
@@ -1695,7 +1678,7 @@ pub(super) fn reconcile_watched_index(
             }
             let path_lower = path.to_string_lossy().to_lowercase();
             seen.insert(path_lower.clone());
-            let is_file = entry.file_type().map(|file_type| file_type.is_file()).unwrap_or(false);
+            let is_file = entry.file_type().is_some_and(|file_type| file_type.is_file());
             if !is_file {
                 continue;
             }
@@ -1706,8 +1689,7 @@ pub(super) fn reconcile_watched_index(
                 .modified()
                 .ok()
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-                .unwrap_or(0);
+                .map_or(0, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
             let unchanged = cache
                 .map
                 .get(&path_lower)
@@ -1749,8 +1731,11 @@ pub(super) fn apply_watch_batch_to_index(
     // Filter out pure access events (file reads by Windows Search, Defender, etc.)
     // and any other events that can never result in an index change, before we pay
     // the cost of opening the index at all.
-    let events: Vec<Event> =
-        pending.into_iter().filter_map(|r| r.ok()).filter(|e| !matches!(e.kind, EventKind::Access(_))).collect();
+    let events: Vec<Event> = pending
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter(|e| !matches!(e.kind, EventKind::Access(_)))
+        .collect();
 
     if events.is_empty() {
         return Ok((0, 0));
@@ -1765,13 +1750,15 @@ pub(super) fn apply_watch_batch_to_index(
     let mut writer = index
         .writer_with_num_threads(1, WRITER_MEMORY_BUDGET_BYTES_IDLE)
         .map_err(|error| format!("Cannot open watcher search writer: {error}"))?;
-    let max_content_bytes =
-        (options.max_content_kb.unwrap_or(DEFAULT_MAX_CONTENT_KB) as usize).saturating_mul(1024).max(8 * 1024);
+    let max_content_bytes = usize::try_from(options.max_content_kb.unwrap_or(DEFAULT_MAX_CONTENT_KB))
+        .unwrap_or(usize::MAX)
+        .saturating_mul(1024)
+        .max(8 * 1024);
     let mut updated_batch = 0_u64;
     let mut deleted_batch = 0_u64;
 
     for event in events {
-        let (updated, deleted) = apply_watch_event_to_writer(&event, &mut writer, &fields, options, max_content_bytes)?;
+        let (updated, deleted) = apply_watch_event_to_writer(&event, &mut writer, &fields, options, max_content_bytes);
         updated_batch += updated;
         deleted_batch += deleted;
     }

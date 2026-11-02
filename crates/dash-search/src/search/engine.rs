@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) fn ensure_engine_loaded(app: &std::sync::Arc<dyn dash_core::Host>) -> Result<(), String> {
-    if SEARCH_STATUS.lock().map(|status| status.indexing).unwrap_or(false) {
+    if SEARCH_STATUS.lock().is_ok_and(|status| status.indexing) {
         return Err(
             "Search index is rebuilding in an isolated worker. Search will be available when it finishes.".to_string()
         );
@@ -25,28 +25,27 @@ pub(super) fn ensure_engine_loaded(app: &std::sync::Arc<dyn dash_core::Host>) ->
     // Fall back to the last build's options (index-worker-options.json) so the
     // index still loads; the live doc count below corrects indexed_files and we
     // persist a real config so it's not orphaned again next time.
-    let (config, recovered_orphan) = match read_search_config(app)? {
-        Some(config) => (config, false),
-        None => {
-            let state_dir = search_index_dir(app)?;
-            let Some(options) = fs::read(state_dir.join(INDEX_WORKER_OPTIONS_FILE))
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<FileSearchIndexOptions>(&bytes).ok())
-                .and_then(|options| normalize_index_options(options).ok())
-            else {
-                // No config AND no recoverable options — nothing safe to load.
-                return Ok(());
-            };
-            (
-                StoredSearchConfig {
-                    options,
-                    indexed_files: 0,
-                    last_indexed_at_ms: None,
-                    rebuild_schedule: FileSearchRebuildSchedule::default(),
-                },
-                true,
-            )
-        }
+    let (config, recovered_orphan) = if let Some(config) = read_search_config(app)? {
+        (config, false)
+    } else {
+        let state_dir = search_index_dir(app)?;
+        let Some(options) = fs::read(state_dir.join(INDEX_WORKER_OPTIONS_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<FileSearchIndexOptions>(&bytes).ok())
+            .and_then(|options| normalize_index_options(options).ok())
+        else {
+            // No config AND no recoverable options — nothing safe to load.
+            return Ok(());
+        };
+        (
+            StoredSearchConfig {
+                options,
+                indexed_files: 0,
+                last_indexed_at_ms: None,
+                rebuild_schedule: FileSearchRebuildSchedule::default(),
+            },
+            true,
+        )
     };
 
     recover_search_index_dirs(app)?;
@@ -118,16 +117,16 @@ pub(super) fn ensure_engine_loaded(app: &std::sync::Arc<dyn dash_core::Host>) ->
         status.initialized = true;
         status.indexing = false;
         status.watching = watcher_active;
-        status.roots = config.options.roots.clone();
-        status.filename_roots = config.options.filename_roots.clone();
+        status.roots.clone_from(&config.options.roots);
+        status.filename_roots.clone_from(&config.options.filename_roots);
         status.include_hidden = config.options.include_hidden;
         status.index_content = config.options.index_content;
         status.max_content_kb = config.options.max_content_kb.unwrap_or(DEFAULT_MAX_CONTENT_KB);
         status.commit_every = normalize_commit_every(config.options.commit_every);
         status.watcher_enabled = config.options.watcher_enabled;
         status.watcher_paused = config.options.watcher_paused;
-        status.exclude_folders = config.options.exclude_folders.clone();
-        status.exclude_extensions = config.options.exclude_extensions.clone();
+        status.exclude_folders.clone_from(&config.options.exclude_folders);
+        status.exclude_extensions.clone_from(&config.options.exclude_extensions);
         status.rebuild_schedule = config.rebuild_schedule.clone();
         status.indexed_files = indexed_files;
         status.last_indexed_at_ms = config.last_indexed_at_ms;
@@ -220,14 +219,14 @@ pub fn start_file_search_scheduler(app: std::sync::Arc<dyn dash_core::Host>) {
 /// left the index frozen until the next start: start it again. At most
 /// once per scheduler tick, so one that keeps failing can't spin.
 pub(super) fn restart_stopped_watcher(app: &std::sync::Arc<dyn dash_core::Host>) {
-    if worker_process_running(&SEARCH_WATCHER_WORKER) || SEARCH_STATUS.lock().map(|s| s.indexing).unwrap_or(true) {
+    if worker_process_running(&SEARCH_WATCHER_WORKER) || SEARCH_STATUS.lock().map_or(true, |s| s.indexing) {
         return;
     }
     let Ok(Some(config)) = read_search_config(app) else { return };
     if !config.options.watcher_enabled || config.options.watcher_paused {
         return;
     }
-    let indexed_files = SEARCH_STATUS.lock().map(|s| s.indexed_files).unwrap_or(0).max(config.indexed_files);
+    let indexed_files = SEARCH_STATUS.lock().map_or(0, |s| s.indexed_files).max(config.indexed_files);
     if let Err(error) = start_isolated_watch_worker(app, config.options, indexed_files) {
         update_status(|status| status.last_error = Some(error));
     }
@@ -241,12 +240,12 @@ pub(super) fn run_scheduled_file_search_rebuild(app: &std::sync::Arc<dyn dash_co
     if !schedule.enabled || config.options.roots.is_empty() {
         return Ok(());
     }
-    if SEARCH_STATUS.lock().map(|status| status.indexing).unwrap_or(false) {
+    if SEARCH_STATUS.lock().is_ok_and(|status| status.indexing) {
         return Ok(());
     }
 
     let now_ms = unix_now_ms();
-    let interval_ms = (schedule.interval_hours as u128).saturating_mul(60 * 60 * 1000);
+    let interval_ms = u128::from(schedule.interval_hours).saturating_mul(60 * 60 * 1000);
     let reference_ms = schedule.last_scheduled_rebuild_at_ms.or(config.last_indexed_at_ms).unwrap_or(0);
     if reference_ms > 0 && now_ms.saturating_sub(reference_ms) < interval_ms {
         return Ok(());
@@ -258,7 +257,7 @@ pub(super) fn run_scheduled_file_search_rebuild(app: &std::sync::Arc<dyn dash_co
         status.rebuild_schedule = config.rebuild_schedule.clone();
     });
 
-    let _ = start_isolated_index_worker(app.clone(), config.options.clone())?;
+    let _ = start_isolated_index_worker(Arc::clone(app), config.options.clone())?;
     Ok(())
 }
 
@@ -293,8 +292,7 @@ pub(super) fn run_scheduled_filename_index_rebuild(app: &std::sync::Arc<dyn dash
     let active_dir = active_filename_index_dir_for_state(&state_dir);
     let stale = !active_dir.exists()
         || filename_index_last_built_ms(&state_dir)
-            .map(|built| now_ms.saturating_sub(built) >= FILENAME_INDEX_REFRESH_INTERVAL_MS)
-            .unwrap_or(true);
+            .is_none_or(|built| now_ms.saturating_sub(built) >= FILENAME_INDEX_REFRESH_INTERVAL_MS);
     if !stale {
         return Ok(());
     }
@@ -302,7 +300,7 @@ pub(super) fn run_scheduled_filename_index_rebuild(app: &std::sync::Arc<dyn dash
     // In-session anti-thrash: don't re-trigger — or retry a failed build —
     // more than once per refresh interval.
     let last_attempt = FILENAME_INDEX_LAST_REBUILD_MS.load(Ordering::Relaxed);
-    if last_attempt > 0 && now_ms.saturating_sub(last_attempt as u128) < FILENAME_INDEX_REFRESH_INTERVAL_MS {
+    if last_attempt > 0 && now_ms.saturating_sub(u128::from(last_attempt)) < FILENAME_INDEX_REFRESH_INTERVAL_MS {
         return Ok(());
     }
 

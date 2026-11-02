@@ -4,14 +4,14 @@ use super::*;
 
 /// Active / previous / staging directories for the filename index — siblings
 /// of the content index's directories inside the same state directory.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "filename-index scaffolding, wired in step by step")]
 pub(super) fn active_filename_index_dir_for_state(state_dir: &Path) -> PathBuf {
     state_dir.join(FILENAME_INDEX_ACTIVE_DIR)
 }
 
 /// Quality Pass Wave 1 / Option B (2026-05-28): enumerate every FILE
 /// in the active filename index as `lowercase_path → (real_path, size,
-/// modified_ms)`. Used by DuplicateFinder to skip the metadata stat for
+/// modified_ms)`. Used by `DuplicateFinder` to skip the metadata stat for
 /// already-indexed files (10-100x speedup on indexed roots) — the
 /// stored `size` IS the prefilter the duplicate finder builds from
 /// scratch every run.
@@ -20,7 +20,7 @@ pub(super) fn active_filename_index_dir_for_state(state_dir: &Path) -> PathBuf {
 /// opened (corrupt / schema mismatch), or the schema-projection fails.
 /// Caller should fall back to the walker-only path in that case.
 ///
-/// Folders are filtered out via the `entry_type` field — DuplicateFinder
+/// Folders are filtered out via the `entry_type` field — `DuplicateFinder`
 /// works on files only. Lowercase keys because Windows paths are
 /// case-insensitive; the real (case-preserved) path is the value so
 /// downstream code uses the canonical form.
@@ -68,12 +68,12 @@ pub fn enumerate_indexed_file_sizes(state_dir: &Path) -> Option<std::collections
     Some(out)
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "filename-index scaffolding, wired in step by step")]
 pub(super) fn previous_filename_index_dir_for_state(state_dir: &Path) -> PathBuf {
     state_dir.join(FILENAME_INDEX_PREVIOUS_DIR)
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "filename-index scaffolding, wired in step by step")]
 pub(super) fn staging_filename_index_dir_for_state(state_dir: &Path, stamp_ms: u128) -> PathBuf {
     state_dir.join(format!("{FILENAME_STAGING_INDEX_PREFIX}{stamp_ms}"))
 }
@@ -81,12 +81,12 @@ pub(super) fn staging_filename_index_dir_for_state(state_dir: &Path, stamp_ms: u
 /// Schema-version sentinel for the filename index — mirrors the content
 /// index's sentinel but in its own file, so the two indexes version
 /// independently. Reuses `SchemaVersionSentinel`.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "filename-index scaffolding, wired in step by step")]
 pub(super) fn filename_schema_version_path_for_state(state_dir: &Path) -> PathBuf {
     state_dir.join(FILENAME_SCHEMA_VERSION_FILE)
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "filename-index scaffolding, wired in step by step")]
 pub(super) fn write_filename_schema_version_sentinel(state_dir: &Path) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(&SchemaVersionSentinel { version: FILENAME_SCHEMA_VERSION })
         .map_err(|error| format!("Cannot serialize filename schema sentinel: {error}"))?;
@@ -94,7 +94,7 @@ pub(super) fn write_filename_schema_version_sentinel(state_dir: &Path) -> Result
         .map_err(|error| format!("Cannot write filename schema sentinel: {error}"))
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "filename-index scaffolding, wired in step by step")]
 pub(super) fn read_filename_schema_version_sentinel(state_dir: &Path) -> Option<u32> {
     let bytes = fs::read(filename_schema_version_path_for_state(state_dir)).ok()?;
     serde_json::from_slice::<SchemaVersionSentinel>(&bytes).ok().map(|sentinel| sentinel.version)
@@ -482,7 +482,7 @@ pub(super) fn read_search_config_for_state(state_dir: &Path) -> Result<Option<St
 }
 
 pub(super) fn hydrate_status_from_saved_config(app: &std::sync::Arc<dyn dash_core::Host>) {
-    let has_live_engine = SEARCH_ENGINE.lock().map(|guard| guard.is_some()).unwrap_or(false);
+    let has_live_engine = SEARCH_ENGINE.lock().is_ok_and(|guard| guard.is_some());
     if has_live_engine {
         return;
     }
@@ -495,16 +495,16 @@ pub(super) fn hydrate_status_from_saved_config(app: &std::sync::Arc<dyn dash_cor
         if status.indexing || status.initialized {
             return;
         }
-        status.roots = config.options.roots.clone();
-        status.filename_roots = config.options.filename_roots.clone();
+        status.roots.clone_from(&config.options.roots);
+        status.filename_roots.clone_from(&config.options.filename_roots);
         status.include_hidden = config.options.include_hidden;
         status.index_content = config.options.index_content;
         status.max_content_kb = config.options.max_content_kb.unwrap_or(DEFAULT_MAX_CONTENT_KB);
         status.commit_every = normalize_commit_every(config.options.commit_every);
         status.watcher_enabled = config.options.watcher_enabled;
         status.watcher_paused = config.options.watcher_paused;
-        status.exclude_folders = config.options.exclude_folders.clone();
-        status.exclude_extensions = config.options.exclude_extensions.clone();
+        status.exclude_folders.clone_from(&config.options.exclude_folders);
+        status.exclude_extensions.clone_from(&config.options.exclude_extensions);
         status.rebuild_schedule = config.rebuild_schedule.clone();
         status.indexed_files = config.indexed_files;
         status.last_indexed_at_ms = config.last_indexed_at_ms;
@@ -591,7 +591,7 @@ pub(super) fn hydrate_status_from_filename_worker_files(app: &std::sync::Arc<dyn
     // the count is the index's own `num_docs()` (accurate for the MFT and
     // walker engines alike, and it tracks live tailer/watcher edits) and the
     // time is the schema sentinel's mtime.
-    let building = SEARCH_STATUS.lock().map(|status| status.filename_indexing).unwrap_or(false);
+    let building = SEARCH_STATUS.lock().is_ok_and(|status| status.filename_indexing);
     if !building {
         ensure_filename_engine_loaded(app);
         let indexed = filename_index_num_docs();

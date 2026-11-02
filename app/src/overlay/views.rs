@@ -84,7 +84,7 @@ pub(super) fn load_prefs() -> ViewPrefs {
         .unwrap_or_default();
     let text = |key: &str| value.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string();
     ViewPrefs {
-        show_pane: value.get("preview").and_then(|p| p.as_bool()).unwrap_or(true),
+        show_pane: value.get("preview").and_then(serde_json::Value::as_bool).unwrap_or(true),
         search: SearchView::ALL.into_iter().find(|v| v.key() == text("search_view")).unwrap_or(SearchView::Table),
         clipboard: ClipView::ALL.into_iter().find(|v| v.key() == text("clipboard_view")).unwrap_or(ClipView::List),
     }
@@ -172,6 +172,7 @@ impl Overlay {
 
     /// Items per grid row: as many tiles as fit the list's width.
     #[expect(
+        clippy::as_conversions,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "fixed pixel widths over a tile width: a small column count, at least 1"
@@ -193,7 +194,7 @@ impl Overlay {
     /// How far Up / Down move: a row of tiles in a grid.
     pub(super) fn step(&self) -> isize {
         if self.grid_active() {
-            self.grid_cols() as isize
+            isize::try_from(self.grid_cols()).unwrap_or(isize::MAX)
         } else {
             1
         }
@@ -270,13 +271,13 @@ impl Overlay {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                    this.click_clip(ix, event.click_count, window, cx)
+                                    this.click_clip(ix, event.click_count, window, cx);
                                 }),
                             )
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                                    this.clip_right_click(ix, event.position, cx)
+                                    this.clip_right_click(ix, event.position, cx);
                                 }),
                             )
                             .when(clip.image.is_some(), |d| d.child(icon(Icon::Image, 13., theme::muted())))
@@ -361,13 +362,13 @@ impl Overlay {
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                            this.click_clip(ix, event.click_count, window, cx)
+                                            this.click_clip(ix, event.click_count, window, cx);
                                         }),
                                     )
                                     .on_mouse_down(
                                         MouseButton::Right,
                                         cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                                            this.clip_right_click(ix, event.position, cx)
+                                            this.clip_right_click(ix, event.position, cx);
                                         }),
                                     )
                                     .child(body)

@@ -138,21 +138,24 @@ const SCENES: &[(&str, Scene)] = &[
 /// A right-click at `at` (client pixels), sent to this window only.
 #[cfg(windows)]
 #[expect(
+    clippy::as_conversions,
     clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
-    reason = "like MAKELPARAM: each client coordinate goes into 16 bits of the LPARAM"
+    reason = "like MAKELPARAM: each client coordinate goes into 16 bits of the LPARAM \
+              (an isize, which holds any u16 on Windows)"
 )]
 fn right_click(window: &Window, at: (i32, i32)) {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP};
     let Some(hwnd) = window_handle(window) else { return };
     let pos = LPARAM(((at.1 as u16 as isize) << 16) | (at.0 as u16 as isize));
-    // SAFETY: posting to this live window; the messages carry plain values.
-    unsafe {
-        let _ = PostMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), pos);
-        let _ = PostMessageW(hwnd, WM_RBUTTONDOWN, WPARAM(2), pos);
-        let _ = PostMessageW(hwnd, WM_RBUTTONUP, WPARAM(0), pos);
-    }
+    // SAFETY: posting to this live window; the message carries plain values.
+    let _ = unsafe { PostMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), pos) };
+    // SAFETY: posting to this live window; the message carries plain values.
+    let _ = unsafe { PostMessageW(hwnd, WM_RBUTTONDOWN, WPARAM(2), pos) };
+    // SAFETY: posting to this live window; the message carries plain values.
+    let _ = unsafe { PostMessageW(hwnd, WM_RBUTTONUP, WPARAM(0), pos) };
 }
 
 #[cfg(not(windows))]
@@ -161,27 +164,31 @@ fn right_click(_: &Window, _: (i32, i32)) {}
 /// Presses at `from`, moves in steps to `to`, releases (client pixels).
 #[cfg(windows)]
 #[expect(
+    clippy::as_conversions,
     clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
-    reason = "like MAKELPARAM: each client coordinate goes into 16 bits of the LPARAM"
+    reason = "like MAKELPARAM: each client coordinate goes into 16 bits of the LPARAM \
+              (an isize, which holds any u16 on Windows)"
 )]
 fn drag(window: &Window, from: (i32, i32), to: (i32, i32)) {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
+    const LEFT_DOWN: WPARAM = WPARAM(1);
     let Some(hwnd) = window_handle(window) else { return };
     let at = |x: i32, y: i32| LPARAM(((y as u16 as isize) << 16) | (x as u16 as isize));
-    const LEFT_DOWN: WPARAM = WPARAM(1);
-    // SAFETY: posting to this live window; the messages carry plain values.
-    unsafe {
-        let _ = PostMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), at(from.0, from.1));
-        let _ = PostMessageW(hwnd, WM_LBUTTONDOWN, LEFT_DOWN, at(from.0, from.1));
-        for step in 1..=12 {
-            let y = from.1 + (to.1 - from.1) * step / 12;
-            let x = from.0 + (to.0 - from.0) * step / 12;
-            let _ = PostMessageW(hwnd, WM_MOUSEMOVE, LEFT_DOWN, at(x, y));
-        }
-        let _ = PostMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), at(to.0, to.1));
+    // SAFETY: posting to this live window; the message carries plain values.
+    let _ = unsafe { PostMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), at(from.0, from.1)) };
+    // SAFETY: posting to this live window; the message carries plain values.
+    let _ = unsafe { PostMessageW(hwnd, WM_LBUTTONDOWN, LEFT_DOWN, at(from.0, from.1)) };
+    for step in 1..=12 {
+        let y = from.1 + (to.1 - from.1) * step / 12;
+        let x = from.0 + (to.0 - from.0) * step / 12;
+        // SAFETY: posting to this live window; the message carries plain values.
+        let _ = unsafe { PostMessageW(hwnd, WM_MOUSEMOVE, LEFT_DOWN, at(x, y)) };
     }
+    // SAFETY: posting to this live window; the message carries plain values.
+    let _ = unsafe { PostMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), at(to.0, to.1)) };
 }
 
 #[cfg(not(windows))]
@@ -266,20 +273,26 @@ fn show_offscreen((hwnd, scale): (Option<windows::Win32::Foundation::HWND>, f32)
         SWP_SHOWWINDOW,
     };
     let Some(hwnd) = hwnd else { return };
-    #[expect(clippy::cast_possible_truncation, reason = "a window size in pixels at the display scale, far inside i32")]
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "a window size in pixels at the display scale, far inside i32"
+    )]
     let (w, h) = ((1120. * scale) as i32, (620. * scale) as i32);
     let (mut outer, mut client) = (RECT::default(), RECT::default());
-    // SAFETY: `hwnd` is this live window's. Shown first, then sized: GPUI
-    // only follows a size change while the window is visible. The window is
-    // bigger than its content by GPUI's border.
-    unsafe {
-        let _ = SetWindowPos(hwnd, HWND_BOTTOM, -20_000, 0, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_SHOWWINDOW);
-        let _ = GetWindowRect(hwnd, &mut outer);
-        let _ = GetClientRect(hwnd, &mut client);
-        let (extra_w, extra_h) =
-            ((outer.right - outer.left) - client.right, (outer.bottom - outer.top) - client.bottom);
-        let _ = SetWindowPos(hwnd, None, 0, 0, w + extra_w, h + extra_h, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER);
-    }
+    // Shown first, then sized: GPUI only follows a size change while the
+    // window is visible. The window is bigger than its content by GPUI's
+    // border.
+    // SAFETY: `hwnd` is this live window's; plain values only.
+    let _ = unsafe { SetWindowPos(hwnd, HWND_BOTTOM, -20_000, 0, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_SHOWWINDOW) };
+    // SAFETY: `hwnd` is this live window's; `outer` is a local out-param.
+    let _ = unsafe { GetWindowRect(hwnd, &raw mut outer) };
+    // SAFETY: `hwnd` is this live window's; `client` is a local out-param.
+    let _ = unsafe { GetClientRect(hwnd, &raw mut client) };
+    let (extra_w, extra_h) = ((outer.right - outer.left) - client.right, (outer.bottom - outer.top) - client.bottom);
+    // SAFETY: `hwnd` is this live window's; plain values only.
+    let _ =
+        unsafe { SetWindowPos(hwnd, None, 0, 0, w + extra_w, h + extra_h, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER) };
 }
 
 /// The window's own pixels (DWM draws it for us even off-screen) as a PNG.
@@ -295,46 +308,57 @@ fn capture(window: &Window, path: &std::path::Path) -> Result<(), String> {
 
     let hwnd = window_handle(window).ok_or("no window handle")?;
     let mut rect = RECT::default();
-    // SAFETY: all handles are created and released here; `pixels` is as
-    // large as the bitmap GetDIBits copies into it.
-    let pixels = unsafe {
-        GetClientRect(hwnd, &mut rect).map_err(|e| e.to_string())?;
-        let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
-        let (Ok(width), Ok(height)) = (u32::try_from(w), u32::try_from(h)) else {
-            return Err("The window has no size".into());
-        };
-        let screen = GetDC(None);
-        let dc = CreateCompatibleDC(screen);
-        let bitmap = CreateCompatibleBitmap(screen, w, h);
-        let old = SelectObject(dc, bitmap);
-        // PW_CLIENTONLY | PW_RENDERFULLCONTENT: the content only, DirectX /
-        // composition included.
-        let printed = PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(3)).as_bool();
-        let mut info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: u32::try_from(size_of::<BITMAPINFOHEADER>()).expect("BITMAPINFOHEADER is 40 bytes"),
-                biWidth: w,
-                biHeight: -h,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut pixels = vec![0u8; width as usize * height as usize * 4];
-        let lines = GetDIBits(dc, bitmap, 0, height, Some(pixels.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS);
-        SelectObject(dc, old);
-        let _ = DeleteObject(bitmap);
-        let _ = DeleteDC(dc);
-        ReleaseDC(None, screen);
-        if !printed || lines == 0 {
-            return Err("Windows wouldn't copy the window".into());
-        }
-        (width, height, pixels)
+    // All handles are created and released here.
+    // SAFETY: `hwnd` is this live window's; `rect` is a local out-param.
+    unsafe { GetClientRect(hwnd, &raw mut rect) }.map_err(|e| e.to_string())?;
+    let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+    let (Ok(width), Ok(height)) = (u32::try_from(w), u32::try_from(h)) else {
+        return Err("The window has no size".into());
     };
+    // SAFETY: the screen DC, released below.
+    let screen = unsafe { GetDC(None) };
+    // SAFETY: `screen` is live; the DC is deleted below.
+    let dc = unsafe { CreateCompatibleDC(screen) };
+    // SAFETY: `screen` is live; the bitmap is deleted below.
+    let bitmap = unsafe { CreateCompatibleBitmap(screen, w, h) };
+    // SAFETY: `dc` and `bitmap` are ours and live; `old` is put back below.
+    let old = unsafe { SelectObject(dc, bitmap) };
+    // PW_CLIENTONLY | PW_RENDERFULLCONTENT: the content only, DirectX /
+    // composition included.
+    // SAFETY: `hwnd` is this live window's and `dc` is ours.
+    let printed = unsafe { PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(3)) }.as_bool();
+    let mut info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: u32::try_from(size_of::<BITMAPINFOHEADER>()).expect("BITMAPINFOHEADER is 40 bytes"),
+            biWidth: w,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // u32 always fits in usize on Windows.
+    let mut pixels = vec![0u8; usize::try_from(width).unwrap_or(0) * usize::try_from(height).unwrap_or(0) * 4];
+    // SAFETY: `pixels` is as large as the 32-bit, `height`-row bitmap
+    // GetDIBits copies into it; `info` is a local describing that layout.
+    let lines =
+        unsafe { GetDIBits(dc, bitmap, 0, height, Some(pixels.as_mut_ptr().cast()), &raw mut info, DIB_RGB_COLORS) };
+    // SAFETY: puts back the object `dc` had.
+    unsafe { SelectObject(dc, old) };
+    // SAFETY: `bitmap` is ours and no longer selected.
+    let _ = unsafe { DeleteObject(bitmap) };
+    // SAFETY: `dc` is ours.
+    let _ = unsafe { DeleteDC(dc) };
+    // SAFETY: the DC GetDC gave us above.
+    unsafe { ReleaseDC(None, screen) };
+    if !printed || lines == 0 {
+        return Err("Windows wouldn't copy the window".into());
+    }
+    let pixels = (width, height, pixels);
     let (w, h, mut bgra) = pixels;
-    for px in bgra.chunks_exact_mut(4) {
+    for px in bgra.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
         px[3] = 255;
     }

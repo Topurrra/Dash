@@ -1,7 +1,10 @@
 //! Updates from GitHub Releases. Once a day Dash looks for a newer release;
-//! the overlay offers it, and on "Update" the installer is downloaded, its
-//! SHA-256 checked against the `.sha256` file published beside it, and run
-//! silently (it closes Dash, installs, and starts Dash again).
+//! the overlay offers it, and on "Update" this system's package is
+//! downloaded and its SHA-256 checked against the `.sha256` file published
+//! beside it. Windows: the installer runs silently (it closes Dash,
+//! installs, and starts Dash again). macOS: the `.app` inside the `.dmg`
+//! replaces the running one. Linux: the new `AppImage` replaces the running
+//! one. Then Dash starts again.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -10,7 +13,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 const LATEST: &str = "https://api.github.com/repos/Topurrra/Dash/releases/latest";
-const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+const CHECK_EVERY: Duration = Duration::from_hours(24);
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A newer release, as GitHub lists it.
@@ -51,8 +54,7 @@ fn last_check_path() -> PathBuf {
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Whether a day has passed since the last look.
@@ -60,7 +62,7 @@ pub fn due() -> bool {
     let last = std::fs::read(last_check_path())
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| v.get("lastCheckMs").and_then(|m| m.as_u64()))
+        .and_then(|v| v.get("lastCheckMs").and_then(serde_json::Value::as_u64))
         .unwrap_or(0);
     now_ms().saturating_sub(last) >= u64::try_from(CHECK_EVERY.as_millis()).unwrap_or(u64::MAX)
 }
@@ -93,6 +95,19 @@ pub fn check() -> Result<Option<Release>, String> {
     Ok(release_from(&body).filter(|r| newer(&r.version, current_version())))
 }
 
+/// How this system's package name ends (`installer/build.ps1`,
+/// `packaging/macos/make_dmg.sh`, `packaging/linux/make_appimage.sh`).
+fn package_suffix() -> String {
+    let arch = std::env::consts::ARCH;
+    if cfg!(windows) {
+        "_x64-setup.exe".to_string()
+    } else if cfg!(target_os = "macos") {
+        format!("_{arch}.dmg")
+    } else {
+        format!("_{arch}.AppImage")
+    }
+}
+
 /// The parts of GitHub's release JSON an update needs.
 fn release_from(body: &serde_json::Value) -> Option<Release> {
     let version = body.get("tag_name")?.as_str()?.trim_start_matches('v').to_string();
@@ -104,8 +119,9 @@ fn release_from(body: &serde_json::Value) -> Option<Release> {
             .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(name))
             .and_then(|a| a.get("browser_download_url")?.as_str().map(str::to_string))
     };
+    let suffix = package_suffix();
     let installer_name =
-        assets.iter().filter_map(|a| a.get("name")?.as_str()).find(|n| n.ends_with("_x64-setup.exe"))?.to_string();
+        assets.iter().filter_map(|a| a.get("name")?.as_str()).find(|n| n.ends_with(&suffix))?.to_string();
     Some(Release {
         version,
         page,
@@ -143,9 +159,9 @@ pub fn install(release: &Release, progress: impl Fn(u8)) -> Result<(), String> {
         }
         hasher.update(&buf[..n]);
         file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        done += n as u64;
+        done += u64::try_from(n).unwrap_or(0);
         if let Some(total) = total.filter(|t| *t > 0) {
-            progress((done * 100 / total).min(100) as u8);
+            progress(u8::try_from((done * 100 / total).min(100)).unwrap_or(100));
         }
     }
     drop(file);
@@ -165,10 +181,79 @@ fn run_installer(path: &std::path::Path) -> Result<(), String> {
         .map_err(|e| format!("Couldn't start the installer: {e}"))
 }
 
-/// Only Windows has an installer yet: open the release page instead.
+/// Puts the `.app` from the downloaded `.dmg` in place of the running one,
+/// then starts it.
+#[cfg(target_os = "macos")]
+fn run_installer(dmg: &std::path::Path) -> Result<(), String> {
+    use std::process::Command;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // …/Dash.app/Contents/MacOS/dash
+    let bundle = exe
+        .ancestors()
+        .nth(3)
+        .filter(|b| b.extension().is_some_and(|e| e == "app"))
+        .ok_or("This copy of Dash isn't an installed app; get the update from the release page.")?
+        .to_path_buf();
+    let mount = std::env::temp_dir().join("dash-update-mount");
+    let _ = std::fs::create_dir_all(&mount);
+    let attached = Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-readonly", "-mountpoint"])
+        .arg(&mount)
+        .arg(dmg)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !attached.success() {
+        return Err("Couldn't open the downloaded .dmg".into());
+    }
+    let staged = bundle.with_extension("app.new");
+    let _ = std::fs::remove_dir_all(&staged);
+    let copied = Command::new("ditto").arg(mount.join("Dash.app")).arg(&staged).status();
+    let _ = Command::new("hdiutil").arg("detach").arg(&mount).status();
+    if !copied.is_ok_and(|s| s.success()) {
+        let _ = std::fs::remove_dir_all(&staged);
+        return Err("Couldn't copy the new Dash out of the .dmg".into());
+    }
+    let old = bundle.with_extension("app.old");
+    let _ = std::fs::remove_dir_all(&old);
+    std::fs::rename(&bundle, &old).map_err(|e| format!("Couldn't replace Dash: {e}"))?;
+    if let Err(error) = std::fs::rename(&staged, &bundle) {
+        let _ = std::fs::rename(&old, &bundle);
+        return Err(format!("Couldn't replace Dash: {error}"));
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    let _ = std::fs::remove_file(dmg);
+    let mut start = Command::new("open");
+    start.arg("-n").arg(&bundle).arg("--args");
+    restart(start)
+}
+
+/// Puts the downloaded AppImage in place of the running one, then starts it.
+#[cfg(target_os = "linux")]
+fn run_installer(image: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    // Set by the AppImage runtime to the file it was started from.
+    let running = std::env::var_os("APPIMAGE")
+        .map(PathBuf::from)
+        .ok_or("This copy of Dash isn't the AppImage; get the update from the release page.")?;
+    // Next to the running one, so the rename below stays on one disk.
+    let staged = running.with_extension("AppImage.new");
+    std::fs::copy(image, &staged).map_err(|e| format!("Couldn't place the update: {e}"))?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    std::fs::rename(&staged, &running).map_err(|e| format!("Couldn't replace Dash: {e}"))?;
+    let _ = std::fs::remove_file(image);
+    restart(std::process::Command::new(running))
+}
+
+/// Starts the new Dash (it waits for this one to let go of the hotkeys)
+/// and closes this one.
 #[cfg(not(windows))]
-fn run_installer(_: &std::path::Path) -> Result<(), String> {
-    Err("Updates install by hand here: open the release page.".into())
+fn restart(mut start: std::process::Command) -> Result<(), String> {
+    start
+        .args(["--background", crate::host::RESTARTED])
+        .spawn()
+        .map_err(|e| format!("Couldn't start the new Dash: {e}"))?;
+    dash_search::search::stop_all_index_workers();
+    std::process::exit(0);
 }
 
 // ── In the app ───────────────────────────────────────────────────────────
@@ -201,7 +286,7 @@ pub fn start_checks(cx: &mut App) {
                 let _ = cx.update(|cx| offer(Some(Offer::Available(release)), cx));
             }
         }
-        cx.background_executor().timer(Duration::from_secs(60 * 60)).await;
+        cx.background_executor().timer(Duration::from_hours(1)).await;
     })
     .detach();
 }
@@ -233,7 +318,7 @@ pub fn check_now(cx: &mut App, done: impl FnOnce(String, &mut App) + 'static) {
 fn start_install(release: Release, cx: &mut App) {
     offer(Some(Offer::Downloading(release.clone(), 0)), cx);
     let percent = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
-    let seen = percent.clone();
+    let seen = std::sync::Arc::clone(&percent);
     let job = release.clone();
     let task = crate::host::runtime()
         .spawn_blocking(move || install(&job, |p| percent.store(p, std::sync::atomic::Ordering::Relaxed)));
@@ -283,13 +368,7 @@ pub fn render_bar(cx: &App) -> Option<gpui::AnyElement> {
                         .into_any_element(),
                     button("update-later", "Later", false).on_click(|_, _, cx| offer_none(cx)).into_any_element(),
                     button("update-now", "Update", true)
-                        .on_click(move |_, _, cx| {
-                            if cfg!(windows) {
-                                start_install(update.clone(), cx);
-                            } else {
-                                let _ = open_page(&update.page);
-                            }
-                        })
+                        .on_click(move |_, _, cx| start_install(update.clone(), cx))
                         .into_any_element(),
                 ],
             )
@@ -378,18 +457,20 @@ mod tests {
 
     #[test]
     fn release_needs_an_installer_and_its_checksum() {
+        let name = format!("Dash_0.2.0{}", package_suffix());
         let body = serde_json::json!({
             "tag_name": "v0.2.0",
             "html_url": "https://github.com/Topurrra/Dash/releases/tag/v0.2.0",
             "assets": [
-                { "name": "Dash_0.2.0_x64-setup.exe", "browser_download_url": "https://x/setup.exe" },
-                { "name": "Dash_0.2.0_x64-setup.exe.sha256", "browser_download_url": "https://x/setup.exe.sha256" },
+                { "name": "Dash_0.2.0_other.zip", "browser_download_url": "https://x/other.zip" },
+                { "name": name, "browser_download_url": "https://x/package" },
+                { "name": format!("{name}.sha256"), "browser_download_url": "https://x/package.sha256" },
             ]
         });
         let release = release_from(&body).expect("release");
         assert_eq!(release.version, "0.2.0");
-        assert_eq!(release.installer, "https://x/setup.exe");
-        assert_eq!(release.checksum, "https://x/setup.exe.sha256");
+        assert_eq!(release.installer, "https://x/package");
+        assert_eq!(release.checksum, "https://x/package.sha256");
         let mut no_checksum = body.clone();
         no_checksum["assets"].as_array_mut().unwrap().pop();
         assert!(release_from(&no_checksum).is_none(), "no checksum, no update");

@@ -74,7 +74,7 @@ static MODE: std::sync::Mutex<Option<Mode>> = std::sync::Mutex::new(None);
 
 /// The chosen mode (read from disk the first time).
 pub fn mode() -> Mode {
-    let mut slot = MODE.lock().unwrap_or_else(|p| p.into_inner());
+    let mut slot = MODE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     *slot.get_or_insert_with(|| {
         let saved = std::fs::read(mode_path())
             .ok()
@@ -86,7 +86,7 @@ pub fn mode() -> Mode {
 
 /// Chooses `mode` (saved) and applies it with the system's `appearance`.
 pub fn set_mode(mode: Mode, appearance: WindowAppearance) {
-    *MODE.lock().unwrap_or_else(|p| p.into_inner()) = Some(mode);
+    *MODE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mode);
     let path = mode_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -121,67 +121,67 @@ fn pick(dark: u32, light: u32) -> Rgba {
 
 /// The window itself.
 pub fn bg() -> Rgba {
-    pick(0x131316f0, 0xf6f6f8f2)
+    pick(0x1313_16f0, 0xf6f6_f8f2)
 }
 /// The preview pane and other side surfaces.
 pub fn panel() -> Rgba {
-    pick(0xffffff07, 0x00000006)
+    pick(0xffff_ff07, 0x0000_0006)
 }
 /// Buttons, chips, key caps.
 pub fn panel_2() -> Rgba {
-    pick(0xffffff10, 0x0000000d)
+    pick(0xffff_ff10, 0x0000_000d)
 }
 /// A row under the mouse.
 pub fn hover() -> Rgba {
-    pick(0xffffff0a, 0x00000009)
+    pick(0xffff_ff0a, 0x0000_0009)
 }
 /// The selected row.
 pub fn selected() -> Rgba {
-    pick(0xffffff17, 0x00000012)
+    pick(0xffff_ff17, 0x0000_0012)
 }
 /// The scrollbar's thumb (brighter under the mouse: `muted`).
 pub fn scrollbar() -> Rgba {
-    pick(0xffffff30, 0x00000030)
+    pick(0xffff_ff30, 0x0000_0030)
 }
 /// Menus over the content (solid: nothing shows through).
 pub fn menu() -> Rgba {
-    pick(0x232328ff, 0xffffffff)
+    pick(0x2323_28ff, 0xffff_ffff)
 }
 pub fn border() -> Rgba {
-    pick(0xffffff14, 0x00000017)
+    pick(0xffff_ff14, 0x0000_0017)
 }
 pub fn text() -> Rgba {
-    pick(0xececf0ff, 0x1b1b20ff)
+    pick(0xecec_f0ff, 0x1b1b_20ff)
 }
 pub fn text_2() -> Rgba {
-    pick(0xb2b2bbff, 0x494952ff)
+    pick(0xb2b2_bbff, 0x4949_52ff)
 }
 pub fn muted() -> Rgba {
-    pick(0x7c7c87ff, 0x7e7e88ff)
+    pick(0x7c7c_87ff, 0x7e7e_88ff)
 }
 pub fn accent() -> Rgba {
-    pick(0x5b8defff, 0x2f6fe0ff)
+    pick(0x5b8d_efff, 0x2f6f_e0ff)
 }
 /// "All good" (index up to date).
 pub fn success() -> Rgba {
-    pick(0x3fb950ff, 0x1a7f37ff)
+    pick(0x3fb9_50ff, 0x1a7f_37ff)
 }
 /// Something that can't be undone.
 pub fn danger() -> Rgba {
-    pick(0xf85149ff, 0xcf222eff)
+    pick(0xf851_49ff, 0xcf22_2eff)
 }
 /// Selected text (the preview pane).
 pub fn selection() -> Rgba {
-    pick(0x5b8def55, 0x2f6fe040)
+    pick(0x5b8d_ef55, 0x2f6f_e040)
 }
 pub fn accent_soft() -> Rgba {
-    pick(0x5b8def33, 0x2f6fe024)
+    pick(0x5b8d_ef33, 0x2f6f_e024)
 }
 /// The window's outline, drawn by Windows (`0x00BBGGRR`).
 pub fn window_border() -> u32 {
     if LIGHT.load(Ordering::Relaxed) {
-        0x00cfcfcf
+        0x00cf_cfcf
     } else {
-        0x00403a3a
+        0x0040_3a3a
     }
 }

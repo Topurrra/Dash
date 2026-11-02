@@ -68,7 +68,11 @@ pub fn cache_path_for_dir(dir: &Path) -> PathBuf {
 /// full [-127, 127] range is used regardless of the vector's magnitude. The
 /// scale is deliberately NOT stored: cosine is invariant to positive scaling
 /// of each argument, so `cosine(q, i8)` ≈ `cosine(q, f32)`.
-#[expect(clippy::cast_possible_truncation, reason = "each value is rounded and clamped to -127..=127 before the cast")]
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "each value is rounded and clamped to -127..=127 before the cast"
+)]
 fn quantize(vec: &[f32]) -> Vec<i8> {
     let maxabs = vec.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     if maxabs <= 0.0 {
@@ -81,7 +85,7 @@ fn quantize(vec: &[f32]) -> Vec<i8> {
 /// `[u16 dim][u16 chunk_count][i8; dim]…`, little-endian. All chunks must
 /// share one dimension (they do — same model). Empty input → empty output.
 fn pack(chunks: &[Vec<i8>]) -> Vec<u8> {
-    let dim = chunks.first().map(|c| c.len()).unwrap_or(0);
+    let dim = chunks.first().map_or(0, std::vec::Vec::len);
     let (Ok(dim_header), Ok(count_header)) = (u16::try_from(dim), u16::try_from(chunks.len())) else {
         return Vec::new();
     };
@@ -105,15 +109,15 @@ fn unpack(bytes: &[u8]) -> Option<Vec<Vec<i8>>> {
     if bytes.len() < 4 {
         return None;
     }
-    let dim = u16::from_le_bytes(bytes[0..2].try_into().ok()?) as usize;
-    let count = u16::from_le_bytes(bytes[2..4].try_into().ok()?) as usize;
+    let dim = usize::from(u16::from_le_bytes(bytes[0..2].try_into().ok()?));
+    let count = usize::from(u16::from_le_bytes(bytes[2..4].try_into().ok()?));
     if dim == 0 || bytes.len() != 4 + dim * count {
         return None;
     }
     let mut chunks = Vec::with_capacity(count);
     for i in 0..count {
         let start = 4 + i * dim;
-        let chunk: Vec<i8> = bytes[start..start + dim].iter().map(|&b| b as i8).collect();
+        let chunk: Vec<i8> = bytes[start..start + dim].iter().map(|&b| b.cast_signed()).collect();
         chunks.push(chunk);
     }
     Some(chunks)
@@ -157,9 +161,8 @@ pub fn store(db_path: &Path, path: &str, chunks: &[Vec<f32>]) {
     if packed.is_empty() {
         return;
     }
-    let _guard = match VECTOR_CACHE_LOCK.lock() {
-        Ok(g) => g,
-        Err(_) => return,
+    let Ok(_guard) = VECTOR_CACHE_LOCK.lock() else {
+        return;
     };
     let db = match open_db(db_path) {
         Ok(db) => db,
@@ -179,9 +182,8 @@ pub fn store(db_path: &Path, path: &str, chunks: &[Vec<f32>]) {
 /// Wipe the store (called at the start of a full rebuild so vectors for
 /// deleted files don't linger as orphans). Best-effort.
 pub fn clear(db_path: &Path) {
-    let _guard = match VECTOR_CACHE_LOCK.lock() {
-        Ok(g) => g,
-        Err(_) => return,
+    let Ok(_guard) = VECTOR_CACHE_LOCK.lock() else {
+        return;
     };
     let _ = fs::remove_file(db_path);
     if let Ok(mut cache) = DECODE_CACHE.lock() {
@@ -211,9 +213,8 @@ fn read_all(db_path: &Path) -> Vec<ChunkSet> {
     if !db_path.exists() {
         return Vec::new();
     }
-    let db = match open_db(db_path) {
-        Ok(db) => db,
-        Err(_) => return Vec::new(),
+    let Ok(db) = open_db(db_path) else {
+        return Vec::new();
     };
     let mut out = Vec::new();
     if let Ok(read_txn) = db.begin_read() {
@@ -242,7 +243,7 @@ fn cosine_f32_i8(query: &[f32], chunk: &[i8]) -> f32 {
     let mut nq = 0.0f32;
     let mut nc = 0.0f32;
     for i in 0..query.len() {
-        let c = chunk[i] as f32;
+        let c = f32::from(chunk[i]);
         dot += query[i] * c;
         nq += query[i] * query[i];
         nc += c * c;
@@ -262,9 +263,8 @@ pub fn top_k(db_path: &Path, query: &[f32], k: usize) -> Vec<(String, f32)> {
     if query.is_empty() || k == 0 {
         return Vec::new();
     }
-    let _guard = match VECTOR_CACHE_LOCK.lock() {
-        Ok(g) => g,
-        Err(_) => return Vec::new(),
+    let Ok(_guard) = VECTOR_CACHE_LOCK.lock() else {
+        return Vec::new();
     };
     let sets = load_all_cached(db_path);
     let mut scored: Vec<(String, f32)> = sets

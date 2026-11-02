@@ -35,6 +35,9 @@ const MIGRATED_MARKER: &str = "moved-in";
 /// folder, from before the folder was shared) into `shared`, once, replacing
 /// what's there. Only call while holding the owner lock, before any engine
 /// starts. Returns whether anything moved.
+///
+/// # Errors
+/// Returns `Err` if a folder can't be created or an item can't be moved.
 pub fn move_engine_data(old: &Path, shared: &Path) -> Result<bool, String> {
     let marker = shared.join(MIGRATED_MARKER);
     if marker.exists() {

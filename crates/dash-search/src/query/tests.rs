@@ -831,11 +831,11 @@ fn tokenizer() {
 // ---------------------------------------------------------------- performance
 
 #[test]
-#[ignore]
+#[ignore = "benchmark; run by hand"]
 fn perf_one_million_entries() {
     let entries: Vec<T> = (0..1_000_000u64)
         .map(|i| {
-            let ext = ["pdf", "txt", "jpg", "docx", "rs"][(i % 5) as usize];
+            let ext = ["pdf", "txt", "jpg", "docx", "rs"][usize::try_from(i % 5).expect("below 5")];
             let name =
                 if i % 7 == 0 { format!("Отчёт {i}.{ext}") } else { format!("Q{} Report {i}.{ext}", i % 4) };
             f(&format!(r"C:\Users\me\Documents\folder{}\{name}", i % 100)).size(i * 37 % (20 * MB))

@@ -309,7 +309,7 @@ pub(super) fn build_result_item(
 pub struct SensitiveFile {
     pub path: String,
     pub file_name: String,
-    /// Specific finding kinds (e.g. "aws_access_key", "us_ssn"); the universal
+    /// Specific finding kinds (e.g. "`aws_access_key`", "`us_ssn`"); the universal
     /// "sensitive" tag is stripped — callers want the specifics.
     pub kinds: Vec<String>,
 }
@@ -330,6 +330,9 @@ pub struct SensitiveFilesReport {
 /// index time by `sensitive_scan`. Reuses existing index data — NO new
 /// content scan — and is a purely LOCAL read (nothing leaves the machine).
 /// Powers the Privacy Audit's unencrypted-secrets card.
+///
+/// # Errors
+/// When the engine lock fails or the index search does.
 pub fn collect_sensitive_files(
     app: &std::sync::Arc<dyn dash_core::Host>,
     limit: usize,
@@ -438,6 +441,16 @@ pub(super) fn build_content_result_item(
     // match); false on the keyword passes. Flows to `semantic_only` on the item.
     semantic_only: bool,
 ) -> Result<Option<ContentSearchResultItem>, String> {
+    // Snippet building, match counting, and matched-keyword detection each clean
+    // + lowercase + scan the text — and on a large document (multi-hundred-KB
+    // books) doing that several times per result, across every matched file, is
+    // the dominant content-search cost (seconds on a common term like "უფალი"
+    // across big Georgian books). Cap what these per-result text passes scan:
+    // the hit itself already came from the FULL-text index (so no result is
+    // dropped), highlightable matches almost always sit in the document head,
+    // and the depth/coverage ranking signals are log-scaled + clamped, so the
+    // ranking impact of a capped count is negligible. ~5-10× faster on big docs.
+    const SNIPPET_SCAN_CAP_BYTES: usize = 96 * 1024;
     let retrieved = searcher
         .doc::<TantivyDocument>(address)
         .map_err(|error| format!("Cannot load content search document: {error}"))?;
@@ -478,16 +491,7 @@ pub(super) fn build_content_result_item(
         .or_else(|| extract_text_sandboxed(Path::new(&path), max_content_bytes))
         .unwrap_or_default();
 
-    // Snippet building, match counting, and matched-keyword detection each clean
-    // + lowercase + scan the text — and on a large document (multi-hundred-KB
-    // books) doing that several times per result, across every matched file, is
-    // the dominant content-search cost (seconds on a common term like "უფალი"
-    // across big Georgian books). Cap what these per-result text passes scan:
-    // the hit itself already came from the FULL-text index (so no result is
-    // dropped), highlightable matches almost always sit in the document head,
-    // and the depth/coverage ranking signals are log-scaled + clamped, so the
-    // ranking impact of a capped count is negligible. ~5-10× faster on big docs.
-    const SNIPPET_SCAN_CAP_BYTES: usize = 96 * 1024;
+    // Capped to `SNIPPET_SCAN_CAP_BYTES` (see above).
     let scan_text: &str = if content.len() > SNIPPET_SCAN_CAP_BYTES {
         &content[..nearest_char_boundary_before(&content, SNIPPET_SCAN_CAP_BYTES)]
     } else {
@@ -519,9 +523,15 @@ pub(super) fn build_content_result_item(
     // uses; content results have no entry-type filter, so `filter_bonus` is 0.
     let modified_ms = doc_u64(&retrieved, fields.modified_ms).unwrap_or(0);
     let total_keywords = query_keywords.iter().filter(|word| !word.is_empty()).count();
+    #[expect(clippy::as_conversions, clippy::cast_precision_loss, reason = "keyword counts are tiny, exact in f32")]
     let coverage = if total_keywords > 0 { matched_keywords.len() as f32 / total_keywords as f32 } else { 0.0 };
     // 0..1 in-document frequency factor — logarithmic so 200 mentions does not
     // dwarf a precise match in a file with 3.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "a match count in at most 96 KB of text, exact in f32"
+    )]
     let depth = (((match_count as f32) + 1.0).ln() / 6.0).clamp(0.0, 1.0);
     let lexical = (coverage * (0.5 + 0.5 * depth)).clamp(0.0, 1.0);
     let fused_score = crate::rank::fuse(
@@ -769,7 +779,7 @@ pub(super) fn extract_highlighted_snippets(
 }
 
 /// Build a prefix-range query for the content field. Mirrors what main file
-/// search does with file_name/path — when the parser's exact term match
+/// search does with `file_name/path` — when the parser's exact term match
 /// returns nothing for "invest", a range query [invest, invesu) catches
 /// "investment", "investing", "investor" via the FST term dictionary.
 pub(super) fn build_content_prefix_query(query_keywords: &[String], content_field: Field) -> Option<Box<dyn Query>> {
@@ -779,9 +789,8 @@ pub(super) fn build_content_prefix_query(query_keywords: &[String], content_fiel
             continue;
         }
         let lower = keyword.to_lowercase();
-        let upper = match next_lex_prefix(&lower) {
-            Some(s) => s,
-            None => continue,
+        let Some(upper) = next_lex_prefix(&lower) else {
+            continue;
         };
         let lower_term = Term::from_field_text(content_field, &lower);
         let upper_term = Term::from_field_text(content_field, &upper);
@@ -795,7 +804,7 @@ pub(super) fn build_content_prefix_query(query_keywords: &[String], content_fiel
     }
 }
 
-/// FuzzyTermQuery on the content field for edit-distance-1 typo tolerance.
+/// `FuzzyTermQuery` on the content field for edit-distance-1 typo tolerance.
 /// Only applies to tokens long enough that one edit doesn't hit every word.
 pub(super) fn build_content_fuzzy_query(query_keywords: &[String], content_field: Field) -> Option<Box<dyn Query>> {
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
@@ -860,6 +869,7 @@ pub(super) fn size_filter_label(filter: &SizeFilter) -> String {
     }
 }
 
+#[expect(clippy::as_conversions, clippy::cast_precision_loss, reason = "display only, to one decimal place")]
 pub(super) fn format_size_label(bytes: u64) -> String {
     if bytes >= 1024_u64.pow(4) {
         format!("{:.1} TB", bytes as f64 / 1024_u64.pow(4) as f64)
@@ -875,7 +885,7 @@ pub(super) fn format_size_label(bytes: u64) -> String {
 }
 
 pub(super) fn is_empty_folder_path(path: &Path) -> bool {
-    fs::read_dir(path).map(|mut entries| entries.next().is_none()).unwrap_or(false)
+    fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 pub(super) fn parse_year_token(token: &str) -> Option<i32> {

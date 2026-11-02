@@ -107,14 +107,15 @@ impl Table {
 
     /// Footer: "4,512 items · 3 selected · 4 ms".
     pub(super) fn summary(&self) -> String {
+        use std::fmt::Write as _;
         if self.total == 0 {
             return String::new();
         }
         let mut text = plural(self.total);
         if self.sel.count() > 1 {
-            text.push_str(&format!(" · {} selected", thousands(self.sel.count())));
+            let _ = write!(text, " · {} selected", thousands(self.sel.count()));
         }
-        text.push_str(&format!(" · {} ms", self.took_ms));
+        let _ = write!(text, " · {} ms", self.took_ms);
         text
     }
 }
@@ -348,12 +349,11 @@ impl Overlay {
                         this.table.cache.insert(page, r.rows);
                     }
                 }
-                match this.table.cache.rows_at(this.table.sel.indices()) {
-                    Some(rows) => then(this, rows, cx),
-                    None => {
-                        this.table.notice = Some("Couldn't load all the selected rows.".into());
-                        cx.notify();
-                    }
+                if let Some(rows) = this.table.cache.rows_at(this.table.sel.indices()) {
+                    then(this, rows, cx);
+                } else {
+                    this.table.notice = Some("Couldn't load all the selected rows.".into());
+                    cx.notify();
                 }
             });
         })
@@ -675,7 +675,7 @@ impl Overlay {
                                         .map(|e| e.to_string_lossy().to_lowercase())
                                         .unwrap_or_default()
                                 };
-                                row.path = new_path.clone();
+                                row.path.clone_from(&new_path);
                             }
                         }
                         let is_dir = this.table.cache.row(ix).is_some_and(|r| r.is_dir);
@@ -804,7 +804,8 @@ impl Overlay {
                 prompt: Some("Move here".into()),
             });
             cx.spawn(async move |this, cx| {
-                let folder = picked.await.ok().and_then(|r| r.ok()).flatten().and_then(|p| p.into_iter().next());
+                let folder =
+                    picked.await.ok().and_then(std::result::Result::ok).flatten().and_then(|p| p.into_iter().next());
                 let _ = handle.update(cx, |_, window, _| window.activate_window());
                 settings::PICKING.store(false, std::sync::atomic::Ordering::SeqCst);
                 let Some(folder) = folder else { return };
@@ -1058,8 +1059,8 @@ impl Overlay {
             .h(px(row_height))
             .px_3()
             .rounded_md()
-            .when(compact, |d| d.text_xs())
-            .when(!compact, |d| d.text_sm())
+            .when(compact, gpui::Styled::text_xs)
+            .when(!compact, gpui::Styled::text_sm)
             .cursor_pointer()
             .border_1()
             .border_color(ring)
@@ -1072,7 +1073,7 @@ impl Overlay {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    this.row_right_click(ix, event, window, cx)
+                    this.row_right_click(ix, event, window, cx);
                 }),
             )
             .child(div().flex().flex_1().min_w_0().items_center().gap_2().child(icon).child(name))
@@ -1111,12 +1112,7 @@ impl Overlay {
     }
 
     /// Mouse handlers every view's item shares (select, open, drag, menu).
-    fn item_mouse(
-        &self,
-        item: gpui::Stateful<gpui::Div>,
-        ix: usize,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
+    fn item_mouse(item: gpui::Stateful<gpui::Div>, ix: usize, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         item.on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| this.row_mouse_down(ix, event, window, cx)),
@@ -1181,7 +1177,7 @@ impl Overlay {
                     ),
             )
             .child(div().flex_none().text_xs().text_color(theme::muted()).child(meta));
-        self.item_mouse(item, ix, cx).into_any_element()
+        Self::item_mouse(item, ix, cx).into_any_element()
     }
 
     /// Grid view: one row of tiles (`cols` of them), pictures as thumbnails.
@@ -1241,7 +1237,7 @@ impl Overlay {
                             .child(ft::short_name(&row.name, 26))
                             .into_any_element(),
                     });
-                self.item_mouse(item, ix, cx).into_any_element()
+                Self::item_mouse(item, ix, cx).into_any_element()
             })
             .collect();
         div()
@@ -1445,7 +1441,7 @@ fn rename_box(input: Entity<TextInput>, grow: bool) -> gpui::AnyElement {
     div()
         .flex()
         .flex_none()
-        .when(grow, |d| d.flex_1())
+        .when(grow, gpui::Styled::flex_1)
         .w_full()
         .min_w_0()
         .h(px(22.))
@@ -1482,7 +1478,7 @@ mod tests {
         assert_eq!(thousands(0), "0");
         assert_eq!(thousands(999), "999");
         assert_eq!(thousands(1000), "1,000");
-        assert_eq!(thousands(1234567), "1,234,567");
+        assert_eq!(thousands(1_234_567), "1,234,567");
         assert_eq!(plural(1), "1 item");
         assert_eq!(plural(2500), "2,500 items");
     }

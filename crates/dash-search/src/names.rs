@@ -1,5 +1,5 @@
 //! Name search: an in-memory table of every indexed file and folder name
-//! (Everything / FSearch style), read from the filename index and scanned in
+//! (Everything / `FSearch` style), read from the filename index and scanned in
 //! parallel on every keystroke. Each column has a cached sort order, so a
 //! sorted page is a walk over that order keeping the ids that matched.
 //!
@@ -28,13 +28,17 @@ use crate::entry::{Entry, Matcher, NameQueryOptions, NameRow, NameSearchResult, 
 /// Runs a name search (on the owner when this app follows; see `dash_core::link`).
 /// The scan, a first sort and the follower round trip are seconds of blocking
 /// work at worst, so they run on the blocking pool.
+///
+/// # Errors
+/// When the worker fails, a newer search replaced this one (`SUPERSEDED`),
+/// or the owner's (or the fallback) search fails.
 pub async fn search_names(app: Arc<dyn Host>, options: NameQueryOptions) -> Result<NameSearchResult, String> {
-    tokio::task::spawn_blocking(move || search_names_blocking(app, options))
+    tokio::task::spawn_blocking(move || search_names_blocking(&app, &options))
         .await
         .map_err(|error| format!("Name search worker failed: {error}"))?
 }
 
-fn search_names_blocking(app: Arc<dyn Host>, options: NameQueryOptions) -> Result<NameSearchResult, String> {
+fn search_names_blocking(app: &Arc<dyn Host>, options: &NameQueryOptions) -> Result<NameSearchResult, String> {
     if dash_core::link::is_follower() {
         if let Some(result) = dash_core::link::forward("search_names", serde_json::json!({ "options": options })) {
             return result;
@@ -46,13 +50,13 @@ fn search_names_blocking(app: Arc<dyn Host>, options: NameQueryOptions) -> Resul
         Ok(q) => q,
         Err(e) => return Ok(NameSearchResult { error: Some(e), ..Default::default() }),
     };
-    refresh_table(&app);
+    refresh_table(app);
     let table = STATE.table.read().ok().and_then(|guard| guard.clone());
     let Some(table) = table else {
-        return fallback_search(app, &query, &options, started);
+        return fallback_search(app, &query, options, started);
     };
     let hide = hidden_bits(&table);
-    let (total, ids) = table.search(&query, query.is_empty(), &options, hide.as_deref(), &cancel);
+    let (total, ids) = table.search(&query, query.is_empty(), options, hide.as_deref(), &cancel);
     if cancel.is_set() {
         return Err(SUPERSEDED.into());
     }
@@ -213,7 +217,7 @@ fn split_path(path: &str) -> (&str, &str) {
         return ("", path);
     }
     match trimmed.rfind(is_sep) {
-        Some(at) => (&path[..at + 1], &path[at + 1..]),
+        Some(at) => (&path[..=at], &path[at + 1..]),
         None => ("", path),
     }
 }
@@ -225,7 +229,7 @@ impl TableBuilder {
             return false;
         }
         let (prefix, name) = split_path(path);
-        let name = &name[..floor_char_boundary(name, u16::MAX as usize)];
+        let name = &name[..floor_char_boundary(name, usize::from(u16::MAX))];
         // The new id is `items.len()`; ids run 0..len, so len + 1 must fit too.
         let fits = self.fit(self.items.len() + 1).is_some() && self.fit(self.names.len() + name.len()).is_some();
         let (Some(name_start), Some(folder), true) = (self.fit(self.names.len()), self.folder_id(prefix), fits) else {
@@ -310,7 +314,7 @@ impl TableBuilder {
         };
         let mut children = vec![0u32; table.folders.len()];
         for item in &table.items {
-            children[item.folder as usize] += 1;
+            children[ix(item.folder)] += 1;
         }
         // A folder's children are the entries whose prefix is its path + separator.
         let mut key = String::new();
@@ -327,7 +331,7 @@ impl TableBuilder {
                 key.push(if windows_style { '\\' } else { '/' });
             }
             if let Some(&child_folder) = folder_ids.get(key.as_str()) {
-                table.items[i].child_count = children[child_folder as usize];
+                table.items[i].child_count = children[ix(child_folder)];
             }
         }
         drop(folder_ids);
@@ -346,6 +350,11 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
         at -= 1;
     }
     at
+}
+
+/// A `u32` id or offset as an index (lossless on the 32- and 64-bit targets Dash builds for).
+fn ix(v: u32) -> usize {
+    usize::try_from(v).expect("u32 fits in usize")
 }
 
 /// Case-insensitive compare (ASCII fast path).
@@ -376,31 +385,32 @@ impl Table {
 
     fn name(&self, id: usize) -> &str {
         let item = &self.items[id];
-        &self.names[item.name_start as usize..item.name_start as usize + item.name_len as usize]
+        let start = ix(item.name_start);
+        &self.names[start..start + usize::from(item.name_len)]
     }
 
     /// Appends a folder's prefix (`C:\Users\`) by walking up its parents.
     fn push_prefix(&self, folder: u32, buf: &mut String) {
-        let f = &self.folders[folder as usize];
+        let f = &self.folders[ix(folder)];
         if f.parent != NO_FOLDER {
             self.push_prefix(f.parent, buf);
         }
-        let start = f.seg_start as usize;
-        buf.push_str(&self.segments[start..start + f.seg_len as usize]);
+        let start = ix(f.seg_start);
+        buf.push_str(&self.segments[start..start + ix(f.seg_len)]);
     }
 
     /// A folder's path as `Entry::parent` shows it.
     fn parent_string(&self, folder: u32) -> String {
         let mut buf = String::new();
         self.push_prefix(folder, &mut buf);
-        buf.truncate(self.folders[folder as usize].parent_len as usize);
+        buf.truncate(ix(self.folders[ix(folder)].parent_len));
         buf
     }
 
     /// The entry for `id`, its path built into `scratch`.
     fn entry<'a>(&'a self, id: usize, scratch: &'a mut PathScratch) -> Entry<'a> {
         let item = &self.items[id];
-        let folder = &self.folders[item.folder as usize];
+        let folder = &self.folders[ix(item.folder)];
         if scratch.folder == item.folder {
             scratch.buf.truncate(scratch.prefix_len);
         } else {
@@ -414,7 +424,7 @@ impl Table {
         Entry {
             name: self.name(id),
             path: buf.as_str(),
-            parent: &buf[..folder.parent_len as usize],
+            parent: &buf[..ix(folder.parent_len)],
             is_dir: item.is_dir,
             size: item.size,
             modified_ms: item.modified_ms,
@@ -425,7 +435,7 @@ impl Table {
     }
 
     pub(crate) fn row(&self, id: u32) -> NameRow {
-        let id = id as usize;
+        let id = ix(id);
         let item = &self.items[id];
         let name = self.name(id);
         let mut path = String::new();
@@ -446,7 +456,7 @@ impl Table {
     #[cfg(test)]
     fn heap_bytes(&self) -> usize {
         let orders: usize = self.orders.iter().filter_map(|o| o.get()).map(|o| o.capacity() * 4).sum();
-        let rank = self.name_rank.get().map(|r| r.capacity() * 4).unwrap_or(0);
+        let rank = self.name_rank.get().map_or(0, |r| r.capacity() * 4);
         self.names.capacity()
             + self.segments.capacity()
             + self.folders.capacity() * std::mem::size_of::<Folder>()
@@ -460,7 +470,7 @@ impl Table {
             let order = self.order(ORDER_NAME);
             let mut rank = vec![0u32; order.len()];
             for (position, &id) in (0u32..).zip(order) {
-                rank[id as usize] = position;
+                rank[ix(id)] = position;
             }
             rank
         })
@@ -475,7 +485,7 @@ impl Table {
         let item_count = u32::try_from(self.items.len()).expect("TableBuilder::fit keeps item ids within u32");
         let mut ids: Vec<u32> = (0..item_count).collect();
         if slot == ORDER_NAME {
-            ids.par_sort_unstable_by(|&a, &b| cmp_ci(self.name(a as usize), self.name(b as usize)).then(a.cmp(&b)));
+            ids.par_sort_unstable_by(|&a, &b| cmp_ci(self.name(ix(a)), self.name(ix(b))).then(a.cmp(&b)));
             return ids;
         }
         let rank = self.name_rank();
@@ -488,32 +498,28 @@ impl Table {
                     u32::try_from(self.folders.len()).expect("TableBuilder::fit keeps folder ids within u32");
                 let parents: Vec<String> = (0..folder_count).into_par_iter().map(|f| self.parent_string(f)).collect();
                 let mut folders: Vec<u32> = (0..folder_count).collect();
-                folders
-                    .par_sort_unstable_by(|&a, &b| cmp_ci(&parents[a as usize], &parents[b as usize]).then(a.cmp(&b)));
+                folders.par_sort_unstable_by(|&a, &b| cmp_ci(&parents[ix(a)], &parents[ix(b)]).then(a.cmp(&b)));
                 drop(parents);
                 let mut folder_rank = vec![0u32; folders.len()];
                 for (position, &f) in (0u32..).zip(&folders) {
-                    folder_rank[f as usize] = position;
+                    folder_rank[ix(f)] = position;
                 }
                 ids.par_sort_unstable_by_key(|&id| {
-                    ((folder_rank[items[id as usize].folder as usize] as u64) << 32) | rank[id as usize] as u64
+                    (u64::from(folder_rank[ix(items[ix(id)].folder)]) << 32) | u64::from(rank[ix(id)])
                 });
             }
-            ORDER_SIZE => ids.par_sort_unstable_by_key(|&id| (items[id as usize].size, rank[id as usize])),
-            ORDER_MODIFIED => ids.par_sort_unstable_by_key(|&id| (items[id as usize].modified_ms, rank[id as usize])),
+            ORDER_SIZE => ids.par_sort_unstable_by_key(|&id| (items[ix(id)].size, rank[ix(id)])),
+            ORDER_MODIFIED => ids.par_sort_unstable_by_key(|&id| (items[ix(id)].modified_ms, rank[ix(id)])),
             _ => {
                 // Type: folders first, then extension, then name.
                 ids.par_sort_unstable_by(|&a, &b| {
-                    let (ia, ib) = (&items[a as usize], &items[b as usize]);
+                    let (ia, ib) = (&items[ix(a)], &items[ix(b)]);
                     ib.is_dir
                         .cmp(&ia.is_dir)
                         .then_with(|| {
-                            cmp_ci(
-                                extension_of(self.name(a as usize), ia.is_dir),
-                                extension_of(self.name(b as usize), ib.is_dir),
-                            )
+                            cmp_ci(extension_of(self.name(ix(a)), ia.is_dir), extension_of(self.name(ix(b)), ib.is_dir))
                         })
-                        .then(rank[a as usize].cmp(&rank[b as usize]))
+                        .then(rank[ix(a)].cmp(&rank[ix(b)]))
                 });
             }
         }
@@ -586,7 +592,7 @@ impl Table {
                 let mut bits = bits.unwrap_or_else(|| all_bits(self.items.len()));
                 let mut total = total;
                 for (word, hidden) in bits.iter_mut().zip(hide) {
-                    total -= (*word & hidden).count_ones() as usize;
+                    total -= ix((*word & hidden).count_ones());
                     *word &= !hidden;
                 }
                 (Some(bits), total)
@@ -621,7 +627,7 @@ impl Table {
         for (w, &word) in bits.iter().enumerate() {
             let mut word = word;
             while word != 0 {
-                let id = w * 64 + word.trailing_zeros() as usize;
+                let id = w * 64 + ix(word.trailing_zeros());
                 ids.push(u32::try_from(id).expect("a set bit is an item id, which fits in u32"));
                 word &= word - 1;
             }
@@ -629,20 +635,21 @@ impl Table {
         let mut keys: Vec<u64> = ids
             .par_iter()
             .map_init(String::new, |lower, &id| {
-                let name = self.name(id as usize);
+                let name = self.name(ix(id));
                 lower.clear();
                 lower.extend(name.chars().flat_map(char::to_lowercase));
-                let tier = needles.iter().map(|n| match_tier(lower, n)).min().unwrap_or(4) as u64;
-                let item = &self.items[id as usize];
+                let tier = u64::from(needles.iter().map(|n| match_tier(lower, n)).min().unwrap_or(4));
+                let item = &self.items[ix(id)];
                 (tier << 60)
-                    | ((item.name_len.min(0xFFF) as u64) << 48)
-                    | ((!item.is_dir as u64) << 32)
-                    | rank[id as usize] as u64
+                    | (u64::from(item.name_len.min(0xFFF)) << 48)
+                    | (u64::from(!item.is_dir) << 32)
+                    | u64::from(rank[ix(id)])
             })
             .collect();
         keys.par_sort_unstable();
         let order = self.order(ORDER_NAME);
-        let pick = |key: &u64| order[(*key & 0xFFFF_FFFF) as usize];
+        // The low 32 bits are the name rank (see the key above).
+        let pick = |key: &u64| order[usize::try_from(*key & 0xFFFF_FFFF).expect("masked to 32 bits")];
         if options.descending {
             keys.iter().rev().skip(options.offset).take(options.limit).map(pick).collect()
         } else {
@@ -682,6 +689,7 @@ static GONE: LazyLock<Mutex<Gone>> = LazyLock::new(Mutex::default);
 /// Leaves `paths` (and what's inside them) out of name search until the
 /// index no longer has them or they exist again (on the owner when this app
 /// follows).
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn forget_paths(paths: Vec<String>) {
     if dash_core::link::is_follower() {
         let forwarded: Option<Result<(), String>> =
@@ -738,7 +746,7 @@ fn hidden_bits(table: &Arc<Table>) -> Option<Vec<u64>> {
     if gone.paths.is_empty() {
         return None;
     }
-    let key = Arc::as_ptr(table) as usize;
+    let key = Arc::as_ptr(table).addr();
     if gone.table != key {
         gone.paths.retain(|p| !std::path::Path::new(p).exists());
         let matcher = UnderGone { paths: &gone.paths, found: Mutex::default() };
@@ -765,7 +773,7 @@ fn page_of_order(order: &[u32], bits: Option<&[u64]>, descending: bool, offset: 
             order[start..end].to_vec()
         };
     };
-    let hit = |id: &&u32| bits[(**id / 64) as usize] & (1 << (**id % 64)) != 0;
+    let hit = |id: &&u32| bits[ix(**id / 64)] & (1 << (**id % 64)) != 0;
     if descending {
         order.iter().rev().filter(hit).skip(offset).take(limit).copied().collect()
     } else {
@@ -809,7 +817,7 @@ fn match_tier(name_lower: &str, needle: &str) -> u8 {
     for (at, _) in name_lower.match_indices(needle) {
         found = true;
         let before = name_lower[..at].chars().next_back();
-        if before.map(|c| !c.is_alphanumeric()).unwrap_or(true) {
+        if before.is_none_or(|c| !c.is_alphanumeric()) {
             return 2;
         }
     }
@@ -875,7 +883,7 @@ fn refresh_table(app: &Arc<dyn Host>) {
     if STATE.building.swap(true, AtomicOrdering::AcqRel) {
         return;
     }
-    let app = app.clone();
+    let app = Arc::clone(app);
     // Clears `building` however the build ends, a panic included, so a
     // failed build can't leave name search on the fallback for good.
     let building = BuildingFlag;
@@ -888,7 +896,7 @@ fn refresh_table(app: &Arc<dyn Host>) {
         let table = fingerprint.map(|fp| Arc::new(builder.finish(fp)));
         if let Some(table) = &table {
             if let Ok(mut slot) = STATE.table.write() {
-                *slot = Some(table.clone());
+                *slot = Some(Arc::clone(table));
             }
         }
         if let Ok(mut last) = STATE.last_build.lock() {
@@ -928,7 +936,7 @@ fn is_current(table: &Arc<Table>) -> bool {
 /// Runs on the caller's (blocking) thread, so it calls the blocking search
 /// directly; a follower already forwarded above.
 fn fallback_search(
-    app: Arc<dyn Host>,
+    app: &Arc<dyn Host>,
     query: &crate::query::Query,
     options: &NameQueryOptions,
     started: Instant,
@@ -938,7 +946,7 @@ fn fallback_search(
     }
     let found = crate::search::search_local_files_inner(
         app,
-        crate::search::FileSearchQueryOptions {
+        &crate::search::FileSearchQueryOptions {
             query: options.query.clone(),
             limit: Some(200),
             offset: None,
@@ -1118,8 +1126,10 @@ mod tests {
             b.push(path, dir, 0, 0, 0);
         }
         let t = b.finish(0);
+        // Another case finds the folder only where paths ignore case.
+        let folder = if cfg!(windows) { r"C:\A\" } else { r"C:\a\" };
         let paths: std::collections::HashSet<String> =
-            [gone_key(r"C:\A\"), gone_key(r"C:\missing.txt")].into_iter().collect();
+            [gone_key(folder), gone_key(r"C:\missing.txt")].into_iter().collect();
         let matcher = UnderGone { paths: &paths, found: Mutex::default() };
         let (hide, hidden) = t.match_bits(&matcher, &Cancel::NEVER);
         // C:\a, both files inside it; not C:\ab.txt (same prefix, other name).
@@ -1297,8 +1307,18 @@ mod tests {
     /// 1M synthetic entries: build, scans, cached-order pages.
     /// `cargo test --release -p dash-search names -- --ignored --nocapture`
     #[test]
-    #[ignore]
+    #[ignore = "benchmark; run by hand"]
+    #[expect(clippy::as_conversions, clippy::cast_precision_loss, reason = "bench output: approximate bytes per entry")]
     fn bench_one_million() {
+        use std::fmt::Write as _;
+
+        /// Allocation-free ASCII case-insensitive substring test.
+        struct AsciiContains(&'static [u8]);
+        impl Matcher for AsciiContains {
+            fn matches(&self, entry: &Entry) -> bool {
+                entry.name.as_bytes().windows(self.0.len()).any(|w| w.eq_ignore_ascii_case(self.0))
+            }
+        }
         let words = ["report", "photo", "invoice", "notes", "draft", "budget", "Résumé", "backup", "music", "video"];
         let exts = ["pdf", "jpg", "docx", "txt", "mp4", "rs", "png", "xlsx"];
         let started = Instant::now();
@@ -1314,12 +1334,8 @@ mod tests {
                     path.clear();
                     path.push_str(&folder);
                     path.push('\\');
-                    path.push_str(&format!(
-                        "{} {} {f}.{}",
-                        words[(f * 7 + sub) % words.len()],
-                        n % 997,
-                        exts[f % exts.len()]
-                    ));
+                    write!(path, "{} {} {f}.{}", words[(f * 7 + sub) % words.len()], n % 997, exts[f % exts.len()])
+                        .expect("writing to a String can't fail");
                     b.push(&path, false, n * 37 % 100_000, n * 7919 % 1_000_000, n);
                     n += 1;
                     if n >= 1_000_000 {
@@ -1358,13 +1374,6 @@ mod tests {
         let (total, _) =
             table.search(&Everything, true, &opts("", SortKey::Path, true, 500_000, 100), None, &Cancel::NEVER);
         println!("empty query, Path desc page @500k: {total} total, {:?}", t.elapsed());
-        /// Allocation-free ASCII case-insensitive substring test.
-        struct AsciiContains(&'static [u8]);
-        impl Matcher for AsciiContains {
-            fn matches(&self, entry: &Entry) -> bool {
-                entry.name.as_bytes().windows(self.0.len()).any(|w| w.eq_ignore_ascii_case(self.0))
-            }
-        }
         let t = Instant::now();
         let (bits, hits) = table.match_bits(&AsciiContains(b"report"), &Cancel::NEVER);
         println!("scan only (alloc-free matcher): {hits} hits, {:?}", t.elapsed());
@@ -1373,10 +1382,11 @@ mod tests {
         println!("sorted page fetch from cached order: {} rows, {:?}", ids.len(), t.elapsed());
     }
 
-    /// Real data: set DASH_NAMES_REAL_INDEX to a COPY of the filename index
+    /// Real data: set `DASH_NAMES_REAL_INDEX` to a COPY of the filename index
     /// (opened read-only, but don't point it at the live one).
     #[test]
-    #[ignore]
+    #[ignore = "benchmark on a real index; run by hand"]
+    #[expect(clippy::as_conversions, clippy::cast_precision_loss, reason = "bench output: approximate bytes per entry")]
     fn bench_real_index() {
         let Ok(dir) = std::env::var("DASH_NAMES_REAL_INDEX") else {
             println!("DASH_NAMES_REAL_INDEX not set; skipped");

@@ -61,14 +61,12 @@ pub(super) fn upsert_filename_document(
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
+        .map_or(0, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
     let created_ms = metadata
         .created()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(modified_ms);
+        .map_or(modified_ms, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
 
     delete_filename_doc(writer, fields, &file_path);
     let document = doc!(
@@ -132,7 +130,7 @@ pub(super) fn apply_filename_watch_event(
                 }
             }
         }
-        _ => {}
+        EventKind::Access(_) => {}
     }
     (updated, deleted)
 }
@@ -147,7 +145,7 @@ pub(super) fn apply_filename_watch_batch(
 ) -> Result<(u64, u64), String> {
     let events: Vec<Event> = pending
         .into_iter()
-        .filter_map(|result| result.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|event| !matches!(event.kind, EventKind::Access(_)))
         .collect();
     if events.is_empty() {
@@ -189,7 +187,7 @@ pub(super) fn apply_filename_watch_batch(
 /// `.gitignore` / `.ignore` files exclude — right for the content index
 /// (no point reading build output), wrong for the name index, which should
 /// find every name. Hidden entries follow the setting. Never follows links
-/// (see FileSearchStatus). `standard_filters` must come first: it also turns
+/// (see `FileSearchStatus`). `standard_filters` must come first: it also turns
 /// hidden-skipping on, which used to override the setting.
 pub(super) fn index_walker(root: &str, options: &FileSearchIndexOptions, honour_ignore_files: bool) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
@@ -286,8 +284,8 @@ pub(super) fn reconcile_filename_index(
                 continue;
             }
             let file_type = entry.file_type();
-            let is_file = file_type.map(|value| value.is_file()).unwrap_or(false);
-            let is_dir = file_type.map(|value| value.is_dir()).unwrap_or(false);
+            let is_file = file_type.is_some_and(|value| value.is_file());
+            let is_dir = file_type.is_some_and(|value| value.is_dir());
             if !is_file && !is_dir {
                 continue;
             }
@@ -307,8 +305,7 @@ pub(super) fn reconcile_filename_index(
                         .modified()
                         .ok()
                         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                        .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-                        .unwrap_or(0);
+                        .map_or(0, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
                     disk_modified != *modified_ms || meta.len() != *size
                 }
             };
@@ -354,6 +351,13 @@ pub(super) fn watch_filename_index(
     status_path: &Path,
     cancel_path: &Path,
 ) -> Result<(), String> {
+    // Minimum gap between batch applies — events accumulate in the channel
+    // during the wait so each apply opens the index once for many changes.
+    const MIN_APPLY_INTERVAL_MS: u128 = 5_000;
+    // Periodic full reconciliation, plus an immediate one when the loop gap
+    // implies the process was suspended (sleep/hibernate dropped events).
+    const RECONCILE_INTERVAL_MS: u128 = 6 * 60 * 60 * 1_000;
+    const SLEEP_GAP_THRESHOLD_MS: u128 = 2 * 60 * 1_000;
     if cancel_path.exists() || !options.watcher_enabled {
         return Ok(());
     }
@@ -386,10 +390,10 @@ pub(super) fn watch_filename_index(
         if let Ok(ref event) = result {
             use notify::event::ModifyKind;
             match &event.kind {
-                EventKind::Access(_) => return,
-                EventKind::Modify(ModifyKind::Metadata(_)) => return,
-                EventKind::Modify(ModifyKind::Other) => return,
-                EventKind::Any | EventKind::Other => return,
+                EventKind::Access(_)
+                | EventKind::Modify(ModifyKind::Metadata(_) | ModifyKind::Other)
+                | EventKind::Any
+                | EventKind::Other => return,
                 _ => {}
             }
         }
@@ -408,13 +412,6 @@ pub(super) fn watch_filename_index(
     }
 
     let strategy = WatcherStrategy { name: "filename watcher", debounce_ms: 2_000, max_batch: 1_024 };
-    // Minimum gap between batch applies — events accumulate in the channel
-    // during the wait so each apply opens the index once for many changes.
-    const MIN_APPLY_INTERVAL_MS: u128 = 5_000;
-    // Periodic full reconciliation, plus an immediate one when the loop gap
-    // implies the process was suspended (sleep/hibernate dropped events).
-    const RECONCILE_INTERVAL_MS: u128 = 6 * 60 * 60 * 1_000;
-    const SLEEP_GAP_THRESHOLD_MS: u128 = 2 * 60 * 1_000;
     let mut last_apply_ms: u128 = 0;
     let mut last_reconcile_ms: u128 = unix_now_ms();
     let mut last_loop_iter_ms: u128 = unix_now_ms();
@@ -479,9 +476,8 @@ pub(super) fn watch_filename_index(
         // A failed apply is not a build failure — the index is already built
         // and valid. Stop watching cleanly and let the scheduled rebuild
         // resume as the backstop rather than marking the whole build failed.
-        let (updated_batch, deleted_batch) = match apply_filename_watch_batch(&active_dir, options, pending) {
-            Ok(counts) => counts,
-            Err(_) => return Ok(()),
+        let Ok((updated_batch, deleted_batch)) = apply_filename_watch_batch(&active_dir, options, pending) else {
+            return Ok(());
         };
         last_apply_ms = unix_now_ms();
         if updated_batch == 0 && deleted_batch == 0 {

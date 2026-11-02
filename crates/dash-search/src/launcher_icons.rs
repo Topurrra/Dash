@@ -16,9 +16,8 @@
 //!
 //! Used by the overlay's results.
 //!
-//! Non-Windows targets always return Ok(None) so this file compiles cleanly
-//! cross-platform without disabling the command entirely. macOS/Linux support
-//! is planned but explicitly deferred.
+//! macOS (`launcher_icons/macos.rs`) asks `NSWorkspace`; Linux
+//! (`launcher_icons/linux.rs`) looks in the freedesktop icon themes.
 
 use std::collections::HashSet;
 use std::fs;
@@ -66,7 +65,7 @@ fn hash_path(path: &str) -> String {
 /// Sanitize an extension for use as a filename component. Keeps it ASCII
 /// alphanumeric and bounded — defense against weird/long extensions.
 fn sanitize_extension(ext: &str) -> String {
-    ext.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect::<String>().to_lowercase()
+    ext.chars().filter(char::is_ascii_alphanumeric).take(8).collect::<String>().to_lowercase()
 }
 
 /// Decide cache filename + classify how to extract.
@@ -104,9 +103,9 @@ struct Classification {
 enum ExtractMode {
     /// Extract from the real path on disk (apps).
     RealPath,
-    /// Generic folder icon — SHGFI_USEFILEATTRIBUTES + FILE_ATTRIBUTE_DIRECTORY.
+    /// Generic folder icon — `SHGFI_USEFILEATTRIBUTES` + `FILE_ATTRIBUTE_DIRECTORY`.
     Folder,
-    /// Generic icon for an extension — SHGFI_USEFILEATTRIBUTES + FILE_ATTRIBUTE_NORMAL
+    /// Generic icon for an extension — `SHGFI_USEFILEATTRIBUTES` + `FILE_ATTRIBUTE_NORMAL`
     /// with a dummy path like "x.docx".
     Extension(String),
     /// Packaged (MSIX / Store) app — no file to stat, so the icon comes from
@@ -120,12 +119,16 @@ enum ExtractMode {
 /// `kind` should be one of "app" | "folder" | "file" | None. When None we treat
 /// the path as a unique app (safe fallback). Frontend passes the actual kind
 /// based on result type so we cache efficiently.
+///
+/// # Errors
+/// When the icon cache folder can't be found or the icon can't be written.
 // `(async)` so each extraction runs on a Tauri worker thread, NOT the main/UI
 // thread. The palette fans out dozens of icon requests on first (cold-cache)
 // open; as a sync command these serialized on the main thread and froze the UI
 // while SHGetFileInfoW did its work. Off-thread, the bounded blocking pool
 // resolves them in the background and icons fade in. (COM is initialized per
 // worker thread inside extract_icon_png, since SHGetFileInfoW requires it.)
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn ensure_launcher_icon(app: Arc<dyn Host>, path: String, kind: Option<String>) -> Result<Option<String>, String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -182,17 +185,40 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos::extract_icon_png;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux::extract_icon_png;
+
+/// Icons are made at this size on macOS / Linux (sharp at 2x in the
+/// overlay's rows).
 #[cfg(not(windows))]
-fn extract_icon_png(_path: &str, _mode: &ExtractMode) -> Option<Vec<u8>> {
-    // macOS/Linux planned but not implemented yet. The frontend renders a
-    // Lucide fallback icon in this case.
-    None
+const ICON_PX: u32 = 64;
+
+/// `image` as a PNG, scaled to `ICON_PX` if it's another size.
+#[cfg(not(windows))]
+fn png_of(image: &image::RgbaImage) -> Option<Vec<u8>> {
+    let scaled;
+    let image = if image.dimensions() == (ICON_PX, ICON_PX) {
+        image
+    } else {
+        scaled = image::imageops::resize(image, ICON_PX, ICON_PX, image::imageops::FilterType::Lanczos3);
+        &scaled
+    };
+    let mut png = Vec::new();
+    image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+    Some(png)
 }
 
 /// Resolve a Windows .lnk shortcut to its target path so we extract the
 /// icon from the real executable rather than the shortcut file.
 ///
-/// Why this matters: when SHGetFileInfoW is given a `.lnk` path, Windows
+/// Why this matters: when `SHGetFileInfoW` is given a `.lnk` path, Windows
 /// returns the target's icon *with the shell shortcut-arrow overlay baked
 /// in*. That made every Start-Menu-launched app in our overlay results
 /// render with a small arrow badge — visual noise that didn't match the
@@ -208,7 +234,7 @@ fn extract_icon_png(_path: &str, _mode: &ExtractMode) -> Option<Vec<u8>> {
 ///   - the resolved target doesn't actually exist on disk
 ///
 /// Pure-Rust + filesystem-only — no shell COM, no network, no spawned
-/// processes. parselnk reads the binary header + LinkInfo / StringData
+/// processes. parselnk reads the binary header + `LinkInfo` / `StringData`
 /// blocks and we pick the first viable path candidate.
 #[cfg(windows)]
 pub fn resolve_lnk_target(path: &str) -> Option<String> {
@@ -261,20 +287,20 @@ pub fn resolve_lnk_full(path: &str) -> Option<(String, Option<String>)> {
 }
 
 /// Windows implementation. Three modes branch on what we ask the shell for:
-///   - RealPath          → no USEFILEATTRIBUTES; the real app's embedded icon
-///   - Folder            → USEFILEATTRIBUTES + FILE_ATTRIBUTE_DIRECTORY
-///   - Extension(ext)    → USEFILEATTRIBUTES + FILE_ATTRIBUTE_NORMAL + dummy path
+///   - `RealPath`          → no USEFILEATTRIBUTES; the real app's embedded icon
+///   - Folder            → USEFILEATTRIBUTES + `FILE_ATTRIBUTE_DIRECTORY`
+///   - Extension(ext)    → USEFILEATTRIBUTES + `FILE_ATTRIBUTE_NORMAL` + dummy path
 ///
 /// Pipeline:
-///   path -> SHGetFileInfoW -> HICON
-///        -> GetIconInfo -> ICONINFO (hbmColor / hbmMask)
-///        -> GetObjectW on hbmColor -> BITMAP (width, height)
-///        -> GetDIBits -> BGRA pixel buffer
+///   path -> `SHGetFileInfoW` -> HICON
+///        -> `GetIconInfo` -> ICONINFO (hbmColor / hbmMask)
+///        -> `GetObjectW` on hbmColor -> BITMAP (width, height)
+///        -> `GetDIBits` -> BGRA pixel buffer
 ///        -> swap BGRA->RGBA, fix all-zero alpha as opaque
 ///        -> encode as PNG via the `image` crate
-///        -> DestroyIcon for cleanup
+///        -> `DestroyIcon` for cleanup
 ///
-/// `.lnk` resolution: in RealPath mode, shortcuts are pre-resolved to their
+/// `.lnk` resolution: in `RealPath` mode, shortcuts are pre-resolved to their
 /// target path (see `resolve_lnk_target`) so the returned icon doesn't carry
 /// the shell shortcut-arrow overlay.
 #[cfg(windows)]
@@ -301,7 +327,7 @@ fn extract_icon_png(path: &str, mode: &ExtractMode) -> Option<Vec<u8>> {
         // init per thread is correct and effectively leak-free.
         static COM_INIT: () = unsafe { let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); };
     }
-    COM_INIT.with(|_| {});
+    COM_INIT.with(|()| {});
 
     // Packaged apps: prefer the real exe's embedded icon, which fills its canvas
     // like every classic app's does. Only fall back to the shell's tile image if
@@ -349,22 +375,24 @@ fn extract_icon_png(path: &str, mode: &ExtractMode) -> Option<Vec<u8>> {
 
     let wide: Vec<u16> = query_string.encode_utf16().chain(std::iter::once(0)).collect();
 
-    // SAFETY: SHGetFileInfoW writes into our zeroed SHFILEINFOW; we DestroyIcon
-    // the resulting hIcon before returning regardless of conversion success.
-    let icon: HICON = unsafe {
-        let mut info: SHFILEINFOW = std::mem::zeroed();
-        let result = SHGetFileInfoW(
+    // We DestroyIcon the resulting hIcon before returning regardless of
+    // conversion success.
+    let mut info = SHFILEINFOW::default();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; SHGetFileInfoW
+    // writes into `info`, whose size we pass.
+    let result = unsafe {
+        SHGetFileInfoW(
             PCWSTR(wide.as_ptr()),
             attrs,
-            Some(&mut info),
+            Some(&raw mut info),
             u32::try_from(std::mem::size_of::<SHFILEINFOW>()).expect("SHFILEINFOW is under 1 KB"),
             flags,
-        );
-        if result == 0 || info.hIcon.is_invalid() {
-            return None;
-        }
-        info.hIcon
+        )
     };
+    if result == 0 || info.hIcon.is_invalid() {
+        return None;
+    }
+    let icon: HICON = info.hIcon;
 
     let pixels = extract_icon_pixels(icon);
 
@@ -388,22 +416,23 @@ fn extract_icon_pixels(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> 
     use windows::Win32::Graphics::Gdi::DeleteObject;
     use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, ICONINFO};
 
-    // SAFETY: All Win32 GDI calls below are paired — DC released, bitmaps deleted.
-    unsafe {
-        let mut icon_info: ICONINFO = std::mem::zeroed();
-        if GetIconInfo(icon, &mut icon_info).is_err() {
-            return None;
-        }
-        let hbm_color = icon_info.hbmColor;
-        let hbm_mask = icon_info.hbmMask;
-
-        let result = hbitmap_to_rgba(hbm_color, false);
-
-        let _ = DeleteObject(hbm_color);
-        let _ = DeleteObject(hbm_mask);
-
-        result
+    let mut icon_info = ICONINFO::default();
+    // SAFETY: `icon` is a live HICON the caller owns; GetIconInfo fills
+    // `icon_info` and hands us its two bitmaps, deleted below.
+    if unsafe { GetIconInfo(icon, &raw mut icon_info) }.is_err() {
+        return None;
     }
+    let hbm_color = icon_info.hbmColor;
+    let hbm_mask = icon_info.hbmMask;
+
+    let result = hbitmap_to_rgba(hbm_color, false);
+
+    // SAFETY: GetIconInfo gave us this bitmap; it's deleted once, here.
+    let _ = unsafe { DeleteObject(hbm_color) };
+    // SAFETY: as above, for the mask bitmap.
+    let _ = unsafe { DeleteObject(hbm_mask) };
+
+    result
 }
 
 /// Read a GDI bitmap's pixels as top-down RGBA.
@@ -425,71 +454,77 @@ fn hbitmap_to_rgba(hbm: windows::Win32::Graphics::Gdi::HBITMAP, unpremultiply: b
         GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
     };
 
-    // SAFETY: GDI reads below are paired (DC acquired then released); we never
+    // The GDI reads below are paired (DC acquired then released); we never
     // take ownership of `hbm`.
-    unsafe {
-        let mut bitmap: BITMAP = std::mem::zeroed();
-        let bitmap_size = i32::try_from(std::mem::size_of::<BITMAP>()).expect("BITMAP is a few dozen bytes");
-        let got = GetObjectW(hbm, bitmap_size, Some(&mut bitmap as *mut _ as *mut _));
-        if got == 0 {
-            return None;
+    let mut bitmap = BITMAP::default();
+    let bitmap_size = i32::try_from(std::mem::size_of::<BITMAP>()).expect("BITMAP is a few dozen bytes");
+    // SAFETY: `hbm` is a live bitmap the caller owns; GetObjectW writes at
+    // most `bitmap_size` bytes into `bitmap`.
+    let got = unsafe { GetObjectW(hbm, bitmap_size, Some((&raw mut bitmap).cast())) };
+    if got == 0 {
+        return None;
+    }
+
+    // A negative size would turn into a huge buffer below; skip the icon.
+    let width = u32::try_from(bitmap.bmWidth).ok()?;
+    let height = u32::try_from(bitmap.bmHeight).ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize =
+        u32::try_from(std::mem::size_of::<BITMAPINFOHEADER>()).expect("BITMAPINFOHEADER is 40 bytes");
+    // Both came from non-negative i32s above, so neither wraps.
+    bmi.bmiHeader.biWidth = width.cast_signed();
+    // Negative biHeight to get top-down rows — matches PNG's row order.
+    bmi.bmiHeader.biHeight = -height.cast_signed();
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB.0;
+
+    let row_bytes = usize::try_from(width).ok()? * 4;
+    let mut pixels = vec![0u8; row_bytes * usize::try_from(height).ok()?];
+
+    // SAFETY: the screen DC; released just below.
+    let hdc = unsafe { GetDC(HWND(0)) };
+    // SAFETY: `pixels` holds `height` rows of `width` 32-bit pixels, the
+    // format `bmi` asks for; `hdc` and `hbm` are live.
+    let lines =
+        unsafe { GetDIBits(hdc, hbm, 0, height, Some(pixels.as_mut_ptr().cast()), &raw mut bmi, DIB_RGB_COLORS) };
+    // SAFETY: `hdc` came from GetDC above and is released once.
+    unsafe { ReleaseDC(HWND(0), hdc) };
+
+    if lines == 0 {
+        return None;
+    }
+
+    // GDI returns BGRA; PNG wants RGBA. Swap in place.
+    // Some legacy 24bpp icons surface with zero alpha; if every alpha byte
+    // is 0 we treat as fully opaque rather than rendering an invisible PNG.
+    let mut any_alpha_set = false;
+    for chunk in pixels.as_chunks_mut::<4>().0 {
+        chunk.swap(0, 2);
+        if chunk[3] != 0 {
+            any_alpha_set = true;
         }
-
-        // A negative size would turn into a huge buffer below; skip the icon.
-        let width = u32::try_from(bitmap.bmWidth).ok()?;
-        let height = u32::try_from(bitmap.bmHeight).ok()?;
-        if width == 0 || height == 0 {
-            return None;
+    }
+    if !any_alpha_set {
+        for chunk in pixels.as_chunks_mut::<4>().0 {
+            chunk[3] = 0xFF;
         }
-
-        let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmiHeader.biSize =
-            u32::try_from(std::mem::size_of::<BITMAPINFOHEADER>()).expect("BITMAPINFOHEADER is 40 bytes");
-        bmi.bmiHeader.biWidth = width as i32;
-        // Negative biHeight to get top-down rows — matches PNG's row order.
-        bmi.bmiHeader.biHeight = -(height as i32);
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB.0;
-
-        let row_bytes = (width as usize) * 4;
-        let mut pixels = vec![0u8; row_bytes * (height as usize)];
-
-        let hdc = GetDC(HWND(0));
-        let lines = GetDIBits(hdc, hbm, 0, height, Some(pixels.as_mut_ptr() as *mut _), &mut bmi, DIB_RGB_COLORS);
-        ReleaseDC(HWND(0), hdc);
-
-        if lines == 0 {
-            return None;
-        }
-
-        // GDI returns BGRA; PNG wants RGBA. Swap in place.
-        // Some legacy 24bpp icons surface with zero alpha; if every alpha byte
-        // is 0 we treat as fully opaque rather than rendering an invisible PNG.
-        let mut any_alpha_set = false;
-        for chunk in pixels.chunks_exact_mut(4) {
-            chunk.swap(0, 2);
-            if chunk[3] != 0 {
-                any_alpha_set = true;
-            }
-        }
-        if !any_alpha_set {
-            for chunk in pixels.chunks_exact_mut(4) {
-                chunk[3] = 0xFF;
-            }
-        } else if unpremultiply {
-            for chunk in pixels.chunks_exact_mut(4) {
-                let a = chunk[3] as u32;
-                if a > 0 && a < 255 {
-                    for channel in &mut chunk[..3] {
-                        *channel = ((*channel as u32 * 255 + a / 2) / a).min(255) as u8;
-                    }
+    } else if unpremultiply {
+        for chunk in pixels.as_chunks_mut::<4>().0 {
+            let a = u32::from(chunk[3]);
+            if a > 0 && a < 255 {
+                for channel in &mut chunk[..3] {
+                    *channel = u8::try_from(((u32::from(*channel) * 255 + a / 2) / a).min(255)).unwrap_or(u8::MAX);
                 }
             }
         }
-
-        Some((pixels, width, height))
     }
+
+    Some((pixels, width, height))
 }
 
 /// Extract a packaged (MSIX / Store) app's real tile icon.
@@ -502,7 +537,7 @@ fn hbitmap_to_rgba(hbm: windows::Win32::Graphics::Gdi::HBITMAP, unpremultiply: b
 ///
 /// Requested at 64px (larger than the 32px `SHGFI_LARGEICON` classic path) with
 /// `BIGGERSIZEOK`: rows render at 20 CSS px, so oversampling keeps Store icons
-/// crisp on HiDPI rather than upscaling a small tile.
+/// crisp on `HiDPI` rather than upscaling a small tile.
 #[cfg(windows)]
 fn extract_packaged_icon_png(path: &str) -> Option<Vec<u8>> {
     use image::{ImageBuffer, Rgba};
@@ -515,28 +550,29 @@ fn extract_packaged_icon_png(path: &str) -> Option<Vec<u8>> {
 
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
 
-    // SAFETY: read-only shell COM. The HBITMAP from GetImage is owned by us and
+    // Read-only shell COM. The HBITMAP from GetImage is owned by us and
     // deleted below in every path.
-    unsafe {
-        let factory: IShellItemImageFactory = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
-        // 256px, not 64: this path only runs for tiles that will then be CROPPED
-        // to their safe area (see `trim_tile_safe_area`). A 64px tile whose mark
-        // is 25% wide crops to ~17px, which upscales into mush at a 20px row.
-        // Asking for 256 leaves ~68px after the crop — sharp at any row size.
-        let hbm = factory.GetImage(SIZE { cx: 256, cy: 256 }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK).ok()?;
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    let factory: IShellItemImageFactory = unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) }.ok()?;
+    // 256px, not 64: this path only runs for tiles that will then be CROPPED
+    // to their safe area (see `trim_tile_safe_area`). A 64px tile whose mark
+    // is 25% wide crops to ~17px, which upscales into mush at a 20px row.
+    // Asking for 256 leaves ~68px after the crop — sharp at any row size.
+    // SAFETY: `factory` is a live COM object; the bitmap it returns is ours.
+    let hbm = unsafe { factory.GetImage(SIZE { cx: 256, cy: 256 }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK) }.ok()?;
 
-        let pixels = hbitmap_to_rgba(hbm, true);
-        let _ = DeleteObject(hbm);
+    let pixels = hbitmap_to_rgba(hbm, true);
+    // SAFETY: GetImage gave us this bitmap; it's deleted once, here.
+    let _ = unsafe { DeleteObject(hbm) };
 
-        let (rgba, width, height) = pixels?;
-        let buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(width, height, rgba)?;
-        let buf = trim_tile_safe_area(buf);
+    let (rgba, width, height) = pixels?;
+    let buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(width, height, rgba)?;
+    let buf = trim_tile_safe_area(buf);
 
-        let mut png = Vec::with_capacity(8192);
-        let mut cursor = std::io::Cursor::new(&mut png);
-        buf.write_to(&mut cursor, image::ImageFormat::Png).ok()?;
-        Some(png)
-    }
+    let mut png = Vec::with_capacity(8192);
+    let mut cursor = std::io::Cursor::new(&mut png);
+    buf.write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+    Some(png)
 }
 
 /// Crop a Store tile's safe-area padding so the mark fills the icon.
@@ -573,8 +609,8 @@ fn trim_tile_safe_area(
     // Square side around the mark, plus margin, clamped to the image.
     let side = gw.max(gh);
     let side = (side + (side * MARGIN_PCT) / 100).min(w.min(h));
-    let cx = (x0 + x1) / 2;
-    let cy = (y0 + y1) / 2;
+    let cx = u32::midpoint(x0, x1);
+    let cy = u32::midpoint(y0, y1);
     let x = cx.saturating_sub(side / 2).min(w.saturating_sub(side));
     let y = cy.saturating_sub(side / 2).min(h.saturating_sub(side));
 
@@ -634,7 +670,7 @@ fn similar(a: [u8; 4], b: [u8; 4]) -> bool {
     if a[3] < 8 && b[3] < 8 {
         return true;
     }
-    a.iter().zip(b.iter()).all(|(p, q)| (*p as i16 - *q as i16).abs() <= 12)
+    a.iter().zip(b.iter()).all(|(p, q)| (i16::from(*p) - i16::from(*q)).abs() <= 12)
 }
 
 #[cfg(all(windows, test))]

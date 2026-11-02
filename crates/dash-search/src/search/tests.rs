@@ -150,15 +150,15 @@ fn natural_language_date_field_phrases_resolve() {
     // "<category> created/createdat/created at <year>" → date filter on the
     // Created field, across the bare, one-word, and "at"-connector forms.
     let created_phrases = ["movies created 2025", "movies created at 2025", "movies createdat 2025"];
-    for &query in created_phrases.iter() {
-        let f = build_natural_query_plan(query).date_filter.unwrap_or_else(|| panic!("{} → date filter", query));
-        assert!(matches!(f.field, DateFieldIntent::Created), "{} should map to Created", query);
+    for &query in &created_phrases {
+        let f = build_natural_query_plan(query).date_filter.unwrap_or_else(|| panic!("{query} → date filter"));
+        assert!(matches!(f.field, DateFieldIntent::Created), "{query} should map to Created");
     }
 
     let modified_phrases = ["movies modified 2025", "movies modified at 2025", "movies modifiedat 2025"];
-    for &query in modified_phrases.iter() {
-        let f = build_natural_query_plan(query).date_filter.unwrap_or_else(|| panic!("{} → date filter", query));
-        assert!(matches!(f.field, DateFieldIntent::Modified), "{} should map to Modified", query);
+    for &query in &modified_phrases {
+        let f = build_natural_query_plan(query).date_filter.unwrap_or_else(|| panic!("{query} → date filter"));
+        assert!(matches!(f.field, DateFieldIntent::Modified), "{query} should map to Modified");
     }
 
     // A bare year is the filename release-year default — NOT a date filter.
@@ -175,7 +175,7 @@ fn bare_category_keyword_searches_by_format_only() {
     // movie-format file (build_result_item enforces the per-hit filter).
     let plan = build_natural_query_plan("movies");
     assert!(plan.query_keywords.is_empty(), "a bare category must not add a name keyword");
-    assert!(plan.query_text.is_empty());
+    assert_eq!(plan.query_text, "");
     assert!(plan.extension_filters.iter().any(|e| e == "mp4"));
     assert!(plan.extension_filters.iter().any(|e| e == "mkv"));
     assert!(!plan.extension_filters.iter().any(|e| e == "webm"), "movies excludes webm");

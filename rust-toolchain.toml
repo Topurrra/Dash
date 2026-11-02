@@ -1,0 +1,4 @@
+# One Rust for everyone: CI and local builds lint with the same clippy.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

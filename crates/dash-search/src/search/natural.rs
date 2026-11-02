@@ -132,10 +132,10 @@ pub(super) fn build_natural_query_plan(input: &str) -> NaturalQueryPlan {
         }
 
         if let Some(year) = parse_year_token(&bare) {
-            if previous_token.as_deref().map(is_year_filter_hint).unwrap_or(false) {
-                date_filter = exact_year_filter(date_field_hint, year);
+            if previous_token.as_deref().is_some_and(is_year_filter_hint) {
+                date_filter = Some(exact_year_filter(date_field_hint, year));
             } else {
-                push_expanded_query_word(&mut query_words, bare.clone());
+                push_expanded_query_word(&mut query_words, &bare);
             }
             previous_token = Some(bare);
             index += 1;
@@ -164,15 +164,15 @@ pub(super) fn build_natural_query_plan(input: &str) -> NaturalQueryPlan {
             // A connector like "at"/"on" between a date word and the year
             // ("created at 2025", "modified on 2025") must NOT break the
             // year-hint chain — keep the preceding hint so the year binds to it.
-            let bridges_year_hint = matches!(bare.as_str(), "at" | "on")
-                && previous_token.as_deref().map(is_year_filter_hint).unwrap_or(false);
+            let bridges_year_hint =
+                matches!(bare.as_str(), "at" | "on") && previous_token.as_deref().is_some_and(is_year_filter_hint);
             if !bridges_year_hint {
                 previous_token = Some(bare);
             }
             index += 1;
             continue;
         }
-        push_expanded_query_word(&mut query_words, bare.clone());
+        push_expanded_query_word(&mut query_words, &bare);
         previous_token = Some(bare);
         index += 1;
     }
@@ -183,7 +183,7 @@ pub(super) fn build_natural_query_plan(input: &str) -> NaturalQueryPlan {
             if bare.is_empty() || is_natural_stopword(&bare) {
                 continue;
             }
-            push_expanded_query_word(&mut query_words, bare);
+            push_expanded_query_word(&mut query_words, &bare);
         }
     }
 
@@ -218,7 +218,7 @@ pub(super) fn should_run_aggressive_file_fallback(
 
     // Only widen the net when the entire query is a single short keyword.
     // A short word inside a multi-keyword query is meaningful — don't over-fetch.
-    query_keywords.len() == 1 && query_keywords.first().map(|k| k.len() >= 3 && k.len() <= 5).unwrap_or(false)
+    query_keywords.len() == 1 && query_keywords.first().is_some_and(|k| k.len() >= 3 && k.len() <= 5)
 }
 
 pub(super) fn extract_quoted_phrases(input: &str) -> (String, Vec<String>) {
@@ -276,9 +276,9 @@ pub(super) fn tokenize_search_input(input: &str) -> Vec<String> {
         .collect()
 }
 
-pub(super) fn push_expanded_query_word(query_words: &mut Vec<String>, word: String) {
-    push_unique(query_words, word.clone());
-    for related in related_natural_terms(&word) {
+pub(super) fn push_expanded_query_word(query_words: &mut Vec<String>, word: &str) {
+    push_unique(query_words, word.to_string());
+    for related in related_natural_terms(word) {
         push_unique(query_words, related.to_string());
     }
 }
@@ -485,7 +485,7 @@ pub(super) fn parse_date_filter(
             ))
         }
         "this" | "last" | "past" => {
-            let next = tokens.get(index + 1).map(|value| value.as_str())?;
+            let next = tokens.get(index + 1).map(std::string::String::as_str)?;
             // Numeric window — "last 7 days", "past 3 months".
             if let Ok(count) = next.parse::<u64>() {
                 let unit = tokens.get(index + 2)?;
@@ -505,24 +505,27 @@ pub(super) fn parse_date_filter(
         }
         "between" => {
             let first_year = tokens.get(index + 1).and_then(|value| parse_year_token(value))?;
-            let second_index =
-                if tokens.get(index + 2).map(|value| value.as_str()) == Some("and") { index + 3 } else { index + 2 };
+            let second_index = if tokens.get(index + 2).map(std::string::String::as_str) == Some("and") {
+                index + 3
+            } else {
+                index + 2
+            };
             let second_year = tokens.get(second_index).and_then(|value| parse_year_token(value))?;
             let start_year = first_year.min(second_year);
             let end_year = first_year.max(second_year);
-            Some((year_range_filter(field, start_year, end_year)?, second_index.saturating_sub(index) + 1))
+            Some((year_range_filter(field, start_year, end_year), second_index.saturating_sub(index) + 1))
         }
         "before" => {
             let year = tokens.get(index + 1).and_then(|value| parse_year_token(value))?;
-            Some((before_year_filter(field, year)?, 2))
+            Some((before_year_filter(field, year), 2))
         }
         "after" => {
             let year = tokens.get(index + 1).and_then(|value| parse_year_token(value))?;
-            Some((after_year_filter(field, year)?, 2))
+            Some((after_year_filter(field, year), 2))
         }
         "since" => {
             let year = tokens.get(index + 1).and_then(|value| parse_year_token(value))?;
-            Some((since_year_filter(field, year)?, 2))
+            Some((since_year_filter(field, year), 2))
         }
         // `from`/`in` are intentionally NOT here — they read as the release
         // year in the *name* ("movies from 2025" == "movies 2025"), not a date.
@@ -530,7 +533,7 @@ pub(super) fn parse_date_filter(
         // `modified` + a year.
         "during" | "year" => {
             let year = tokens.get(index + 1).and_then(|value| parse_year_token(value))?;
-            Some((exact_year_filter(field, year)?, 2))
+            Some((exact_year_filter(field, year), 2))
         }
         _ => None,
     }
@@ -592,7 +595,7 @@ pub(super) fn parse_size_filter(tokens: &[String], index: usize) -> Option<(Size
                 consumed + 1,
             )
         }),
-        "more" if tokens.get(index + 1).map(|value| value.as_str()) == Some("than") => {
+        "more" if tokens.get(index + 1).map(std::string::String::as_str) == Some("than") => {
             parse_size_after(tokens, index + 2).map(|(bytes, consumed)| {
                 (
                     SizeFilter::Range {
@@ -604,7 +607,7 @@ pub(super) fn parse_size_filter(tokens: &[String], index: usize) -> Option<(Size
                 )
             })
         }
-        "less" if tokens.get(index + 1).map(|value| value.as_str()) == Some("than") => {
+        "less" if tokens.get(index + 1).map(std::string::String::as_str) == Some("than") => {
             parse_size_after(tokens, index + 2).map(|(bytes, consumed)| {
                 (
                     SizeFilter::Range {
@@ -616,7 +619,7 @@ pub(super) fn parse_size_filter(tokens: &[String], index: usize) -> Option<(Size
                 )
             })
         }
-        "at" if tokens.get(index + 1).map(|value| value.as_str()) == Some("least") => {
+        "at" if tokens.get(index + 1).map(std::string::String::as_str) == Some("least") => {
             parse_size_after(tokens, index + 2).map(|(bytes, consumed)| {
                 (
                     SizeFilter::Range {
@@ -628,7 +631,7 @@ pub(super) fn parse_size_filter(tokens: &[String], index: usize) -> Option<(Size
                 )
             })
         }
-        "at" if tokens.get(index + 1).map(|value| value.as_str()) == Some("most") => {
+        "at" if tokens.get(index + 1).map(std::string::String::as_str) == Some("most") => {
             parse_size_after(tokens, index + 2).map(|(bytes, consumed)| {
                 (
                     SizeFilter::Range {
@@ -646,7 +649,7 @@ pub(super) fn parse_size_filter(tokens: &[String], index: usize) -> Option<(Size
 
 pub(super) fn parse_size_after(tokens: &[String], mut index: usize) -> Option<(u64, usize)> {
     let original_index = index;
-    if tokens.get(index).map(|value| value.as_str()) == Some("than") {
+    if tokens.get(index).map(std::string::String::as_str) == Some("than") {
         index += 1;
     }
     let (bytes, consumed) = parse_size_expression(tokens, index)?;
@@ -665,6 +668,7 @@ pub(super) fn parse_size_expression(tokens: &[String], index: usize) -> Option<(
         _ => return None,
     };
     #[expect(
+        clippy::as_conversions,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "`as` saturates: an oversized value becomes u64::MAX and a negative or NaN one 0"
@@ -699,39 +703,39 @@ pub(super) fn split_size_token<'a>(token: &'a str, next: Option<&'a str>) -> Opt
     Some((value, unit, 2))
 }
 
-pub(super) fn exact_year_filter(field: DateFieldIntent, year: i32) -> Option<DateFilter> {
+pub(super) fn exact_year_filter(field: DateFieldIntent, year: i32) -> DateFilter {
     year_range_filter(field, year, year)
 }
 
-pub(super) fn before_year_filter(field: DateFieldIntent, year: i32) -> Option<DateFilter> {
-    Some(DateFilter {
+pub(super) fn before_year_filter(field: DateFieldIntent, year: i32) -> DateFilter {
+    DateFilter {
         field,
         start_ms: None,
         end_ms: year_start_ms(year).map(|value| value.saturating_sub(1)),
         label: format!("{} before {year}", date_field_label(field)),
-    })
+    }
 }
 
-pub(super) fn after_year_filter(field: DateFieldIntent, year: i32) -> Option<DateFilter> {
-    Some(DateFilter {
+pub(super) fn after_year_filter(field: DateFieldIntent, year: i32) -> DateFilter {
+    DateFilter {
         field,
         start_ms: year_start_ms(year.saturating_add(1)),
         end_ms: None,
         label: format!("{} after {year}", date_field_label(field)),
-    })
+    }
 }
 
-pub(super) fn since_year_filter(field: DateFieldIntent, year: i32) -> Option<DateFilter> {
-    Some(DateFilter {
+pub(super) fn since_year_filter(field: DateFieldIntent, year: i32) -> DateFilter {
+    DateFilter {
         field,
         start_ms: year_start_ms(year),
         end_ms: None,
         label: format!("{} since {year}", date_field_label(field)),
-    })
+    }
 }
 
-pub(super) fn year_range_filter(field: DateFieldIntent, start_year: i32, end_year: i32) -> Option<DateFilter> {
-    Some(DateFilter {
+pub(super) fn year_range_filter(field: DateFieldIntent, start_year: i32, end_year: i32) -> DateFilter {
+    DateFilter {
         field,
         start_ms: year_start_ms(start_year),
         end_ms: year_start_ms(end_year.saturating_add(1)).map(|value| value.saturating_sub(1)),
@@ -740,7 +744,7 @@ pub(super) fn year_range_filter(field: DateFieldIntent, start_year: i32, end_yea
         } else {
             format!("{} between {start_year} and {end_year}", date_field_label(field))
         },
-    })
+    }
 }
 
 pub(super) fn date_field_label(field: DateFieldIntent) -> &'static str {
@@ -758,10 +762,7 @@ pub(super) fn year_start_ms(year: i32) -> Option<u64> {
 }
 
 pub(super) fn current_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
 }
 
 pub(super) fn parse_extension_filters(raw: Option<&str>) -> Vec<String> {
@@ -877,14 +878,10 @@ pub(super) fn build_native_tantivy_query(
             DateFieldIntent::Modified => fields.modified_ms,
             DateFieldIntent::Created => fields.created_ms?,
         };
-        let lower = date_filter
-            .start_ms
-            .map(|ms| Bound::Included(Term::from_field_u64(ms_field, ms)))
-            .unwrap_or(Bound::Unbounded);
-        let upper = date_filter
-            .end_ms
-            .map(|ms| Bound::Included(Term::from_field_u64(ms_field, ms)))
-            .unwrap_or(Bound::Unbounded);
+        let lower =
+            date_filter.start_ms.map_or(Bound::Unbounded, |ms| Bound::Included(Term::from_field_u64(ms_field, ms)));
+        let upper =
+            date_filter.end_ms.map_or(Bound::Unbounded, |ms| Bound::Included(Term::from_field_u64(ms_field, ms)));
         let range = RangeQuery::new(lower, upper);
         clauses.push((Occur::Must, Box::new(range)));
     }
@@ -893,10 +890,8 @@ pub(super) fn build_native_tantivy_query(
     // SizeFilter::Empty is skipped here — empty-folder detection needs a filesystem check
     // that can't be expressed as a Tantivy query, so the post-filter handles it.
     if let Some(SizeFilter::Range { min_bytes, max_bytes, .. }) = &natural_plan.size_filter {
-        let lower =
-            min_bytes.map(|b| Bound::Included(Term::from_field_u64(fields.size, b))).unwrap_or(Bound::Unbounded);
-        let upper =
-            max_bytes.map(|b| Bound::Included(Term::from_field_u64(fields.size, b))).unwrap_or(Bound::Unbounded);
+        let lower = min_bytes.map_or(Bound::Unbounded, |b| Bound::Included(Term::from_field_u64(fields.size, b)));
+        let upper = max_bytes.map_or(Bound::Unbounded, |b| Bound::Included(Term::from_field_u64(fields.size, b)));
         let range = RangeQuery::new(lower, upper);
         clauses.push((Occur::Must, Box::new(range)));
     }
@@ -945,7 +940,7 @@ pub(super) fn build_fuzzy_tantivy_query(
 }
 
 /// Build a prefix range query for the keywords. For each keyword `K`, this finds
-/// every term in the file_name and path fields that starts with `K` by doing a
+/// every term in the `file_name` and path fields that starts with `K` by doing a
 /// lexicographic range query over the term dictionary `[K, K_next)`.
 ///
 /// This is what catches "asu" → "asura", "spi" → "spider", "xmen" → "xmen_..."
@@ -968,9 +963,8 @@ pub(super) fn build_prefix_tantivy_query(
         let lower = keyword.to_lowercase();
         // Build the lexicographic upper bound. For "spi" we want "spj" so that
         // every term >= "spi" and < "spj" is in range — i.e. every term starting with "spi".
-        let upper = match next_lex_prefix(&lower) {
-            Some(s) => s,
-            None => continue,
+        let Some(upper) = next_lex_prefix(&lower) else {
+            continue;
         };
 
         for &field in &[file_name_field, path_field] {

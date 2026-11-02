@@ -19,7 +19,7 @@ pub(super) fn index_throttle_sleep_ms(performance_mode: &str, on_battery: bool) 
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "kept for explicit post-rebuild reloads; nothing calls it today")]
 pub(super) fn reload_search_reader_if_due(reader: &IndexReader) {
     // No longer called on the hot search path because OnCommitWithDelay
     // auto-reloads in a background thread. Kept available for explicit
@@ -103,7 +103,7 @@ pub(super) fn is_system_protected_path(path: &Path) -> bool {
             format!("{system_drive}/program files (x86)"),
             format!("{system_drive}/programdata"),
         ];
-        for blocked in protected_roots.iter() {
+        for blocked in &protected_roots {
             // Match exact OR any path under that root.
             if trimmed == blocked || trimmed.starts_with(&format!("{blocked}/")) {
                 return true;
@@ -149,9 +149,11 @@ pub(super) fn normalize_rebuild_schedule(mut schedule: FileSearchRebuildSchedule
 }
 
 pub(super) fn unix_now_ms() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |value| value.as_millis())
 }
 
+/// # Errors
+/// Only on a follower, when the owner's call fails.
 pub fn cancel_file_search_index_build() -> Result<(), String> {
     on_owner!("cancel_file_search_index_build", {});
     SEARCH_BUILD_CANCELLED.store(true, Ordering::Relaxed);
@@ -181,12 +183,12 @@ pub fn cancel_file_search_index_build() -> Result<(), String> {
 
 /// Kill a process and its ENTIRE descendant tree on Windows (`taskkill /F /T`).
 /// The index workers spawn out-of-process extractor children; `Child::kill()`
-/// (TerminateProcess) only takes out the one process, so descendants survive.
+/// (`TerminateProcess`) only takes out the one process, so descendants survive.
 /// `taskkill /F /T` terminates the whole tree.
 #[cfg(windows)]
 pub(super) fn kill_process_tree(pid: u32) {
     use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let _ = Command::new("taskkill")
         .args(["/F", "/T", "/PID", &pid.to_string()])
         .creation_flags(CREATE_NO_WINDOW)
@@ -219,6 +221,11 @@ pub fn stop_all_index_workers() {
     }
 }
 
+/// # Errors
+/// When the index folder or saved config can't be read or written, or the
+/// engine lock fails.
+/// On a follower, also when the owner's call fails.
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn stop_file_search_index_watcher(app: std::sync::Arc<dyn dash_core::Host>) -> Result<(), String> {
     on_owner!("stop_file_search_index_watcher", {});
     let state_dir = search_index_dir(&app)?;
@@ -245,6 +252,10 @@ pub fn stop_file_search_index_watcher(app: std::sync::Arc<dyn dash_core::Host>) 
     Ok(())
 }
 
+/// # Errors
+/// When the status lock fails.
+/// On a follower, also when the owner's call fails.
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn get_file_search_status(app: std::sync::Arc<dyn dash_core::Host>) -> Result<FileSearchStatus, String> {
     on_owner!("get_file_search_status", {});
     // Wave 6 (2026-05-28): `status.elevated` populated removed with MFT.
@@ -326,10 +337,15 @@ pub(super) fn worker_process_running(worker_slot: &LazyLock<Mutex<Option<SearchI
     let Some(worker) = guard.as_ref() else {
         return false;
     };
-    worker.child.lock().map(|mut child| child.try_wait().ok().flatten().is_none()).unwrap_or(false)
+    worker.child.lock().is_ok_and(|mut child| child.try_wait().ok().flatten().is_none())
 }
 
 /// The saved index options (`None` before the first save).
+///
+/// # Errors
+/// When the saved config can't be read.
+/// On a follower, also when the owner's call fails.
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn get_file_search_index_options(
     app: std::sync::Arc<dyn dash_core::Host>,
 ) -> Result<Option<FileSearchIndexOptions>, String> {
@@ -337,6 +353,11 @@ pub fn get_file_search_index_options(
     Ok(read_search_config(&app)?.map(|config| config.options))
 }
 
+/// # Errors
+/// When the saved config can't be read or written, the index folder can't
+/// be found, or the engine lock fails.
+/// On a follower, also when the owner's call fails.
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn save_file_search_index_options(
     app: std::sync::Arc<dyn dash_core::Host>,
     mut options: FileSearchIndexOptions,
@@ -354,19 +375,19 @@ pub fn save_file_search_index_options(
 
     let saved_config = read_search_config(&app)?;
     let search_coverage_changed =
-        saved_config.as_ref().map(|config| search_coverage_options_changed(&config.options, &options)).unwrap_or(false);
+        saved_config.as_ref().is_some_and(|config| search_coverage_options_changed(&config.options, &options));
     let watcher_enabled_changed =
-        saved_config.as_ref().map(|config| config.options.watcher_enabled != options.watcher_enabled).unwrap_or(false);
+        saved_config.as_ref().is_some_and(|config| config.options.watcher_enabled != options.watcher_enabled);
     let watcher_pause_changed =
-        saved_config.as_ref().map(|config| config.options.watcher_paused != options.watcher_paused).unwrap_or(false);
+        saved_config.as_ref().is_some_and(|config| config.options.watcher_paused != options.watcher_paused);
     if search_coverage_changed || !options.watcher_enabled {
         let state_dir = search_index_dir(&app)?;
         stop_isolated_watch_worker_for_state(&state_dir);
     }
-    let (indexed_files, last_indexed_at_ms) =
-        saved_config.as_ref().map(|config| (config.indexed_files, config.last_indexed_at_ms)).unwrap_or_else(|| {
-            SEARCH_STATUS.lock().map(|status| (status.indexed_files, status.last_indexed_at_ms)).unwrap_or((0, None))
-        });
+    let (indexed_files, last_indexed_at_ms) = saved_config.as_ref().map_or_else(
+        || SEARCH_STATUS.lock().map_or((0, None), |status| (status.indexed_files, status.last_indexed_at_ms)),
+        |config| (config.indexed_files, config.last_indexed_at_ms),
+    );
 
     write_search_config(
         &app,
@@ -381,31 +402,31 @@ pub fn save_file_search_index_options(
     {
         let mut guard = SEARCH_ENGINE.lock().map_err(|_| "Search engine lock failed".to_string())?;
         if let Some(engine) = guard.as_mut() {
-            engine.options.roots = options.roots.clone();
+            engine.options.roots.clone_from(&options.roots);
             engine.options.include_hidden = options.include_hidden;
             engine.options.index_content = options.index_content;
             engine.options.max_content_kb = options.max_content_kb;
             engine.options.commit_every = options.commit_every;
-            engine.options.performance_mode = options.performance_mode.clone();
+            engine.options.performance_mode.clone_from(&options.performance_mode);
             engine.options.watcher_enabled = options.watcher_enabled;
             engine.options.watcher_paused = options.watcher_paused;
-            engine.options.exclude_folders = options.exclude_folders.clone();
-            engine.options.exclude_extensions = options.exclude_extensions.clone();
+            engine.options.exclude_folders.clone_from(&options.exclude_folders);
+            engine.options.exclude_extensions.clone_from(&options.exclude_extensions);
         }
     }
 
     update_status(|status| {
-        status.roots = options.roots.clone();
-        status.filename_roots = options.filename_roots.clone();
+        status.roots.clone_from(&options.roots);
+        status.filename_roots.clone_from(&options.filename_roots);
         status.include_hidden = options.include_hidden;
         status.index_content = options.index_content;
         status.max_content_kb = options.max_content_kb.unwrap_or(DEFAULT_MAX_CONTENT_KB);
         status.commit_every = normalize_commit_every(options.commit_every);
         status.watcher_enabled = options.watcher_enabled;
         status.watcher_paused = options.watcher_paused;
-        status.exclude_folders = options.exclude_folders.clone();
-        status.exclude_extensions = options.exclude_extensions.clone();
-        status.diagnostics.performance_mode = options.performance_mode.clone();
+        status.exclude_folders.clone_from(&options.exclude_folders);
+        status.exclude_extensions.clone_from(&options.exclude_extensions);
+        status.diagnostics.performance_mode.clone_from(&options.performance_mode);
         if !options.watcher_enabled {
             status.watching = false;
             status.diagnostics.watcher_worker = "stopped".to_string();
@@ -452,6 +473,10 @@ pub fn save_file_search_index_options(
     Ok(())
 }
 
+/// # Errors
+/// When the saved config can't be read or written.
+/// On a follower, also when the owner's call fails.
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn save_file_search_rebuild_schedule(
     app: std::sync::Arc<dyn dash_core::Host>,
     schedule: FileSearchRebuildSchedule,
@@ -477,12 +502,16 @@ pub fn save_file_search_rebuild_schedule(
     Ok(schedule)
 }
 
+/// # Errors
+/// When the cache lock fails.
 pub fn refresh_launch_target_cache() -> Result<(), String> {
     let mut guard = LAUNCH_TARGET_CACHE.lock().map_err(|_| "Launch target cache lock failed".to_string())?;
     *guard = None;
     Ok(())
 }
 
+/// # Errors
+/// When the launch target cache can't be built or loaded.
 pub async fn search_launch_targets(
     app: std::sync::Arc<dyn dash_core::Host>,
     options: LaunchTargetSearchOptions,
@@ -537,7 +566,7 @@ pub async fn search_launch_targets(
                 query,
                 total_hits: total,
                 returned: results.len(),
-                took_ms: started_at.elapsed().map(|d| d.as_millis()).unwrap_or(0),
+                took_ms: started_at.elapsed().map_or(0, |d| d.as_millis()),
                 cache_built_at_ms: Some(cache.built_at_ms),
                 results,
             });
@@ -546,7 +575,7 @@ pub async fn search_launch_targets(
             query,
             total_hits: 0,
             returned: 0,
-            took_ms: started_at.elapsed().map(|d| d.as_millis()).unwrap_or(0),
+            took_ms: started_at.elapsed().map_or(0, |d| d.as_millis()),
             cache_built_at_ms: None,
             results: Vec::new(),
         });
@@ -556,7 +585,7 @@ pub async fn search_launch_targets(
     let query_tokens = query_normalized
         .split_whitespace()
         .filter(|token| token.len() >= 2 && !is_natural_stopword(token))
-        .map(|token| token.to_string())
+        .map(std::string::ToString::to_string)
         .collect::<Vec<_>>();
 
     let cache = tokio::task::spawn_blocking(ensure_launch_target_cache)
@@ -588,7 +617,7 @@ pub async fn search_launch_targets(
 
     let total_hits = ranked.len();
     let results = ranked.into_iter().take(limit).collect::<Vec<_>>();
-    let took_ms = started_at.elapsed().map(|d| d.as_millis()).unwrap_or(0);
+    let took_ms = started_at.elapsed().map_or(0, |d| d.as_millis());
 
     Ok(LaunchTargetSearchResult {
         query,
@@ -600,6 +629,9 @@ pub async fn search_launch_targets(
     })
 }
 
+/// # Errors
+/// When the path is empty or missing, isn't in the trusted launcher cache,
+/// the cache can't be loaded, or the launch fails.
 pub async fn launch_cached_target(app: std::sync::Arc<dyn dash_core::Host>, path: String) -> Result<(), String> {
     let requested = path.trim();
     if requested.is_empty() {
@@ -692,6 +724,10 @@ pub(super) async fn launch_packaged_target(
     }
 }
 
+/// # Errors
+/// When the path is empty, fails validation (system locations), isn't a
+/// file or folder, or the OS can't open it.
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn open_search_result_path(app: std::sync::Arc<dyn dash_core::Host>, path: String) -> Result<(), String> {
     let requested = path.trim();
     if requested.is_empty() {
@@ -721,12 +757,15 @@ pub fn open_search_result_path(app: std::sync::Arc<dyn dash_core::Host>, path: S
     Ok(())
 }
 
+/// # Errors
+/// When the launcher task fails or the content index worker can't start.
+/// On a follower, also when the owner's call fails.
 pub async fn start_file_search_index(
     app: std::sync::Arc<dyn dash_core::Host>,
     options: FileSearchIndexOptions,
 ) -> Result<FileSearchBuildResult, String> {
     on_owner!("start_file_search_index", { "options": options });
-    let app_for_worker = app.clone();
+    let app_for_worker = Arc::clone(&app);
     tokio::task::spawn_blocking(move || {
         // Also refresh the standalone filename index (it uses the MFT
         // fast-path when opted-in + elevated). Best-effort and independent —
@@ -741,12 +780,16 @@ pub async fn start_file_search_index(
 
 /// Build the content index (the Content Search tab) — triggers only the
 /// content indexer, not the filename indexer.
+///
+/// # Errors
+/// When the launcher task fails or the content index worker can't start.
+/// On a follower, also when the owner's call fails.
 pub async fn start_content_search_index(
     app: std::sync::Arc<dyn dash_core::Host>,
     options: FileSearchIndexOptions,
 ) -> Result<FileSearchBuildResult, String> {
     on_owner!("start_content_search_index", { "options": options });
-    let app_for_worker = app.clone();
+    let app_for_worker = Arc::clone(&app);
     tokio::task::spawn_blocking(move || start_isolated_index_worker(app_for_worker, options))
         .await
         .map_err(|error| format!("Search index launcher failed: {error}"))?
@@ -754,33 +797,43 @@ pub async fn start_content_search_index(
 
 /// Build the filename index (the File Search tab) via the deterministic
 /// folder walker. Triggers only the filename indexer.
+///
+/// # Errors
+/// When the launcher task fails or the filename index worker can't start.
+/// On a follower, also when the owner's call fails.
 pub async fn start_filename_search_index(
     app: std::sync::Arc<dyn dash_core::Host>,
     options: FileSearchIndexOptions,
 ) -> Result<bool, String> {
     on_owner!("start_filename_search_index", { "options": options });
-    let app_for_worker = app.clone();
+    let app_for_worker = Arc::clone(&app);
     tokio::task::spawn_blocking(move || start_isolated_filename_index_worker(&app_for_worker, options, true))
         .await
         .map_err(|error| format!("Filename index launcher failed: {error}"))?
 }
 
+/// # Errors
+/// When the search worker fails or the search itself does.
+/// On a follower, also when the owner's call fails.
 pub async fn search_local_files(
     app: std::sync::Arc<dyn dash_core::Host>,
     options: FileSearchQueryOptions,
 ) -> Result<FileSearchQueryResult, String> {
     on_owner!("search_local_files", { "options": options });
-    tokio::task::spawn_blocking(move || search_local_files_inner(app, options))
+    tokio::task::spawn_blocking(move || search_local_files_inner(&app, &options))
         .await
         .map_err(|error| format!("Search worker failed: {error}"))?
 }
 
+/// # Errors
+/// When the search worker fails or the search itself does.
+/// On a follower, also when the owner's call fails.
 pub async fn search_file_contents(
     app: std::sync::Arc<dyn dash_core::Host>,
     options: FileSearchQueryOptions,
 ) -> Result<ContentSearchQueryResult, String> {
     on_owner!("search_file_contents", { "options": options });
-    tokio::task::spawn_blocking(move || search_file_contents_inner(app, options))
+    tokio::task::spawn_blocking(move || search_file_contents_inner(&app, &options))
         .await
         .map_err(|error| format!("Content search worker failed: {error}"))?
 }

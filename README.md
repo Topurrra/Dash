@@ -62,8 +62,13 @@ Times include parsing the query, scanning every name and returning the first 100
 
 ## Install
 
-Windows: download `Dash_<version>_x64-setup.exe` from Releases. Per-user install, no admin rights.
-macOS and Linux build in CI but are early: no auto-paste, video or file icons yet.
+From [Releases](https://github.com/Topurrra/Dash/releases):
+
+- **Windows:** `Dash_<version>_x64-setup.exe`. Per-user install, no admin rights.
+- **macOS:** `Dash_<version>_aarch64.dmg`; drag Dash to Applications. It isn't signed, so the first start needs right-click › Open. Pasting into other apps needs Accessibility permission (macOS asks once).
+- **Linux:** `Dash_<version>_x86_64.AppImage`; make it executable and run it. Pasting into other apps works on X11; on Wayland the text is put on the clipboard for you to paste. Clipboard history is encrypted with a key kept in the Secret Service (GNOME Keyring, KWallet).
+
+macOS and Linux are built and tested in CI but haven't been tried by hand yet, and they don't play video. Each package has a `.sha256` beside it; Dash updates itself from the same files.
 
 ## Build
 
@@ -72,6 +77,7 @@ cargo build --release -p dash
 ```
 
 Windows installer: `installer/build.ps1` (needs NSIS, plus the runtime files listed in `installer/dash.nsi`: PDFium, Tesseract, the EmbeddingGemma 2 model).
+macOS `.dmg`: `packaging/macos/make_dmg.sh`. Linux AppImage: `packaging/linux/make_appimage.sh`. CI builds both, and the Release workflow attaches them to each published release.
 
 | Crate | What |
 |---|---|

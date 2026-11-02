@@ -48,18 +48,21 @@ const VERSION_BYTE: u8 = 0x01;
 /// Wrap an arbitrary byte slice with DPAPI. The output is the magic byte
 /// followed by the DPAPI envelope (which includes its own IV + integrity
 /// data). Safe to store as-is in redb.
+///
+/// # Errors
+/// Returns `Err` if the value is over 4 GiB or DPAPI fails to encrypt it.
 pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let len = u32::try_from(plaintext.len()).map_err(|_| "DPAPI encrypt: value too large".to_string())?;
+    let in_blob = CRYPT_INTEGER_BLOB { cbData: len, pbData: plaintext.as_ptr().cast_mut() };
+    let mut out_blob = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+
     // SAFETY: CryptProtectData reads the input descriptor in-place and
     // writes a new heap allocation into out_blob. We own the input slice
-    // for the duration of the call. On success we copy the output into a
-    // Vec and LocalFree it; on failure there is no output buffer to free.
+    // for the duration of the call. On failure there is no output buffer
+    // to free.
     unsafe {
-        let in_blob = CRYPT_INTEGER_BLOB { cbData: len, pbData: plaintext.as_ptr() as *mut u8 };
-        let mut out_blob = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
-
         CryptProtectData(
-            &in_blob,
+            &raw const in_blob,
             None,
             None,
             None,
@@ -68,34 +71,44 @@ pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
             // We never want a UI prompt for this — it would surface during
             // settings reads at app start, which is unacceptable.
             0,
-            &mut out_blob,
+            &raw mut out_blob,
         )
-        .map_err(|error| format!("DPAPI encrypt failed: {error}"))?;
-
-        if out_blob.pbData.is_null() {
-            return Err("DPAPI encrypt produced a null buffer".into());
-        }
-
-        let raw = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
-        // Reserve space for the magic byte + the ciphertext so the final
-        // Vec doesn't have to grow.
-        let mut output = Vec::with_capacity(1 + raw.len());
-        output.push(VERSION_BYTE);
-        output.extend_from_slice(raw);
-
-        // Free the Win32-allocated buffer. Failing to do this would leak
-        // memory on every encrypt call, which adds up fast over a long
-        // session of clipboard captures.
-        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(out_blob.pbData as *mut _));
-
-        Ok(output)
     }
+    .map_err(|error| format!("DPAPI encrypt failed: {error}"))?;
+
+    if out_blob.pbData.is_null() {
+        return Err("DPAPI encrypt produced a null buffer".into());
+    }
+
+    #[expect(clippy::as_conversions, reason = "a u32 always fits in usize on Windows targets")]
+    let out_len = out_blob.cbData as usize;
+    // SAFETY: on success DPAPI hands us a non-null (checked above) buffer of
+    // exactly cbData bytes, which stays alive until the LocalFree below.
+    let raw = unsafe { std::slice::from_raw_parts(out_blob.pbData, out_len) };
+    // Reserve space for the magic byte + the ciphertext so the final
+    // Vec doesn't have to grow.
+    let mut output = Vec::with_capacity(1 + raw.len());
+    output.push(VERSION_BYTE);
+    output.extend_from_slice(raw);
+
+    // Free the Win32-allocated buffer. Failing to do this would leak
+    // memory on every encrypt call, which adds up fast over a long
+    // session of clipboard captures.
+    // SAFETY: the buffer was LocalAlloc'd by DPAPI, is freed exactly once,
+    // and `raw` is not used after this.
+    let _ = unsafe { LocalFree(windows::Win32::Foundation::HLOCAL(out_blob.pbData.cast())) };
+
+    Ok(output)
 }
 
 /// Unwrap a DPAPI-protected blob. If the input doesn't start with our
 /// version byte we treat it as legacy plaintext and return it unchanged —
 /// this is the migration hook that lets existing installs upgrade without
 /// data loss.
+///
+/// # Errors
+/// Returns `Err` if the value is over 4 GiB or DPAPI fails to decrypt it
+/// (e.g. it was protected by another user or machine).
 pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
     // Migration path: pre-DPAPI plaintext values won't have our version
     // byte at the start. Returning the input as-is lets `read_json_*`
@@ -107,43 +120,47 @@ pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
 
     let ciphertext = &blob[1..];
     let len = u32::try_from(ciphertext.len()).map_err(|_| "DPAPI decrypt: value too large".to_string())?;
-    // SAFETY: same contract as `protect`: the input slice outlives the call
-    // and `len` is its exact length; on success DPAPI hands us a LocalAlloc'd
-    // buffer of cbData bytes, which we null-check, copy out, then LocalFree.
-    unsafe {
-        let in_blob = CRYPT_INTEGER_BLOB { cbData: len, pbData: ciphertext.as_ptr() as *mut u8 };
-        let mut out_blob = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+    let in_blob = CRYPT_INTEGER_BLOB { cbData: len, pbData: ciphertext.as_ptr().cast_mut() };
+    let mut out_blob = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
 
+    // SAFETY: same contract as `protect`: the input slice outlives the call
+    // and `len` is its exact length; on failure there is no output buffer.
+    unsafe {
         CryptUnprotectData(
-            &in_blob,
+            &raw const in_blob,
             None,
             None,
             None,
             None,
             // Flag 0 = "no UI prompt". Same rationale as encrypt above.
             0,
-            &mut out_blob,
+            &raw mut out_blob,
         )
-        .map_err(|error| format!("DPAPI decrypt failed: {error}"))?;
-
-        if out_blob.pbData.is_null() {
-            return Err("DPAPI decrypt produced a null buffer".into());
-        }
-
-        let raw = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
-        let plaintext = raw.to_vec();
-        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(out_blob.pbData as *mut _));
-        Ok(plaintext)
     }
+    .map_err(|error| format!("DPAPI decrypt failed: {error}"))?;
+
+    if out_blob.pbData.is_null() {
+        return Err("DPAPI decrypt produced a null buffer".into());
+    }
+
+    #[expect(clippy::as_conversions, reason = "a u32 always fits in usize on Windows targets")]
+    let out_len = out_blob.cbData as usize;
+    // SAFETY: on success DPAPI hands us a non-null (checked above) buffer of
+    // exactly cbData bytes, which stays alive until the LocalFree below.
+    let plaintext = unsafe { std::slice::from_raw_parts(out_blob.pbData, out_len) }.to_vec();
+    // SAFETY: the buffer was LocalAlloc'd by DPAPI and is freed exactly once,
+    // after the copy above.
+    let _ = unsafe { LocalFree(windows::Win32::Foundation::HLOCAL(out_blob.pbData.cast())) };
+    Ok(plaintext)
 }
 
 /// Check whether a blob was produced by `protect()`. Used by tests + a
 /// public helper for future migration logic in `local_db` to detect
 /// which entries are still plaintext and need to be re-protected on
-/// next write. Today the unprotect() path handles that automatically,
+/// next write. Today the `unprotect()` path handles that automatically,
 /// so this is kept available as part of the module's API without an
 /// active caller.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "kept as module API for future migration logic; only tests call it today")]
 pub fn is_protected(blob: &[u8]) -> bool {
     !blob.is_empty() && blob[0] == VERSION_BYTE
 }

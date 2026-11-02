@@ -22,8 +22,7 @@ pub(super) fn start_isolated_index_worker(
     {
         let mut worker_lock = SEARCH_INDEX_WORKER.lock().map_err(|_| "Search worker lock failed".to_string())?;
         if let Some(worker) = worker_lock.as_ref() {
-            let still_running =
-                worker.child.lock().map(|mut child| child.try_wait().ok().flatten().is_none()).unwrap_or(false);
+            let still_running = worker.child.lock().is_ok_and(|mut child| child.try_wait().ok().flatten().is_none());
             if still_running {
                 return Err("Index build is already running".to_string());
             }
@@ -86,15 +85,15 @@ pub(super) fn start_isolated_index_worker(
         status.indexing = true;
         status.initialized = false;
         status.watching = false;
-        status.roots = options.roots.clone();
+        status.roots.clone_from(&options.roots);
         status.include_hidden = options.include_hidden;
         status.index_content = options.index_content;
         status.max_content_kb = options.max_content_kb.unwrap_or(DEFAULT_MAX_CONTENT_KB);
         status.commit_every = normalize_commit_every(options.commit_every);
         status.watcher_enabled = options.watcher_enabled;
         status.watcher_paused = options.watcher_paused;
-        status.exclude_folders = options.exclude_folders.clone();
-        status.exclude_extensions = options.exclude_extensions.clone();
+        status.exclude_folders.clone_from(&options.exclude_folders);
+        status.exclude_extensions.clone_from(&options.exclude_extensions);
         // A fresh build restarts the live scan counters from zero so a stale
         // count from the previous build never flashes before the first poll.
         status.scanned_entries = 0;
@@ -103,13 +102,13 @@ pub(super) fn start_isolated_index_worker(
         status.diagnostics.index_worker = "starting".to_string();
         status.diagnostics.watcher_worker = "stopped".to_string();
         status.diagnostics.watcher_strategy = "stopped during rebuild".to_string();
-        status.diagnostics.performance_mode = options.performance_mode.clone();
+        status.diagnostics.performance_mode.clone_from(&options.performance_mode);
         status.diagnostics.last_worker_message = Some("Index build started in isolated worker".to_string());
         status.diagnostics.last_status_at_ms = Some(unix_now_ms());
     });
     emit_progress(
         &app,
-        FileSearchProgressEvent {
+        &FileSearchProgressEvent {
             stage: "indexing".to_string(),
             index_kind: "content".to_string(),
             indexed_files: 0,
@@ -147,16 +146,15 @@ pub(super) enum WorkerProcessKind {
 #[cfg(target_os = "windows")]
 pub(super) fn configure_worker_process(command: &mut Command, performance_mode: &str, worker_kind: WorkerProcessKind) {
     use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    const IDLE_PRIORITY_CLASS: u32 = 0x00000040;
-    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
-    const NORMAL_PRIORITY_CLASS: u32 = 0x00000020;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const IDLE_PRIORITY_CLASS: u32 = 0x0000_0040;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
 
     let mode = normalize_index_performance_mode(performance_mode);
     let priority = match (mode.as_str(), worker_kind) {
         ("fast", WorkerProcessKind::Index) => NORMAL_PRIORITY_CLASS,
-        (_, WorkerProcessKind::Watch) => IDLE_PRIORITY_CLASS,
-        ("quiet", _) => IDLE_PRIORITY_CLASS,
+        (_, WorkerProcessKind::Watch) | ("quiet", _) => IDLE_PRIORITY_CLASS,
         _ => BELOW_NORMAL_PRIORITY_CLASS,
     };
     command.creation_flags(CREATE_NO_WINDOW | priority);
@@ -186,13 +184,13 @@ impl MemoryCappedJob {
     /// Create a job object capping every assigned process at `memory_limit_bytes`
     /// (`None`: no cap, only ending with the job's owner).
     pub(super) fn new(memory_limit_bytes: impl Into<Option<usize>>) -> Result<Self, String> {
-        let memory_limit_bytes = memory_limit_bytes.into();
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::JobObjects::{
             CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
         };
+        let memory_limit_bytes = memory_limit_bytes.into();
 
         // SAFETY: standard Win32 job-object creation; the returned handle is
         // owned by `self` and closed exactly once in `Drop`.
@@ -212,7 +210,7 @@ impl MemoryCappedJob {
             SetInformationJobObject(
                 handle,
                 JobObjectExtendedLimitInformation,
-                &info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const core::ffi::c_void,
+                (&raw const info).cast::<core::ffi::c_void>(),
                 u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
                     .expect("the limit struct is a few hundred bytes"),
             )
@@ -292,7 +290,7 @@ impl JobAssigner {
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 
-        let process = HANDLE(child.as_raw_handle() as isize);
+        let process = HANDLE(child.as_raw_handle().addr().cast_signed());
         // SAFETY: `child` is a live process just spawned; `self.0` is the job
         // handle the pool created. AssignProcessToJobObject validates both and
         // returns an error (never UB) if the job handle has been closed.
@@ -361,7 +359,7 @@ pub(super) struct ExtractorPool {
 pub(super) fn read_extract_frame(reader: &mut impl std::io::Read) -> Option<(String, Option<String>)> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).ok()?;
-    let path_len = u32::from_le_bytes(len_buf) as usize;
+    let path_len = usize::try_from(u32::from_le_bytes(len_buf)).ok()?;
     if path_len > 64 * 1024 {
         return None;
     }
@@ -373,7 +371,7 @@ pub(super) fn read_extract_frame(reader: &mut impl std::io::Read) -> Option<(Str
     reader.read_exact(&mut ok_buf).ok()?;
 
     reader.read_exact(&mut len_buf).ok()?;
-    let text_len = u32::from_le_bytes(len_buf) as usize;
+    let text_len = usize::try_from(u32::from_le_bytes(len_buf)).ok()?;
     if text_len > 64 * 1024 * 1024 {
         return None;
     }
@@ -514,7 +512,8 @@ pub(super) fn spawn_assigned_extractor_child(
 /// on `free_tx` and receives one path at a time on `work_rx`.
 #[expect(
     clippy::too_many_arguments,
-    reason = "thread body: each argument is a separate handle the pool moves into the slot"
+    clippy::needless_pass_by_value,
+    reason = "thread body: each argument is a separate handle the pool moves into the slot, which owns it"
 )]
 pub(super) fn extractor_slot(
     index: usize,
@@ -577,7 +576,7 @@ pub(super) fn extractor_slot(
         }
 
         // Respawn within the global budget so the pool stays at full strength.
-        if respawn_budget.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)).is_err() {
+        if respawn_budget.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)).is_err() {
             eprintln!("dash-search: content extractor respawn budget spent — pool shrinking");
             return;
         }
@@ -622,9 +621,9 @@ impl ExtractorPool {
         // reduces it on low-RAM machines.
         memory_cap_bytes: usize,
         performance_mode: &str,
-        should_stop: Arc<AtomicBool>,
-        ocr_env: crate::text_extract::OcrChildEnv,
-        cache_ctx: Option<crate::ocr_cache::OcrCacheCtx>,
+        should_stop: &Arc<AtomicBool>,
+        ocr_env: &crate::text_extract::OcrChildEnv,
+        cache_ctx: Option<&crate::ocr_cache::OcrCacheCtx>,
     ) -> Result<(ExtractorPool, std::sync::mpsc::SyncSender<PathBuf>, std::sync::mpsc::Receiver<ExtractResult>), String>
     {
         use std::collections::HashMap;
@@ -669,14 +668,14 @@ impl ExtractorPool {
         let mut work_txs = Vec::with_capacity(child_count);
         for index in 0..child_count {
             let (child, stdin, stdout) =
-                spawn_assigned_extractor_child(max_bytes, performance_mode, assigner, &ocr_env)?;
+                spawn_assigned_extractor_child(max_bytes, performance_mode, assigner, ocr_env)?;
             let (work_tx, work_rx) = channel::<PathBuf>();
             work_txs.push(work_tx);
 
             let inner_result_tx = inner_result_tx.clone();
             let free_tx = free_tx.clone();
             let respawn_budget = Arc::clone(&respawn_budget);
-            let should_stop = Arc::clone(&should_stop);
+            let should_stop = Arc::clone(should_stop);
             let performance_mode = performance_mode.to_string();
             // Wave 8 / task #88 (2026-05-28): each slot owns a clone of
             // the OCR env so respawns inside `extractor_slot` keep the
@@ -715,7 +714,7 @@ impl ExtractorPool {
         // last `outer_result_tx` then closes the caller's receiver too.
         let dispatcher_inner_result_tx = inner_result_tx.clone();
         {
-            let cache_ctx = cache_ctx.clone();
+            let cache_ctx = cache_ctx.cloned();
             let pending_hashes = Arc::clone(&pending_hashes);
             thread::spawn(move || {
                 while let Ok(result) = inner_result_rx.recv() {
@@ -749,7 +748,7 @@ impl ExtractorPool {
         //  - MISS → record the hash in `pending_hashes`; fall through to
         //           normal slot dispatch. The forwarder will store the
         //           slot's text under that hash when it arrives.
-        let cache_ctx_for_dispatcher = cache_ctx.clone();
+        let cache_ctx_for_dispatcher = cache_ctx.cloned();
         let pending_hashes_for_dispatcher = Arc::clone(&pending_hashes);
         thread::spawn(move || {
             while let Ok(path) = path_rx.recv() {
@@ -809,7 +808,7 @@ pub(super) fn start_index_worker_monitor(
                 apply_index_worker_status(&app, &options, &status);
             }
 
-            let exited = worker.child.lock().map(|mut child| child.try_wait().ok().flatten()).unwrap_or(None);
+            let exited = worker.child.lock().map_or(None, |mut child| child.try_wait().ok().flatten());
             if exited.is_some() {
                 let mut final_status =
                     read_index_worker_status(&worker.status_path).ok().flatten().unwrap_or(IndexWorkerStatusFile {
@@ -911,8 +910,7 @@ pub(super) fn start_isolated_filename_index_worker(
         let mut worker_lock =
             FILENAME_INDEX_WORKER.lock().map_err(|_| "Filename index worker lock failed".to_string())?;
         if let Some(worker) = worker_lock.as_ref() {
-            let still_running =
-                worker.child.lock().map(|mut child| child.try_wait().ok().flatten().is_none()).unwrap_or(false);
+            let still_running = worker.child.lock().is_ok_and(|mut child| child.try_wait().ok().flatten().is_none());
             if still_running {
                 if !force {
                     return Ok(false);
@@ -992,7 +990,7 @@ pub(super) fn start_isolated_filename_index_worker(
     });
     emit_progress(
         app,
-        FileSearchProgressEvent {
+        &FileSearchProgressEvent {
             stage: "indexing".to_string(),
             index_kind: "filename".to_string(),
             indexed_files: 0,
@@ -1006,7 +1004,7 @@ pub(super) fn start_isolated_filename_index_worker(
             partial: false,
         },
     );
-    start_filename_index_worker_monitor(app.clone(), worker, state_dir);
+    start_filename_index_worker_monitor(Arc::clone(app), worker, state_dir);
     Ok(true)
 }
 
@@ -1036,7 +1034,7 @@ pub(super) fn apply_filename_index_worker_status(
     });
     emit_progress(
         app,
-        FileSearchProgressEvent {
+        &FileSearchProgressEvent {
             stage: "indexing".to_string(),
             index_kind: "filename".to_string(),
             indexed_files: status_file.indexed_files,
@@ -1091,7 +1089,7 @@ pub(super) fn start_filename_index_worker_monitor(
                 }
             }
 
-            let exited = worker.child.lock().map(|mut child| child.try_wait().ok().flatten()).unwrap_or(None);
+            let exited = worker.child.lock().map_or(None, |mut child| child.try_wait().ok().flatten());
             if exited.is_some() {
                 // A build that never transitioned to a live updater (the walker
                 // path with no watchable roots) reaches success only at exit.
@@ -1099,8 +1097,7 @@ pub(super) fn start_filename_index_worker_monitor(
                     && read_index_worker_status(&worker.status_path)
                         .ok()
                         .flatten()
-                        .map(|status| status.finished && status.success)
-                        .unwrap_or(false)
+                        .is_some_and(|status| status.finished && status.success)
                 {
                     reopen_filename_handle();
                 }
@@ -1117,7 +1114,7 @@ pub(super) fn start_filename_index_worker_monitor(
                     update_status(|status| status.filename_indexing = false);
                     emit_progress(
                         &app,
-                        FileSearchProgressEvent {
+                        &FileSearchProgressEvent {
                             stage: "indexing".to_string(),
                             index_kind: "filename".to_string(),
                             indexed_files: 0,
@@ -1186,8 +1183,7 @@ pub(super) fn start_isolated_watch_worker(
         let mut worker_lock =
             SEARCH_WATCHER_WORKER.lock().map_err(|_| "Search watcher worker lock failed".to_string())?;
         if let Some(worker) = worker_lock.as_ref() {
-            let still_running =
-                worker.child.lock().map(|mut child| child.try_wait().ok().flatten().is_none()).unwrap_or(false);
+            let still_running = worker.child.lock().is_ok_and(|mut child| child.try_wait().ok().flatten().is_none());
             if still_running {
                 return Ok(true);
             }
@@ -1264,13 +1260,13 @@ pub(super) fn start_isolated_watch_worker(
         status.watcher_paused = false;
         status.diagnostics.watcher_worker = "starting".to_string();
         status.diagnostics.watcher_strategy = watcher_strategy;
-        status.diagnostics.performance_mode = options.performance_mode.clone();
+        status.diagnostics.performance_mode.clone_from(&options.performance_mode);
         status.diagnostics.last_worker_message = Some("Index watcher started in isolated worker".to_string());
         status.diagnostics.last_status_at_ms = Some(unix_now_ms());
     });
     emit_progress(
         app,
-        FileSearchProgressEvent {
+        &FileSearchProgressEvent {
             stage: "watch".to_string(),
             index_kind: "content".to_string(),
             indexed_files: 0,
@@ -1285,7 +1281,7 @@ pub(super) fn start_isolated_watch_worker(
         },
     );
 
-    start_watch_worker_monitor(app.clone(), worker, options);
+    start_watch_worker_monitor(Arc::clone(app), worker, options);
     Ok(true)
 }
 
@@ -1323,7 +1319,7 @@ pub(super) fn start_watch_worker_monitor(
                 }
             }
 
-            let exited = worker.child.lock().map(|mut child| child.try_wait().ok().flatten()).unwrap_or(None);
+            let exited = worker.child.lock().map_or(None, |mut child| child.try_wait().ok().flatten());
             if exited.is_some() {
                 let mut final_status = read_index_worker_status(&worker.status_path).ok().flatten().unwrap_or(
                     IndexWorkerStatusFile::finished(
@@ -1363,7 +1359,7 @@ pub(super) fn start_watch_worker_monitor(
 
             // Poll every 3s — the watcher rate-limits to 5s minimum between applies,
             // so faster polling just wastes CPU on duplicate status file reads.
-            thread::sleep(Duration::from_millis(3_000));
+            thread::sleep(Duration::from_secs(3));
         }
     });
 }
@@ -1381,7 +1377,7 @@ pub(super) fn apply_watch_worker_status(
         status.updated_files = status_file.indexed_files;
         status.deleted_files = status_file.skipped_files;
         if status_file.finished && !status_file.canceled {
-            status.last_error = status_file.error.clone();
+            status.last_error.clone_from(&status_file.error);
         }
         status.diagnostics.watcher_worker = if status_file.running && !status_file.finished {
             "running".to_string()
@@ -1399,7 +1395,7 @@ pub(super) fn apply_watch_worker_status(
 
     emit_progress(
         app,
-        FileSearchProgressEvent {
+        &FileSearchProgressEvent {
             stage: "watch".to_string(),
             index_kind: "content".to_string(),
             indexed_files: status_file.indexed_files,
@@ -1433,7 +1429,7 @@ pub(super) fn apply_index_worker_status(
     // counter when the new value is strictly higher, OR when the build is done
     // (finished=true) — so the final tally always lands, even if it's a
     // legitimate 0 on a canceled empty run.
-    let prev_indexed = SEARCH_STATUS.lock().map(|s| s.indexed_files).unwrap_or(0);
+    let prev_indexed = SEARCH_STATUS.lock().map_or(0, |s| s.indexed_files);
     let effective_indexed =
         if finished || status_file.indexed_files > prev_indexed { status_file.indexed_files } else { prev_indexed };
 
@@ -1441,15 +1437,15 @@ pub(super) fn apply_index_worker_status(
         status.indexing = !finished;
         status.initialized = if finished { status_file.success } else { status.initialized };
         status.watching = false;
-        status.roots = options.roots.clone();
+        status.roots.clone_from(&options.roots);
         status.include_hidden = options.include_hidden;
         status.index_content = options.index_content;
         status.max_content_kb = options.max_content_kb.unwrap_or(DEFAULT_MAX_CONTENT_KB);
         status.commit_every = normalize_commit_every(options.commit_every);
         status.watcher_enabled = options.watcher_enabled;
         status.watcher_paused = options.watcher_paused;
-        status.exclude_folders = options.exclude_folders.clone();
-        status.exclude_extensions = options.exclude_extensions.clone();
+        status.exclude_folders.clone_from(&options.exclude_folders);
+        status.exclude_extensions.clone_from(&options.exclude_extensions);
         status.indexed_files = effective_indexed;
         // Live scan counters — mirrored so `get_file_search_status` reports the
         // same numbers the progress event carries (fixes 0/0/0 on a mid-build view).
@@ -1478,7 +1474,7 @@ pub(super) fn apply_index_worker_status(
 
     emit_progress(
         app,
-        FileSearchProgressEvent {
+        &FileSearchProgressEvent {
             stage: "indexing".to_string(),
             index_kind: "content".to_string(),
             indexed_files: effective_indexed,
@@ -1502,7 +1498,7 @@ pub fn maybe_run_index_worker_from_args() -> bool {
 
     let mode = args.get(worker_arg_position + 1).and_then(|value| value.to_str()).unwrap_or_default();
 
-    let worker_args = args.get(worker_arg_position + 2..).map(|value| value.to_vec()).unwrap_or_default();
+    let worker_args = args.get(worker_arg_position + 2..).map(<[std::ffi::OsString]>::to_vec).unwrap_or_default();
 
     let result = match mode {
         "index" | "watch" | "filename-index" => {
@@ -1529,7 +1525,10 @@ pub fn maybe_run_index_worker_from_args() -> bool {
                 _ => Err("Index worker was started with invalid arguments".to_string()),
             }
         }
-        "extract" => run_extractor_worker(&worker_args),
+        "extract" => {
+            run_extractor_worker(&worker_args);
+            Ok(())
+        }
         _ => Err(format!("Unknown index worker mode: {mode}")),
     };
 
@@ -1562,7 +1561,7 @@ pub(super) fn worker_arg_path(args: &[std::ffi::OsString], key: &str) -> Result<
 /// over-the-size-guard file, or an extraction failure (then `text_len` = 0).
 /// File paths cannot contain newlines, so the stdin side is safely
 /// line-delimited; the text side is length-prefixed since it can be anything.
-pub(super) fn run_extractor_worker(worker_args: &[std::ffi::OsString]) -> Result<(), String> {
+pub(super) fn run_extractor_worker(worker_args: &[std::ffi::OsString]) {
     use std::io::{BufRead, BufWriter, Write};
 
     let max_bytes = worker_args
@@ -1570,7 +1569,7 @@ pub(super) fn run_extractor_worker(worker_args: &[std::ffi::OsString]) -> Result
         .position(|arg| arg.to_string_lossy() == "--max-bytes")
         .and_then(|index| worker_args.get(index + 1))
         .and_then(|value| value.to_string_lossy().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_CONTENT_KB as usize * 1024);
+        .unwrap_or(usize::try_from(DEFAULT_MAX_CONTENT_KB * 1024).unwrap_or(usize::MAX));
 
     let mut stdout = BufWriter::new(std::io::stdout().lock());
 
@@ -1611,6 +1610,4 @@ pub(super) fn run_extractor_worker(worker_args: &[std::ffi::OsString]) -> Result
             break;
         }
     }
-
-    Ok(())
 }

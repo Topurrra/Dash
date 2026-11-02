@@ -13,10 +13,10 @@
 //! for preferences and profile data.
 //!
 //! Scoring formula:
-//!   recency  = exp(-age_days × ln(2) / HALF_LIFE_DAYS)
-//!   boost    = ln(launch_count + 1) × recency × MULTIPLIER
+//!   recency  = exp(-age_days × ln(2) / `HALF_LIFE_DAYS`)
+//!   boost    = `ln(launch_count` + 1) × recency × MULTIPLIER
 //!
-//! With HALF_LIFE_DAYS=7 and MULTIPLIER=2.0, the boost ranges from about
+//! With `HALF_LIFE_DAYS=7` and MULTIPLIER=2.0, the boost ranges from about
 //! 1.4 (single launch today) to ~9 (100 launches today), decaying smoothly
 //! over a week and effectively to zero past a month.
 
@@ -64,7 +64,7 @@ const MAX_ENTRIES: usize = 5000;
 pub struct FrecencyEntry {
     pub launch_count: u32,
     pub last_launched_ms: u128,
-    /// The original path as the user activated it (preserves case). The HashMap
+    /// The original path as the user activated it (preserves case). The `HashMap`
     /// key is lowercased for matching, but for display ("Recent Files" rows)
     /// we want the real path. Defaulted for backwards compat with older data.
     #[serde(default)]
@@ -88,7 +88,7 @@ impl Default for FrecencyData {
 static FRECENCY_CACHE: LazyLock<Mutex<Option<FrecencyData>>> = LazyLock::new(|| Mutex::new(None));
 
 fn now_ms() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis())
 }
 
 fn frecency_paths(app: &dyn dash_core::Host) -> Result<(PathBuf, PathBuf, String), String> {
@@ -142,6 +142,11 @@ fn persist(app: &dyn dash_core::Host, data: &FrecencyData) -> Result<(), String>
 /// Record a single activation. Called from the same place we launch/open
 /// the underlying entry. Persists synchronously so a crash before the next
 /// boot doesn't lose the data — writes are cheap (~1ms via redb).
+///
+/// # Errors
+/// When the cache lock fails or the data can't be saved (on a follower,
+/// also when the owner's call fails).
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn record_frecency_launch(
     app: std::sync::Arc<dyn dash_core::Host>,
     kind: String,
@@ -171,7 +176,7 @@ pub fn record_frecency_launch(
     entry.last_launched_ms = now;
     // Always update — if path casing changed (e.g. user switched drives) we
     // want the most recent display form.
-    entry.original_path = path.clone();
+    entry.original_path.clone_from(&path);
 
     // Bound the table size — drop the oldest-by-last-launch entries when over cap.
     if data.entries.len() > MAX_ENTRIES {
@@ -192,14 +197,16 @@ pub fn record_frecency_launch(
 /// Compute the boost an individual entry contributes to a base score.
 /// Public so search.rs can apply it when ranking results.
 #[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    reason = "ln(count + 1) * a 0..=1 decay * 2 stays under 100, so f64 to f32 only drops precision"
+    reason = "an age in ms only rounds in f64 (far finer than the days it becomes); ln(count + 1) * a 0..=1 decay * 2 stays under 100, so f64 to f32 only drops precision"
 )]
 pub fn compute_boost(entry: &FrecencyEntry, now: u128) -> f32 {
     let age_ms = now.saturating_sub(entry.last_launched_ms) as f64;
     let age_days = age_ms / (1000.0 * 60.0 * 60.0 * 24.0);
     let recency = (-age_days * std::f64::consts::LN_2 / HALF_LIFE_DAYS).exp();
-    let freq = ((entry.launch_count as f64) + 1.0).ln();
+    let freq = (f64::from(entry.launch_count) + 1.0).ln();
     (freq * recency * BOOST_MULTIPLIER) as f32
 }
 
@@ -207,7 +214,7 @@ pub fn compute_boost(entry: &FrecencyEntry, now: u128) -> f32 {
 /// Returns 0.0 if the path has never been activated.
 pub fn boost_for(data: &FrecencyData, kind: &str, path: &str, now: u128) -> f32 {
     let key = make_key(kind, path);
-    data.entries.get(&key).map(|entry| compute_boost(entry, now)).unwrap_or(0.0)
+    data.entries.get(&key).map_or(0.0, |entry| compute_boost(entry, now))
 }
 
 /// Snapshot of the current data + a reference timestamp — passed to per-result
@@ -233,7 +240,7 @@ pub fn snapshot(app: &dyn dash_core::Host) -> FrecencySnapshot {
 ///
 /// `size_bytes` and `modified_ms` are populated lazily — only for `file` /
 /// `folder` kinds, and only AFTER the per-kind list has been truncated to
-/// the top-N. This keeps the disk hit bounded (≤ 20 stat() calls per call,
+/// the top-N. This keeps the disk hit bounded (≤ 20 `stat()` calls per call,
 /// in practice 6). Apps / tools don't get stat'd since the preview pane
 /// doesn't show those fields for those kinds.
 ///
@@ -268,6 +275,7 @@ pub struct RecentItemsResult {
 /// Return the top-N entries per kind, ranked by frecency. Used by the overlay
 /// to render a curated "Recent" view when no query is active. Fast — single
 /// pass over the in-memory frecency map (< 5000 entries by design).
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn get_recent_items(app: std::sync::Arc<dyn dash_core::Host>, limit_per_kind: Option<usize>) -> RecentItemsResult {
     on_owner!("get_recent_items", { "limit_per_kind": limit_per_kind }, or_default);
     let limit = limit_per_kind.unwrap_or(4).clamp(1, 20);
@@ -365,6 +373,7 @@ fn derive_display_name(kind: &str, path: &str) -> String {
 ///
 /// The returned paths have their `kind:` prefix stripped — callers ask for one
 /// kind at a time so the keys are unambiguous.
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn get_frecency_boosts(app: std::sync::Arc<dyn dash_core::Host>, kind: String) -> HashMap<String, f32> {
     on_owner!("get_frecency_boosts", { "kind": kind }, or_default);
     let data = load(&app);
@@ -398,10 +407,10 @@ mod tests {
         let before = count();
         let threads: Vec<_> = (0..8)
             .map(|_| {
-                let app = app.clone();
+                let app = Arc::clone(&app);
                 std::thread::spawn(move || {
                     for _ in 0..10 {
-                        record_frecency_launch(app.clone(), "file".into(), "C:/race.txt".into()).unwrap();
+                        record_frecency_launch(Arc::clone(&app), "file".into(), "C:/race.txt".into()).unwrap();
                     }
                 })
             })

@@ -3,6 +3,7 @@
 //! change saves at once; folder changes need a rebuild, which is one click.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use dash_search::search::{self as s, FileSearchIndexOptions, FileSearchStatus};
@@ -32,6 +33,7 @@ enum Folders {
     Ocr,
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "independent page flags, not states of one machine")]
 pub struct Settings {
     section: Section,
     options: Option<FileSearchIndexOptions>,
@@ -109,7 +111,7 @@ impl Settings {
     /// Re-reads everything (each time the page opens).
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let host = crate::host::host();
-        self.options = s::get_file_search_index_options(host.clone()).ok().flatten();
+        self.options = s::get_file_search_index_options(Arc::clone(&host)).ok().flatten();
         self.status = s::get_file_search_status(host).ok();
         self.login = startup::enabled();
         self.ocr_ready = dash_search::ocr::ocr_available();
@@ -143,7 +145,7 @@ impl Settings {
         cx.notify();
     }
 
-    fn add_folders(&mut self, which: Folders, window: &mut Window, cx: &mut Context<Self>) {
+    fn add_folders(which: Folders, window: &mut Window, cx: &mut Context<Self>) {
         PICKING.store(true, Ordering::SeqCst);
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -153,7 +155,7 @@ impl Settings {
         });
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
-            let picked = picked.await.ok().and_then(|r| r.ok()).flatten().unwrap_or_default();
+            let picked = picked.await.ok().and_then(std::result::Result::ok).flatten().unwrap_or_default();
             let _ = handle.update(cx, |_, window, _| window.activate_window());
             PICKING.store(false, Ordering::SeqCst);
             let _ = this.update(cx, |this, cx| {
@@ -263,7 +265,7 @@ impl Settings {
                         },
                         true,
                         cx,
-                    )
+                    );
                 }),
             ))
             .into_any_element()];
@@ -271,7 +273,7 @@ impl Settings {
             let ocr_on = o.ocr_on_index_enabled;
             let semantic_on = o.semantic_search_enabled;
             let (ocr_ready, model_ready) = (self.ocr_ready, self.model_ready);
-            inside.push(self.folder_list(Folders::Inside, "Folders", "Whose files' text is indexed.", &o.roots, cx));
+            inside.push(Self::folder_list(Folders::Inside, "Folders", "Whose files' text is indexed.", &o.roots, cx));
             inside.push(
                 row("Largest file read", Some("Bigger files are found by name only.".into()))
                     .child(chips(
@@ -300,7 +302,7 @@ impl Settings {
                 .into_any_element(),
             );
             if ocr_on {
-                inside.push(self.folder_list(
+                inside.push(Self::folder_list(
                     Folders::Ocr,
                     "Read pictures in",
                     "Only these folders (OCR is slow on whole drives).",
@@ -321,7 +323,7 @@ impl Settings {
                     "semantic",
                     semantic_on,
                     cx.listener(move |this, _, _, cx| {
-                        this.save(|o| o.semantic_search_enabled = !semantic_on, true, cx)
+                        this.save(|o| o.semantic_search_enabled = !semantic_on, true, cx);
                     }),
                 ))
                 .into_any_element(),
@@ -351,7 +353,7 @@ impl Settings {
             .child(summary)
             .child(group(
                 "File names",
-                vec![self.folder_list(
+                vec![Self::folder_list(
                     Folders::Names,
                     "Folders and drives",
                     "Every file and folder name in these can be found.",
@@ -363,7 +365,7 @@ impl Settings {
             .child(group(
                 "Skip",
                 vec![
-                    self.folder_list(
+                    Self::folder_list(
                         Folders::Skipped,
                         "Skipped folders",
                         "Never indexed. Windows and Program Files are always skipped.",
@@ -381,7 +383,7 @@ impl Settings {
                             "hidden",
                             o.include_hidden,
                             cx.listener(move |this, _, _, cx| {
-                                this.save(|o| o.include_hidden = !o.include_hidden, true, cx)
+                                this.save(|o| o.include_hidden = !o.include_hidden, true, cx);
                             }),
                         ))
                         .into_any_element(),
@@ -390,7 +392,7 @@ impl Settings {
                             "watch",
                             o.watcher_enabled,
                             cx.listener(move |this, _, _, cx| {
-                                this.save(|o| o.watcher_enabled = !o.watcher_enabled, false, cx)
+                                this.save(|o| o.watcher_enabled = !o.watcher_enabled, false, cx);
                             }),
                         ))
                         .into_any_element(),
@@ -405,8 +407,8 @@ impl Settings {
                             },
                             cx,
                             |this, v, cx| {
-                                let mode = ["quiet", "balanced", "fast"][v as usize].to_string();
-                                this.save(|o| o.performance_mode = mode, false, cx)
+                                let mode = ["quiet", "balanced", "fast"][usize::try_from(v).unwrap_or(1)].to_string();
+                                this.save(|o| o.performance_mode = mode, false, cx);
                             },
                         ))
                         .into_any_element(),
@@ -417,7 +419,6 @@ impl Settings {
 
     /// A list of folders with "Add folder…", each folder removable.
     fn folder_list(
-        &self,
         which: Folders,
         title: &'static str,
         hint: &'static str,
@@ -432,7 +433,7 @@ impl Settings {
             .child(
                 row(title, Some(hint.into())).child(
                     button_with_icon(id, Icon::Plus, "Add folder")
-                        .on_click(cx.listener(move |this, _, window, cx| this.add_folders(which, window, cx))),
+                        .on_click(cx.listener(move |_, _, window, cx| Self::add_folders(which, window, cx))),
                 ),
             )
             .child(list_items(
@@ -451,12 +452,6 @@ impl Settings {
 
     fn render_clipboard(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         use dash_clipboard as c;
-        let capturing = !c::get_clipboard_paused();
-        let images = c::get_clipboard_images_enabled();
-        let days = c::get_clipboard_retention_days();
-        let image_days = c::get_clipboard_image_retention_days();
-        let apps = c::get_clipboard_exclusions();
-        let confirm = self.confirm_clear;
         const KEEP: &[(u32, &str)] =
             &[(1, "1 day"), (7, "7 days"), (14, "14 days"), (30, "30 days"), (90, "90 days"), (0, "Always")];
         // Images: 2 days by default (they're big).
@@ -469,6 +464,12 @@ impl Settings {
             (90, "90 days"),
             (0, "Always"),
         ];
+        let capturing = !c::get_clipboard_paused();
+        let images = c::get_clipboard_images_enabled();
+        let days = c::get_clipboard_retention_days();
+        let image_days = c::get_clipboard_image_retention_days();
+        let apps = c::get_clipboard_exclusions();
+        let confirm = self.confirm_clear;
         let never = div()
             .flex()
             .flex_col()
@@ -672,7 +673,7 @@ impl Settings {
         let data = crate::host::host().data_dir().unwrap_or_default();
         let engines = match dash_core::link::role() {
             dash_core::link::Role::Follower => {
-                let app = dash_core::link::owner(&data).map(|o| o.app).unwrap_or_else(|| "the other app".into());
+                let app = dash_core::link::owner(&data).map_or_else(|| "the other app".into(), |o| o.app);
                 format!("{app} runs indexing and clipboard saving; Dash uses them and takes over when {app} quits.")
             }
             _ => "Dash runs indexing and clipboard saving here.".into(),
@@ -716,7 +717,7 @@ impl Settings {
                             .unwrap_or(0),
                         cx,
                         |_, v, cx| {
-                            theme::set_mode(theme::Mode::ALL[v as usize], cx.window_appearance());
+                            theme::set_mode(theme::Mode::ALL[usize::try_from(v).unwrap_or(0)], cx.window_appearance());
                             cx.refresh_windows();
                         },
                     ))
@@ -1121,7 +1122,7 @@ fn chips(
         |&(value, label)| {
             let active = value == current;
             div()
-                .id((id, value as usize))
+                .id((id, usize::try_from(value).unwrap_or(0)))
                 .flex()
                 .items_center()
                 .h(px(24.))
@@ -1159,27 +1160,29 @@ mod startup {
 
     #[cfg(windows)]
     pub fn set(on: bool) -> Result<(), String> {
-        // SAFETY: HKCU is a predefined key and the names are static or owned
-        // wide strings; `value` is NUL-terminated, lives past the call, and
-        // the size passed is its length in bytes.
-        unsafe {
-            let result = if on {
-                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-                let value: Vec<u16> =
-                    format!("\"{}\" --background", exe.display()).encode_utf16().chain(Some(0)).collect();
+        let result = if on {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let value: Vec<u16> = format!("\"{}\" --background", exe.display()).encode_utf16().chain(Some(0)).collect();
+            let size = u32::try_from(value.len() * 2).map_err(|_| "Dash's path is too long")?;
+            // SAFETY: HKCU is a predefined key and the names are static or
+            // owned wide strings; `value` is NUL-terminated, lives past the
+            // call, and `size` is its length in bytes.
+            unsafe {
                 RegSetKeyValueW(
                     HKEY_CURRENT_USER,
                     RUN,
                     &HSTRING::from("Dash"),
                     REG_SZ.0,
                     Some(value.as_ptr().cast()),
-                    u32::try_from(value.len() * 2).map_err(|_| "Dash's path is too long")?,
+                    size,
                 )
-            } else {
-                RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN, w!("Dash"))
-            };
-            result.ok().map_err(|e| e.message().to_string())
-        }
+            }
+        } else {
+            // SAFETY: HKCU is a predefined key and the names are static wide
+            // strings.
+            unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN, w!("Dash")) }
+        };
+        result.ok().map_err(|e| e.message().clone())
     }
 
     /// macOS: a LaunchAgent; Linux: an XDG autostart entry.

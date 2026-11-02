@@ -30,6 +30,12 @@ windows = { workspace = true, features = [
 # macOS / Linux clipboard (text + images; Wayland too). Pinned (2026-11-01).
 [target.'cfg(not(windows))'.dependencies]
 arboard = { version = "=3.4.1", features = ["wayland-data-control"] }
+# Paste into the previous app (paste_unix.rs): Cmd+V / Ctrl+V. Pinned (2026-11-02).
+enigo = "=0.6.1"
+
+# Bringing the previous app back to the front (paste_unix.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "libc", "NSWorkspace", "NSRunningApplication"] }
 
 [lints]
 workspace = true

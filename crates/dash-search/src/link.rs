@@ -19,7 +19,7 @@ fn done<T: serde::Serialize>(result: Result<T, String>) -> Result<Value, String>
 /// `runtime` runs the async calls (searches, index builds).
 pub fn link_handler(host: Arc<dyn Host>, runtime: tokio::runtime::Handle) -> Handler {
     Arc::new(move |op: &str, a: Value| {
-        let h = host.clone();
+        let h = Arc::clone(&host);
         let result = match op {
             "cancel_file_search_index_build" => done(s::cancel_file_search_index_build()),
             "stop_file_search_index_watcher" => done(s::stop_file_search_index_watcher(h)),

@@ -1,7 +1,7 @@
 //! Runs in any app that is a `dash_core::Host`.
 //! Text embeddings for semantic search.
 //!
-//! Wraps a bundled EmbeddingGemma 2 ONNX model (text-only, q4, 768-d) via
+//! Wraps a bundled `EmbeddingGemma` 2 ONNX model (text-only, q4, 768-d) via
 //! `ort` + `tokenizers` directly. The model is an asymmetric encoder —
 //! queries get a "task: search result | query: " prefix and documents get
 //! "title: none | text: ". Leaving out the prefixes silently lowers quality.
@@ -23,7 +23,7 @@
 //!
 //! Everything here is offline: the model + tokenizer are read from the
 //! bundled resource dir (`embedding-runtime/`, set via `set_model_dir` at
-//! startup). No HuggingFace download, no network.
+//! startup). No `HuggingFace` download, no network.
 //!
 //! `chunk_text` (below) splits a document into overlapping passages so each
 //! is embedded separately — a long document's specific matching passage is
@@ -49,7 +49,7 @@ pub fn ort_environment() -> Option<&'static ort::environment::Environment> {
     .as_ref()
 }
 
-/// EmbeddingGemma 2 output dimensionality.
+/// `EmbeddingGemma` 2 output dimensionality.
 pub const EMBED_DIM: usize = 768;
 
 /// Absolute path to the bundled model dir (`embedding-runtime/`), resolved
@@ -168,7 +168,7 @@ mod imp {
     }
 
     pub fn is_available() -> bool {
-        MODEL.lock().map(|m| m.is_some()).unwrap_or(false)
+        MODEL.lock().is_ok_and(|m| m.is_some())
     }
 
     fn make_empty_features() -> ort::Result<Tensor<f32>> {
@@ -190,8 +190,8 @@ mod imp {
             let mut ids_flat = Vec::with_capacity(batch_size * seq_len);
             let mut mask_flat = Vec::with_capacity(batch_size * seq_len);
             for enc in &encodings {
-                ids_flat.extend(enc.get_ids().iter().map(|&id| id as i64));
-                mask_flat.extend(enc.get_attention_mask().iter().map(|&m| m as i64));
+                ids_flat.extend(enc.get_ids().iter().map(|&id| i64::from(id)));
+                mask_flat.extend(enc.get_attention_mask().iter().map(|&m| i64::from(m)));
             }
 
             let input_ids = Tensor::<i64>::from_array(([batch_size, seq_len], ids_flat.into_boxed_slice())).ok()?;
@@ -238,7 +238,7 @@ mod imp {
     }
 
     pub fn embed_query(text: &str) -> Option<Vec<f32>> {
-        let prefixed = format!("{}{}", QUERY_PREFIX, text);
+        let prefixed = format!("{QUERY_PREFIX}{text}");
         let mut guard = MODEL.lock().ok()?;
         let model = guard.as_mut()?;
         let mut vecs = raw_embed(model, &[&prefixed])?;
@@ -249,8 +249,8 @@ mod imp {
         if texts.is_empty() {
             return Some(Vec::new());
         }
-        let prefixed: Vec<String> = texts.iter().map(|t| format!("{}{}", DOC_PREFIX, t)).collect();
-        let refs: Vec<&str> = prefixed.iter().map(|s| s.as_str()).collect();
+        let prefixed: Vec<String> = texts.iter().map(|t| format!("{DOC_PREFIX}{t}")).collect();
+        let refs: Vec<&str> = prefixed.iter().map(std::string::String::as_str).collect();
         let mut guard = MODEL.lock().ok()?;
         let model = guard.as_mut()?;
         raw_embed(model, &refs)

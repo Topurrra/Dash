@@ -1,5 +1,6 @@
-"""Draws dash.ico (16-256 px): the tray icon's blue disc with a white ring
-and bar. Standard library only. Run: python -I make_icon.py <out.ico>"""
+"""Draws the app icon: the tray icon's blue disc with a white ring and bar.
+dash.ico (16-256 px) for Windows, .icns for the macOS app, .png (256 px) for
+the AppImage. Standard library only. Run: python -I make_icon.py <out.ico|.icns|.png>"""
 import struct, sys, zlib
 
 
@@ -42,6 +43,20 @@ def ico(sizes):
     return out + b"".join(images)
 
 
+def icns():
+    # PNG entries, under the type codes macOS reads for each size.
+    sizes = ((b"ic07", 128), (b"ic08", 256), (b"ic09", 512))
+    entries = b"".join(kind + struct.pack(">I", 8 + len(data)) + data for kind, data in ((k, png(n)) for k, n in sizes))
+    return b"icns" + struct.pack(">I", 8 + len(entries)) + entries
+
+
 if __name__ == "__main__":
-    with open(sys.argv[1], "wb") as f:
-        f.write(ico([16, 24, 32, 48, 64, 128, 256]))
+    out = sys.argv[1]
+    if out.endswith(".icns"):
+        data = icns()
+    elif out.endswith(".png"):
+        data = png(256)
+    else:
+        data = ico([16, 24, 32, 48, 64, 128, 256])
+    with open(out, "wb") as f:
+        f.write(data)

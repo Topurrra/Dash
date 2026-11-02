@@ -22,7 +22,7 @@
 //! minutes — `SENSITIVE_RETENTION_MS`) instead of the normal one, so
 //! credentials don't linger for days. We also honour the OS "exclude from
 //! clipboard monitors" marker that password fields set, and a user-editable
-//! app exclusion list — capturing from KeePassXC / 1Password is off by
+//! app exclusion list — capturing from `KeePassXC` / 1Password is off by
 //! default since those apps already mark their clipboard data as transient.
 //!
 //! **Persistence — debounced.** Mutations schedule a save 500ms later and
@@ -34,12 +34,17 @@
 //! emits `clipboard-history-updated` through the host so the UI can refresh
 //! without polling.
 
+#[cfg(not(windows))]
+mod paste_unix;
+
 use dash_core::sensitive as sensitive_scan;
 use dash_core::Host;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::AtomicIsize;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -67,10 +72,10 @@ const CF_HDROP: u32 = 15;
 
 /// MIME-typed registered clipboard formats. Browsers, Discord, Slack and
 /// modern image tools put the original file bytes onto the clipboard under
-/// these names alongside CF_DIB — reading the registered format lets us
+/// these names alongside `CF_DIB` — reading the registered format lets us
 /// preserve animation (GIF, animated WebP) and avoid re-encoding losses
-/// (PNG, JPEG). IDs are runtime-allocated by RegisterClipboardFormatW; we
-/// cache them in OnceLocks so the lookup happens at most once per format.
+/// (PNG, JPEG). IDs are runtime-allocated by `RegisterClipboardFormatW`; we
+/// cache them in `OnceLocks` so the lookup happens at most once per format.
 #[cfg(windows)]
 static FORMAT_GIF: OnceLock<u32> = OnceLock::new();
 #[cfg(windows)]
@@ -93,14 +98,14 @@ const MAX_ENTRIES: usize = 200;
 /// Default retention for non-pinned entries — items older than this get
 /// purged on the next cleanup tick. Users can override per-install via the
 /// `set_clipboard_retention_days(n)` command; `0` disables time-based
-/// expiry (only the MAX_ENTRIES cap then applies). Pinned entries are
+/// expiry (only the `MAX_ENTRIES` cap then applies). Pinned entries are
 /// never time-expired regardless of this setting.
 const DEFAULT_RETENTION_DAYS: u32 = 14;
 
 /// How often the save thread runs the retention sweep. The sweep itself is
 /// cheap (one ring-scan) so we can do it generously; this caps the staleness
 /// of an expired entry that's still visible in UI between captures.
-const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Retention window for entries the scanner flagged as sensitive (passwords,
 /// tokens, card numbers). Deliberately short — long enough to paste a copied
@@ -123,7 +128,7 @@ const SAVE_DEBOUNCE_MS: i64 = 500;
 const HISTORY_UPDATED_EVENT: &str = "clipboard-history-updated";
 
 /// Tauri event name. Emitted when an auto-paste attempt couldn't follow
-/// through (SetForegroundWindow refused, SendInput partially failed, etc.).
+/// through (`SetForegroundWindow` refused, `SendInput` partially failed, etc.).
 /// The payload is a short user-facing message the frontend surfaces as a
 /// toast. Text is always already on the clipboard at this point — the
 /// fallback is "press Ctrl+V manually".
@@ -160,7 +165,7 @@ const MAX_DROPPED_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_IMAGE_DISK_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Bounding box (px) for the list-view thumbnail generated at capture time.
-/// 320 px stays crisp on HiDPI displays while encoding to a few tens of KB —
+/// 320 px stays crisp on `HiDPI` displays while encoding to a few tens of KB —
 /// small enough that a 200-entry history of screenshots renders the list
 /// without decoding hundreds of MB of full images.
 const THUMBNAIL_MAX_DIM: u32 = 320;
@@ -205,7 +210,7 @@ pub enum Category {
     FilePath,
     /// Wraps in `{}` or `[]` and parses as JSON.
     Json,
-    /// CSS color (#rgb, #rrggbb, rgb(), rgba(), hsl()) or named common color.
+    /// CSS color (#rgb, #rrggbb, `rgb()`, `rgba()`, `hsl()`) or named common color.
     Color,
     /// 32+ hex chars (MD5 / SHA-1 / SHA-256 / UUIDs / hashes).
     Hash,
@@ -220,7 +225,7 @@ pub enum Category {
 }
 
 /// Discriminant for what kind of clipboard data this entry holds. The
-/// payload fields (text / image_path) are populated based on this. Stored
+/// payload fields (text / `image_path`) are populated based on this. Stored
 /// in serialized form as `"text"` / `"image"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -248,7 +253,7 @@ pub struct ClipboardEntry {
     /// persisted entries that lack this field default to Text via serde.
     #[serde(default = "default_entry_kind")]
     pub kind: EntryKind,
-    /// Full clipboard text (trimmed to MAX_ENTRY_BYTES at capture time).
+    /// Full clipboard text (trimmed to `MAX_ENTRY_BYTES` at capture time).
     /// Empty for image entries.
     #[serde(default)]
     pub text: String,
@@ -262,12 +267,12 @@ pub struct ClipboardEntry {
     #[serde(default)]
     pub source_app_path: Option<String>,
     /// Tags from the sensitive scanner — empty for image entries and for
-    /// normal text. Populated with things like "github_token", "credit_card"
+    /// normal text. Populated with things like "`github_token`", "`credit_card`"
     /// when the content looks like a credential or PII.
     #[serde(default)]
     pub sensitive_kinds: Vec<String>,
     /// Auto-detected content category. Drives UI icons + future quick filters.
-    /// Image entries always carry Category::Image.
+    /// Image entries always carry `Category::Image`.
     #[serde(default = "default_category")]
     pub category: Category,
     /// Sticky entries the user has explicitly kept. Never auto-evicted.
@@ -300,8 +305,8 @@ pub struct ClipboardEntry {
     pub image_size_bytes: Option<u64>,
     /// Original image format the source app placed on the clipboard.
     /// Recognized values: "gif" (animation preserved), "png", "jpeg", "webp",
-    /// "bmp" (from CF_DIB fallback). The file at `image_path` is bytes-
-    /// identical to whatever the source app held, except for the CF_DIB
+    /// "bmp" (from `CF_DIB` fallback). The file at `image_path` is bytes-
+    /// identical to whatever the source app held, except for the `CF_DIB`
     /// case where we transcoded to PNG for storage. Used at paste-back time
     /// to write the matching registered format back, so a copied GIF stays
     /// animated when pasted into Discord / browsers / etc.
@@ -321,6 +326,7 @@ pub struct ExclusionsState {
     pub apps: Vec<String>,
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "independent settings and flags, not one state machine")]
 struct State {
     entries: VecDeque<ClipboardEntry>,
     next_id: u64,
@@ -331,11 +337,11 @@ struct State {
     /// drop captures on the floor without indexing or persisting.
     paused: bool,
     /// Set true while we're writing our own value to the clipboard so the
-    /// listener can skip the resulting WM_CLIPBOARDUPDATE — otherwise picking
+    /// listener can skip the resulting `WM_CLIPBOARDUPDATE` — otherwise picking
     /// a past entry would re-capture it as a brand-new copy.
     suppress_next: bool,
     /// Max age of non-pinned entries before they're swept by the cleanup
-    /// pass. `0` disables time-based expiry (the MAX_ENTRIES cap still
+    /// pass. `0` disables time-based expiry (the `MAX_ENTRIES` cap still
     /// applies). Persisted alongside the entries file.
     retention_days: u32,
     /// Whether image / GIF clipboard data is captured. **Default on**
@@ -381,7 +387,7 @@ impl Default for State {
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 static LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
-/// Stashed AppHandle so the Win32 WindowProc (which has a C signature and
+/// Stashed `AppHandle` so the Win32 `WindowProc` (which has a C signature and
 /// can't take captured state via closure) can reach Tauri APIs for emitting
 /// events and resolving the app data directory.
 static APP_HANDLE: OnceLock<Arc<dyn Host>> = OnceLock::new();
@@ -395,6 +401,7 @@ static SAVE_DEADLINE: AtomicI64 = AtomicI64::new(0);
 /// used by `paste_clipboard_entry` to refocus that window and inject a
 /// synthetic Ctrl+V. A value of 0 means "no captured target" — pastes will
 /// fall back to copy-only behavior.
+#[cfg(windows)]
 static PREVIOUS_FOREGROUND_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// Holds a pending corrupt-history recovery notice — the quarantine filename
@@ -419,7 +426,7 @@ static HISTORY_SAVE_BLOCKED: AtomicBool = AtomicBool::new(false);
 /// only collapses the burst from one physical copy; deliberately re-copying
 /// the same image later still gets its own entry, which preserves the
 /// documented v1 "every image copy is its own entry" decision. If we ever do
-/// want true image dedup, the upgrade path is a hash field on ClipboardEntry
+/// want true image dedup, the upgrade path is a hash field on `ClipboardEntry`
 /// (schema bump + migration) rather than widening this window.
 static LAST_IMAGE: OnceLock<Mutex<Option<ImageStamp>>> = OnceLock::new();
 
@@ -451,7 +458,7 @@ fn last_image() -> &'static Mutex<Option<ImageStamp>> {
 fn is_duplicate_image_burst(bytes: &[u8]) -> bool {
     let digest = *blake3::hash(bytes).as_bytes();
     let now = now_ms();
-    let mut guard = last_image().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = last_image().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dup = matches!(*guard, Some((prev, ts)) if prev == digest && now - ts < IMAGE_BURST_WINDOW_MS);
     *guard = Some((digest, now));
     dup
@@ -466,7 +473,7 @@ fn is_duplicate_image_burst(bytes: &[u8]) -> bool {
 /// one rare panic permanently breaks every clipboard command for the
 /// rest of the session.
 fn locked_state() -> std::sync::MutexGuard<'static, State> {
-    state().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    state().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Largest index <= `max` that is a UTF-8 char boundary in `s`.
@@ -494,7 +501,7 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
 fn now_ms() -> i64 {
     // i64 milliseconds last ~290 million years; saturate rather than wrap
     // if the clock is ever absurd.
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)).unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 fn emit_history_updated() {
@@ -710,7 +717,7 @@ fn looks_like_number(s: &str) -> bool {
         return false;
     }
     let mut chars = s.chars().peekable();
-    if matches!(chars.peek(), Some('-') | Some('+')) {
+    if matches!(chars.peek(), Some('-' | '+')) {
         chars.next();
     }
     let mut saw_digit = false;
@@ -797,7 +804,7 @@ fn delete_image_file_for_entry(entry: &ClipboardEntry) {
     for path in [entry.image_path.as_ref(), entry.thumbnail_path.as_ref()].into_iter().flatten() {
         if let Err(error) = std::fs::remove_file(path) {
             if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("clipboard_history: could not delete image file {:?}: {error}", path);
+                eprintln!("clipboard_history: could not delete image file {}: {error}", path.display());
             }
         }
     }
@@ -814,8 +821,8 @@ fn schedule_save() {
 /// Background flush thread. Wakes periodically; flushes if the deadline has
 /// passed since the last mutation. Cost: one Mutex lock + atomic check every
 /// 200ms when nothing's happening (negligible). Also runs the retention
-/// sweep once per RETENTION_SWEEP_INTERVAL to purge stale non-pinned entries.
-fn run_save_thread(app: Arc<dyn Host>) {
+/// sweep once per `RETENTION_SWEEP_INTERVAL` to purge stale non-pinned entries.
+fn run_save_thread(app: &dyn Host) {
     let mut last_sweep_at_ms = now_ms();
     loop {
         std::thread::sleep(Duration::from_millis(200));
@@ -844,7 +851,7 @@ fn run_save_thread(app: Arc<dyn Host>) {
         if SAVE_DEADLINE.compare_exchange(deadline, 0, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             continue;
         }
-        flush_to_disk(&app);
+        flush_to_disk(app);
     }
 }
 
@@ -887,9 +894,9 @@ fn run_retention_sweep() -> bool {
 
         let now = now_ms();
         let text_cutoff =
-            if text_retention > 0 { Some(now - (text_retention as i64) * 24 * 60 * 60 * 1000) } else { None };
+            if text_retention > 0 { Some(now - i64::from(text_retention) * 24 * 60 * 60 * 1000) } else { None };
         let image_cutoff =
-            if image_retention > 0 { Some(now - (image_retention as i64) * 24 * 60 * 60 * 1000) } else { None };
+            if image_retention > 0 { Some(now - i64::from(image_retention) * 24 * 60 * 60 * 1000) } else { None };
         // Entries the scanner flagged as sensitive expire on a short window
         // regardless of the general retention setting — long enough to paste
         // a copied secret, short enough not to hoard credentials.
@@ -954,37 +961,25 @@ fn default_image_retention_days_serde() -> u32 {
     2
 }
 
-/// At-rest encryption for the clipboard history file. On Windows the bytes
-/// are DPAPI-protected — the same per-user envelope `local_db` uses, so a copy
-/// of the file is opaque to another account / machine. Other platforms pass
-/// through unchanged until a platform keystore is wired up. A failed encrypt
-/// degrades to writing plaintext rather than losing the save.
-#[cfg(windows)]
+/// At-rest encryption for the clipboard history file — the same per-user
+/// envelope `local_db` uses (DPAPI on Windows, the keychain's key on macOS /
+/// Linux; see `dash_core::at_rest`), so a copy of the file is opaque to
+/// another account / machine. A failed encrypt degrades to writing
+/// plaintext rather than losing the save.
 fn protect_at_rest(plaintext: &[u8]) -> Vec<u8> {
-    dash_core::dpapi::protect(plaintext).unwrap_or_else(|error| {
+    dash_core::at_rest::protect(plaintext).unwrap_or_else(|error| {
         eprintln!("clipboard_history: at-rest encrypt failed ({error}); writing plaintext");
         plaintext.to_vec()
     })
 }
 
-#[cfg(not(windows))]
-fn protect_at_rest(plaintext: &[u8]) -> Vec<u8> {
-    plaintext.to_vec()
-}
-
-/// Inverse of `protect_at_rest`. `dpapi::unprotect` already passes a legacy
-/// plaintext file through unchanged (it checks a version byte), so an existing
-/// unencrypted history file upgrades transparently — the next save re-writes
-/// it encrypted. A genuine decrypt failure returns the blob unchanged so the
-/// JSON parse fails and `load_from_disk`'s corrupt-file quarantine takes over.
-#[cfg(windows)]
+/// Inverse of `protect_at_rest`. A legacy plaintext file passes through
+/// unchanged (no version byte), so an existing unencrypted history file
+/// upgrades transparently — the next save re-writes it encrypted. A genuine
+/// decrypt failure returns the blob unchanged so the JSON parse fails and
+/// `load_from_disk`'s corrupt-file quarantine takes over.
 fn unprotect_at_rest(blob: &[u8]) -> Vec<u8> {
-    dash_core::dpapi::unprotect(blob).unwrap_or_else(|_| blob.to_vec())
-}
-
-#[cfg(not(windows))]
-fn unprotect_at_rest(blob: &[u8]) -> Vec<u8> {
-    blob.to_vec()
+    dash_core::at_rest::unprotect(blob).unwrap_or_else(|_| blob.to_vec())
 }
 
 fn flush_to_disk(app: &dyn Host) {
@@ -1028,10 +1023,7 @@ fn flush_to_disk(app: &dyn Host) {
 }
 
 fn save_exclusions(app: &dyn Host) {
-    let path = match exclusions_path(app) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+    let Ok(path) = exclusions_path(app) else { return };
     let exclusions = locked_state().exclusions.clone();
     let state_payload = ExclusionsState { apps: exclusions };
     let Ok(json) = serde_json::to_vec_pretty(&state_payload) else { return };
@@ -1103,7 +1095,8 @@ fn load_from_disk(app: &dyn Host) {
                 match std::fs::rename(&path, &quarantine) {
                     Ok(()) => {
                         eprintln!(
-                            "clipboard_history: history file corrupt — quarantined to {quarantine:?}, starting fresh"
+                            "clipboard_history: history file corrupt — quarantined to {}, starting fresh",
+                            quarantine.display()
                         );
                         // Park a one-time notice so the in-app Clipboard page
                         // can tell the user their history was reset (and where
@@ -1113,7 +1106,7 @@ fn load_from_disk(app: &dyn Host) {
                             .and_then(|n| n.to_str())
                             .unwrap_or("history.corrupt.json")
                             .to_string();
-                        *recovery_notice().lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name);
+                        *recovery_notice().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(name);
                     }
                     Err(error) => {
                         eprintln!(
@@ -1141,7 +1134,7 @@ fn load_from_disk(app: &dyn Host) {
     if let Ok(images_dir) = app.data_dir().map(|d| d.join(IMAGE_STORAGE_SUBDIR)) {
         let mut guard = locked_state();
         let mut moved = false;
-        for entry in guard.entries.iter_mut() {
+        for entry in &mut guard.entries {
             for slot in [&mut entry.image_path, &mut entry.thumbnail_path] {
                 moved |= rebase_into(slot, &images_dir);
             }
@@ -1231,10 +1224,7 @@ fn sweep_orphan_image_files(app: &dyn Host) {
         if !is_ours {
             continue;
         }
-        let canonical = match path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
+        let Ok(canonical) = path.canonicalize() else { continue };
         if !referenced.contains(&canonical) && std::fs::remove_file(&canonical).is_ok() {
             deleted += 1;
         }
@@ -1250,7 +1240,7 @@ fn sweep_orphan_image_files(app: &dyn Host) {
 /// Core "we saw a new clipboard event" path. Tries text first (most copies
 /// are text); falls through to image capture if images are enabled and no
 /// text was found. Writes the entry, schedules a save, emits the change
-/// event. Called from the Win32 WindowProc on WM_CLIPBOARDUPDATE, or by the
+/// event. Called from the Win32 `WindowProc` on `WM_CLIPBOARDUPDATE`, or by the
 /// polling listener on macOS / Linux.
 fn on_clipboard_change() {
     // If a previous copy_back-to-clipboard set suppress_next, consume it and
@@ -1290,7 +1280,7 @@ fn on_clipboard_change() {
                 text.truncate(floor_char_boundary(&text, MAX_ENTRY_BYTES));
             }
             let sensitive_kinds: Vec<String> =
-                sensitive_scan::scan_text(&text).into_iter().map(|s| s.to_string()).collect();
+                sensitive_scan::scan_text(&text).into_iter().map(std::string::ToString::to_string).collect();
             let category = categorize(&text);
             push_text_entry(text, source_app, source_app_path, sensitive_kinds, category);
             schedule_save();
@@ -1328,7 +1318,7 @@ fn on_clipboard_change() {
             for &(fmt_id, ext) in candidates {
                 if let Some(bytes) = read_clipboard_raw_bytes(fmt_id) {
                     let (bytes, ext) = fit_captured_image(bytes, ext);
-                    push_image_entry(bytes, source_app.clone(), source_app_path.clone(), &ext);
+                    push_image_entry(&bytes, source_app.clone(), source_app_path.clone(), &ext);
                     schedule_save();
                     emit_history_updated();
                     return;
@@ -1342,21 +1332,24 @@ fn on_clipboard_change() {
             let dropped_paths = read_clipboard_file_paths();
             for path in &dropped_paths {
                 if let Some(format) = image_format_from_path(path) {
-                    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    let size = std::fs::metadata(path).map_or(0, |m| m.len());
                     if size > MAX_DROPPED_FILE_BYTES {
-                        eprintln!("clipboard_history: skipping dropped file {path:?} ({size} bytes, too large)");
+                        eprintln!(
+                            "clipboard_history: skipping dropped file {} ({size} bytes, too large)",
+                            path.display()
+                        );
                         continue;
                     }
                     match std::fs::read(path) {
                         Ok(bytes) => {
                             let (bytes, format) = fit_captured_image(bytes, format);
-                            push_image_entry(bytes, source_app.clone(), source_app_path.clone(), &format);
+                            push_image_entry(&bytes, source_app.clone(), source_app_path.clone(), &format);
                             schedule_save();
                             emit_history_updated();
                             return;
                         }
                         Err(error) => {
-                            eprintln!("clipboard_history: failed to read dropped file {:?}: {error}", path);
+                            eprintln!("clipboard_history: failed to read dropped file {}: {error}", path.display());
                             // Try the next path (multi-file copy).
                         }
                     }
@@ -1371,7 +1364,7 @@ fn on_clipboard_change() {
         // animated bytes were never on the clipboard to begin with.
         if let Some(png_bytes) = read_clipboard_image_as_png() {
             let (png_bytes, format) = fit_captured_image(png_bytes, "png");
-            push_image_entry(png_bytes, source_app, source_app_path, &format);
+            push_image_entry(&png_bytes, source_app, source_app_path, &format);
             schedule_save();
             emit_history_updated();
         }
@@ -1380,8 +1373,9 @@ fn on_clipboard_change() {
 
 /// Map a file extension to one of our supported image format strings.
 /// Returns None if the extension isn't a recognized image format — that's
-/// what filters out copied PDFs / docs / random files from the CF_HDROP
+/// what filters out copied PDFs / docs / random files from the `CF_HDROP`
 /// pipeline.
+#[cfg(windows)]
 fn image_format_from_path(path: &std::path::Path) -> Option<&'static str> {
     let ext = path.extension().and_then(|e| e.to_str())?.to_lowercase();
     match ext.as_str() {
@@ -1507,7 +1501,7 @@ fn downscale_static_image(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// Bring a freshly-captured image under `MAX_IMAGE_BYTES` rather than dropping
 /// the capture when it is too big. Static images (PNG / JPEG / BMP / the
-/// CF_DIB transcode) are downscaled and re-encoded as PNG. Animated images
+/// `CF_DIB` transcode) are downscaled and re-encoded as PNG. Animated images
 /// (GIF, animated WebP) are returned untouched — re-encoding them would
 /// silently flatten the animation, so an oversized animation is kept as-is and
 /// the cumulative disk-budget enforcer (`MAX_IMAGE_DISK_BYTES`) bounds the
@@ -1559,20 +1553,19 @@ fn generate_thumbnail(full_bytes: &[u8], id: u64, dir: &std::path::Path) -> Opti
 /// a perceptual hash to dedup *similar* screenshots isn't worth the
 /// complexity for v1. Byte-identical repeats arriving in the same instant are
 /// a different matter: those are one copy that Windows reported more than
-/// once, and `is_duplicate_image_burst` drops them (see LAST_IMAGE).
-fn push_image_entry(bytes: Vec<u8>, source_app: Option<String>, source_app_path: Option<String>, image_format: &str) {
+/// once, and `is_duplicate_image_burst` drops them (see `LAST_IMAGE`).
+fn push_image_entry(bytes: &[u8], source_app: Option<String>, source_app_path: Option<String>, image_format: &str) {
     // Checked before the id allocation and the disk write below, so a repeat
     // event costs nothing but a hash — no orphaned file, no id burned.
-    if is_duplicate_image_burst(&bytes) {
+    if is_duplicate_image_burst(bytes) {
         return;
     }
 
-    let app = match APP_HANDLE.get() {
-        Some(a) => a.clone(),
-        None => {
-            eprintln!("clipboard_history: APP_HANDLE not set; skipping image capture");
-            return;
-        }
+    let app = if let Some(a) = APP_HANDLE.get() {
+        Arc::clone(a)
+    } else {
+        eprintln!("clipboard_history: APP_HANDLE not set; skipping image capture");
+        return;
     };
 
     let id = {
@@ -1597,7 +1590,7 @@ fn push_image_entry(bytes: Vec<u8>, source_app: Option<String>, source_app_path:
         other => other,
     };
     let path = dir.join(format!("{id}.{ext}"));
-    if let Err(error) = std::fs::write(&path, &bytes) {
+    if let Err(error) = std::fs::write(&path, bytes) {
         eprintln!("clipboard_history: image write failed: {error}");
         return;
     }
@@ -1610,7 +1603,7 @@ fn push_image_entry(bytes: Vec<u8>, source_app: Option<String>, source_app_path:
     // Generate the list-view thumbnail now, while we still hold the bytes in
     // memory. Failure is non-fatal — the entry is kept and the UI falls back
     // to the full image.
-    let thumbnail_path = generate_thumbnail(&bytes, id, &dir);
+    let thumbnail_path = generate_thumbnail(bytes, id, &dir);
 
     let mut guard = locked_state();
     guard.entries.push_front(ClipboardEntry {
@@ -1628,7 +1621,7 @@ fn push_image_entry(bytes: Vec<u8>, source_app: Option<String>, source_app_path:
         thumbnail_path,
         image_width: Some(width),
         image_height: Some(height),
-        image_size_bytes: Some(bytes.len() as u64),
+        image_size_bytes: u64::try_from(bytes.len()).ok(),
         image_format: Some(image_format.to_string()),
     });
 
@@ -1650,7 +1643,7 @@ fn delete_image_files(evicted: &[ClipboardEntry]) {
     }
 }
 
-/// Trim the back of the ring to MAX_ENTRIES, skipping pinned items. Returns
+/// Trim the back of the ring to `MAX_ENTRIES`, skipping pinned items. Returns
 /// the evicted entries; the caller deletes their image files (via
 /// `delete_image_files`) once the state lock is released — leaving orphan
 /// PNGs would silently accumulate forever.
@@ -1734,6 +1727,10 @@ macro_rules! on_owner {
 
 // ─── Commands ────────────────────────────────────────────────────────────
 
+/// Starts clipboard capture (on a follower: once it becomes the owner).
+///
+/// # Errors
+/// Returns `Err` if a background thread can't be started.
 pub fn start_clipboard_listener(app: Arc<dyn Host>) -> Result<(), String> {
     if dash_core::link::is_follower() {
         dash_core::link::when_owner(move || {
@@ -1744,21 +1741,21 @@ pub fn start_clipboard_listener(app: Arc<dyn Host>) -> Result<(), String> {
     if LISTENER_STARTED.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
-    let _ = APP_HANDLE.set(app.clone());
+    let _ = APP_HANDLE.set(Arc::clone(&app));
     load_from_disk(&app);
 
     // Spawn the Win32 message-pump thread (event-driven, zero idle CPU).
-    let app_for_listener = app.clone();
+    let app_for_listener = Arc::clone(&app);
     std::thread::Builder::new()
         .name("dash-clipboard-listener-supervisor".to_string())
-        .spawn(move || run_listener_supervisor(app_for_listener))
+        .spawn(move || run_listener_supervisor(&app_for_listener))
         .map_err(|e| format!("spawn clipboard listener: {e}"))?;
 
     // Spawn the debounced save thread.
     let app_for_saver = app;
     std::thread::Builder::new()
         .name("dash-clipboard-saver".to_string())
-        .spawn(move || run_save_thread(app_for_saver))
+        .spawn(move || run_save_thread(&*app_for_saver))
         .map_err(|e| format!("spawn clipboard saver: {e}"))?;
 
     Ok(())
@@ -1775,9 +1772,14 @@ pub fn get_clipboard_history() -> Vec<ClipboardEntry> {
 /// time rather than on every mount. Called on page mount.
 pub fn take_clipboard_recovery_notice() -> Option<String> {
     on_owner!("take_clipboard_recovery_notice", {}, or_default);
-    recovery_notice().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+    recovery_notice().lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
 }
 
+/// Removes every entry except pinned ones (and their image files).
+///
+/// # Errors
+/// Returns `Err` only when this process follows another and the call to
+/// the owner fails.
 pub fn clear_clipboard_history() -> Result<(), String> {
     on_owner!("clear_clipboard_history", {});
     let removed: Vec<ClipboardEntry> = {
@@ -1803,6 +1805,11 @@ pub fn clear_clipboard_history() -> Result<(), String> {
     Ok(())
 }
 
+/// Pins or unpins one entry; unknown ids are ignored.
+///
+/// # Errors
+/// Returns `Err` only when this process follows another and the call to
+/// the owner fails.
 pub fn pin_clipboard_entry(id: u64, pinned: bool) -> Result<(), String> {
     on_owner!("pin_clipboard_entry", { "id": id, "pinned": pinned });
     {
@@ -1825,6 +1832,10 @@ pub fn pin_clipboard_entry(id: u64, pinned: bool) -> Result<(), String> {
 /// UI in place of the content preview so users can recognize "my email
 /// signature" without scanning the actual bytes. Only meaningful for pinned
 /// entries — silently ignored for transient ones.
+///
+/// # Errors
+/// Returns `Err` only when this process follows another and the call to
+/// the owner fails.
 pub fn label_clipboard_entry(id: u64, label: Option<String>) -> Result<(), String> {
     on_owner!("label_clipboard_entry", { "id": id, "label": label });
     {
@@ -1840,6 +1851,11 @@ pub fn label_clipboard_entry(id: u64, label: Option<String>) -> Result<(), Strin
     Ok(())
 }
 
+/// Removes one entry (and its image file); unknown ids are ignored.
+///
+/// # Errors
+/// Returns `Err` only when this process follows another and the call to
+/// the owner fails.
 pub fn delete_clipboard_entry(id: u64) -> Result<(), String> {
     on_owner!("delete_clipboard_entry", { "id": id });
     // Capture the entry (and its image path if any) before removing it from
@@ -1861,6 +1877,10 @@ pub fn delete_clipboard_entry(id: u64) -> Result<(), String> {
 /// the whole batch, so a 50-item bulk delete does not trigger 50 separate
 /// history refreshes in the UI. Image files for removed image entries are
 /// unlinked, same as the single-id path. Unknown ids are silently ignored.
+///
+/// # Errors
+/// Returns `Err` only when this process follows another and the call to
+/// the owner fails.
 pub fn delete_clipboard_entries(ids: Vec<u64>) -> Result<(), String> {
     on_owner!("delete_clipboard_entries", { "ids": ids });
     let id_set: std::collections::HashSet<u64> = ids.into_iter().collect();
@@ -1895,6 +1915,10 @@ pub fn delete_clipboard_entries(ids: Vec<u64>) -> Result<(), String> {
 /// batch. Unpinning clears each entry's label (consistent with the single-id
 /// `pin_clipboard_entry`, since `pin_label` has no meaning for non-pinned
 /// entries). Unknown ids are silently ignored.
+///
+/// # Errors
+/// Returns `Err` only when this process follows another and the call to
+/// the owner fails.
 pub fn pin_clipboard_entries(ids: Vec<u64>, pinned: bool) -> Result<(), String> {
     on_owner!("pin_clipboard_entries", { "ids": ids, "pinned": pinned });
     let id_set: std::collections::HashSet<u64> = ids.into_iter().collect();
@@ -1903,7 +1927,7 @@ pub fn pin_clipboard_entries(ids: Vec<u64>, pinned: bool) -> Result<(), String> 
     }
     {
         let mut guard = locked_state();
-        for entry in guard.entries.iter_mut() {
+        for entry in &mut guard.entries {
             if id_set.contains(&entry.id) {
                 entry.is_pinned = pinned;
                 if !pinned {
@@ -1919,12 +1943,17 @@ pub fn pin_clipboard_entries(ids: Vec<u64>, pinned: bool) -> Result<(), String> 
 
 /// Promote a past entry back to the OS clipboard. The user then pastes
 /// manually with Ctrl+V. Kept around as a no-side-effects path — most
-/// callers should use `paste_clipboard_entry` (with auto_paste=true) for
+/// callers should use `paste_clipboard_entry` (with `auto_paste=true`) for
 /// the full "magic" experience where the keystroke is also injected.
 ///
-/// Dispatches on entry kind: text entries write CF_UNICODETEXT, image
-/// entries decode the on-disk PNG and write CF_DIB so the target app sees
+/// Dispatches on entry kind: text entries write `CF_UNICODETEXT`, image
+/// entries decode the on-disk PNG and write `CF_DIB` so the target app sees
 /// it as a regular image paste.
+///
+/// # Errors
+/// Returns `Err` if the entry doesn't exist, its image file is missing or
+/// unreadable, the clipboard can't be written, or (on a follower) the call
+/// to the owner fails.
 pub fn copy_clipboard_entry_to_clipboard(id: u64) -> Result<(), String> {
     on_owner!("copy_clipboard_entry_to_clipboard", { "id": id });
     let snapshot = entry_snapshot(id)?;
@@ -1951,9 +1980,13 @@ pub fn copy_clipboard_entry_to_clipboard(id: u64) -> Result<(), String> {
 /// user has disabled the feature, or when we couldn't capture a target
 /// window (e.g. overlay was opened via tray click, not the global hotkey).
 ///
-/// Failure modes are intentionally tolerant: if SetForegroundWindow fails
+/// Failure modes are intentionally tolerant: if `SetForegroundWindow` fails
 /// (Win32 has restrictions on which processes can steal focus), the text
 /// still lives on the clipboard so the user can Ctrl+V manually.
+///
+/// # Errors
+/// Returns `Err` if the entry can't be put on the clipboard (see
+/// `copy_clipboard_entry_to_clipboard`) or the paste thread can't be started.
 pub fn paste_clipboard_entry(id: u64, auto_paste: Option<bool>) -> Result<(), String> {
     copy_clipboard_entry_to_clipboard(id)?;
 
@@ -1987,11 +2020,18 @@ pub fn paste_clipboard_entry(id: u64, auto_paste: Option<bool>) -> Result<(), St
             })
             .map_err(|e| format!("spawn paste injector: {e}"))?;
     }
+    #[cfg(not(windows))]
+    paste_unix::paste_soon(None)?;
     Ok(())
 }
 
 /// Puts `text` on the clipboard without it entering the history (the
 /// owner's capture ignores its own writes).
+///
+/// # Errors
+/// Returns `Err` if the clipboard can't be written, or (on a follower) the
+/// call to the owner fails.
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn write_clipboard_text(text: String) -> Result<(), String> {
     on_owner!("write_clipboard_text", { "text": text });
     arm_self_write_suppression();
@@ -2038,12 +2078,17 @@ pub fn link_handler() -> dash_core::link::Handler {
     })
 }
 
-/// Paste a snippet expansion's body using the same clipboard + SendInput
+/// Paste a snippet expansion's body using the same clipboard + `SendInput`
 /// pipeline as `paste_clipboard_entry`. Caller provides the already-
 /// expanded text (variables resolved by the snippets module). Mirrors
 /// `paste_clipboard_entry` but with raw text in lieu of a history-entry
 /// lookup — keeps snippet expansions and history pastes on identical
 /// focus-restore + injection paths so they feel identical to the user.
+///
+/// # Errors
+/// Returns `Err` if the text can't be put on the clipboard or the paste
+/// thread can't be started.
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn paste_snippet_text(
     text: String,
     auto_paste: Option<bool>,
@@ -2054,11 +2099,8 @@ pub fn paste_snippet_text(
     // Snapshot it BEFORE we overwrite; only text content is restorable
     // (an image / files on the clipboard yield None — the dictated text
     // then stays, the pre-#22 behaviour).
-    #[cfg(windows)]
     let prior_clipboard: Option<String> =
         if restore_clipboard.unwrap_or(false) { read_clipboard_text().filter(|t| !t.is_empty()) } else { None };
-    #[cfg(not(windows))]
-    let _ = restore_clipboard;
 
     write_clipboard_text(text.clone())?;
 
@@ -2088,6 +2130,8 @@ pub fn paste_snippet_text(
             })
             .map_err(|e| format!("spawn snippet paste injector: {e}"))?;
     }
+    #[cfg(not(windows))]
+    paste_unix::paste_soon(prior_clipboard)?;
     Ok(())
 }
 
@@ -2115,6 +2159,9 @@ fn rescue_text_to_clipboard(text: &str) {
 /// history). Used by the voice overlay and push-to-talk when the voice
 /// output mode is set to "type". On any failure the text is rescued onto the
 /// clipboard so it is never lost.
+///
+/// # Errors
+/// Returns `Err` if the typing thread can't be started.
 pub fn type_out_text(text: String) -> Result<(), String> {
     if text.is_empty() {
         return Ok(());
@@ -2139,16 +2186,12 @@ pub fn type_out_text(text: String) -> Result<(), String> {
                 // window time to hide so focus reverts to the user's app
                 // before the keystrokes are dispatched.
                 std::thread::sleep(Duration::from_millis(30));
-                focus_and_type(target, text);
+                focus_and_type(target, &text);
             })
             .map_err(|e| format!("spawn voice typeout injector: {e}"))?;
     }
     #[cfg(not(windows))]
-    {
-        // Keystroke synthesis is Windows-only for now — mirrors the
-        // `paste_snippet_text` paste path being a `#[cfg(windows)]` block.
-        let _ = text;
-    }
+    paste_unix::type_soon(text)?;
     Ok(())
 }
 
@@ -2170,11 +2213,11 @@ pub fn remember_foreground_window() {
 
 #[cfg(not(windows))]
 pub fn remember_foreground_window() {
-    // No-op on non-Windows — paste simulation is Windows-only for now.
+    paste_unix::remember_front_app();
 }
 
 /// Pull a small snapshot of an entry's payload-relevant fields. Cloning the
-/// whole ClipboardEntry would be wasteful for image entries (text/sensitive
+/// whole `ClipboardEntry` would be wasteful for image entries (text/sensitive
 /// vecs are empty there anyway), so we lift just what we need. Returns a
 /// helper struct rather than the full entry to make callsites read clearly.
 struct EntrySnapshot {
@@ -2212,6 +2255,11 @@ pub fn get_clipboard_exclusions() -> Vec<String> {
     locked_state().exclusions.clone()
 }
 
+/// Replaces the list of apps whose copies aren't captured.
+///
+/// # Errors
+/// Returns `Err` only when this process follows another and the call to
+/// the owner fails.
 pub fn set_clipboard_exclusions(apps: Vec<String>) -> Result<(), String> {
     on_owner!("set_clipboard_exclusions", { "apps": apps });
     let normalized: Vec<String> = apps.into_iter().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
@@ -2229,6 +2277,10 @@ pub fn set_clipboard_exclusions(apps: Vec<String>) -> Result<(), String> {
 /// Reset the exclusion list to the built-in defaults. Useful escape hatch if
 /// the user has mangled their list and wants the sensible password-manager
 /// presets back without typing them in.
+///
+/// # Errors
+/// Returns `Err` only when this process follows another and the call to
+/// the owner fails.
 pub fn reset_clipboard_exclusions_to_defaults() -> Result<(), String> {
     on_owner!("reset_clipboard_exclusions_to_defaults", {});
     {
@@ -2261,6 +2313,11 @@ pub fn get_clipboard_paused() -> bool {
     locked_state().paused
 }
 
+/// Pauses or resumes capture.
+///
+/// # Errors
+/// Returns `Err` only when this process follows another and the call to
+/// the owner fails.
 pub fn set_clipboard_paused(paused: bool) -> Result<(), String> {
     on_owner!("set_clipboard_paused", { "paused": paused });
     locked_state().paused = paused;
@@ -2273,6 +2330,11 @@ pub fn get_clipboard_images_enabled() -> bool {
     locked_state().images_enabled
 }
 
+/// Turns image capture on or off.
+///
+/// # Errors
+/// Returns `Err` only when this process follows another and the call to
+/// the owner fails.
 pub fn set_clipboard_images_enabled(enabled: bool) -> Result<(), String> {
     on_owner!("set_clipboard_images_enabled", { "enabled": enabled });
     locked_state().images_enabled = enabled;
@@ -2289,6 +2351,10 @@ pub fn get_clipboard_image_retention_days() -> u32 {
 /// Update the time-based retention threshold for image entries. Clamped to
 /// 0..=90 because images are large and very long retention windows can
 /// accumulate gigabytes on disk. `0` disables time-expiry for images.
+///
+/// # Errors
+/// Returns `Err` only when this process follows another and the call to
+/// the owner fails.
 pub fn set_clipboard_image_retention_days(days: u32) -> Result<(), String> {
     on_owner!("set_clipboard_image_retention_days", { "days": days });
     let clamped = days.min(90);
@@ -2306,6 +2372,10 @@ pub fn get_clipboard_retention_days() -> u32 {
 /// Update the time-based retention threshold. `0` disables time-expiry (only
 /// the 200-entry cap will apply). Clamped to 0..=365. Persisted so it
 /// survives restarts.
+///
+/// # Errors
+/// Returns `Err` only when this process follows another and the call to
+/// the owner fails.
 pub fn set_clipboard_retention_days(days: u32) -> Result<(), String> {
     on_owner!("set_clipboard_retention_days", { "days": days });
     let clamped = days.min(365);
@@ -2357,23 +2427,26 @@ fn run_listener_thread(_app: Arc<dyn Host>) {
     let class_name_wide: Vec<u16> = WINDOW_CLASS_NAME.encode_utf16().chain(std::iter::once(0)).collect();
 
     // SAFETY: WNDCLASSEXW is a plain C struct for which all-zero is a valid
-    // (empty) value, and so is MSG. `class_name_wide` is NUL-terminated and
-    // outlives both RegisterClassExW and CreateWindowExW. `wnd_proc` matches
-    // the WNDPROC signature, and `msg` is a local the pump owns.
-    unsafe {
-        let mut wc: WNDCLASSEXW = std::mem::zeroed();
-        wc.cbSize = u32::try_from(std::mem::size_of::<WNDCLASSEXW>()).expect("WNDCLASSEXW is 80 bytes");
-        wc.lpfnWndProc = Some(wnd_proc);
-        wc.hInstance =
-            windows::Win32::System::LibraryLoader::GetModuleHandleW(PCWSTR::null()).unwrap_or_default().into();
-        wc.lpszClassName = PCWSTR(class_name_wide.as_ptr());
+    // (empty) value.
+    let mut wc: WNDCLASSEXW = unsafe { std::mem::zeroed() };
+    wc.cbSize = u32::try_from(std::mem::size_of::<WNDCLASSEXW>()).expect("WNDCLASSEXW is 80 bytes");
+    wc.lpfnWndProc = Some(wnd_proc);
+    // SAFETY: a null name asks for this executable's own module handle.
+    wc.hInstance =
+        unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(PCWSTR::null()) }.unwrap_or_default().into();
+    wc.lpszClassName = PCWSTR(class_name_wide.as_ptr());
 
-        // Registration can legitimately fail if we're re-entering after the
-        // class was already registered for this process. ATOM = 0 → already
-        // registered; not fatal.
-        let _ = RegisterClassExW(&wc);
+    // Registration can legitimately fail if we're re-entering after the
+    // class was already registered for this process. ATOM = 0 → already
+    // registered; not fatal.
+    // SAFETY: `wc` is fully set up, `wnd_proc` matches the WNDPROC signature,
+    // and `class_name_wide` is NUL-terminated and outlives the call.
+    let _ = unsafe { RegisterClassExW(&raw const wc) };
 
-        let hwnd = CreateWindowExW(
+    // SAFETY: `class_name_wide` is NUL-terminated and outlives the call; the
+    // other arguments are plain values (HWND_MESSAGE = message-only window).
+    let hwnd = unsafe {
+        CreateWindowExW(
             WINDOW_EX_STYLE(0),
             PCWSTR(class_name_wide.as_ptr()),
             PCWSTR::null(),
@@ -2386,25 +2459,30 @@ fn run_listener_thread(_app: Arc<dyn Host>) {
             None,
             wc.hInstance,
             None,
-        );
-        if hwnd.0 == 0 {
-            eprintln!("clipboard_history: CreateWindowExW failed");
-            return;
-        }
+        )
+    };
+    if hwnd.0 == 0 {
+        eprintln!("clipboard_history: CreateWindowExW failed");
+        return;
+    }
 
-        if AddClipboardFormatListener(hwnd).is_err() {
-            eprintln!("clipboard_history: AddClipboardFormatListener failed");
-            return;
-        }
+    // SAFETY: `hwnd` is the window just created on this thread.
+    if unsafe { AddClipboardFormatListener(hwnd) }.is_err() {
+        eprintln!("clipboard_history: AddClipboardFormatListener failed");
+        return;
+    }
 
-        // Message pump — GetMessageW blocks until a message arrives. Idle
-        // CPU is literally 0% (the thread is parked by the OS).
-        let mut msg: MSG = std::mem::zeroed();
-        // 0 = WM_QUIT, -1 = error: stop on both.
-        while GetMessageW(&mut msg, HWND(0), 0, 0).0 > 0 {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+    // Message pump — GetMessageW blocks until a message arrives. Idle
+    // CPU is literally 0% (the thread is parked by the OS).
+    // SAFETY: MSG is a plain C struct for which all-zero is a valid value.
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    // 0 = WM_QUIT, -1 = error: stop on both.
+    // SAFETY: `msg` is a local the pump owns.
+    while unsafe { GetMessageW(&raw mut msg, HWND(0), 0, 0) }.0 > 0 {
+        // SAFETY: `msg` was just filled in by GetMessageW.
+        let _ = unsafe { TranslateMessage(&raw const msg) };
+        // SAFETY: as above.
+        unsafe { DispatchMessageW(&raw const msg) };
     }
 }
 
@@ -2438,14 +2516,14 @@ fn run_listener_thread(_app: Arc<dyn Host>) {
 /// resets the backoff, so a rare one-off failure recovers fast while a hard,
 /// immediate failure does not spin.
 #[cfg(windows)]
-fn run_listener_supervisor(app: Arc<dyn Host>) {
+fn run_listener_supervisor(app: &Arc<dyn Host>) {
     const MIN_BACKOFF_MS: u64 = 1_000;
     const MAX_BACKOFF_MS: u64 = 60_000;
     const HEALTHY_RUN_SECS: u64 = 30;
 
     let mut backoff_ms = MIN_BACKOFF_MS;
     loop {
-        let app_for_attempt = app.clone();
+        let app_for_attempt = Arc::clone(app);
         let started = std::time::Instant::now();
         let attempt = std::thread::Builder::new()
             .name("dash-clipboard-listener".to_string())
@@ -2476,10 +2554,10 @@ fn run_listener_supervisor(app: Arc<dyn Host>) {
 }
 
 #[cfg(not(windows))]
-fn run_listener_supervisor(app: Arc<dyn Host>) {
+fn run_listener_supervisor(app: &Arc<dyn Host>) {
     // The non-Windows listener is an intentional no-op stub — nothing to
     // supervise until the macOS/Linux ports land.
-    run_listener_thread(app);
+    run_listener_thread(Arc::clone(app));
 }
 
 // ─── Win32 helpers (clipboard read/write, foreground process) ────────────
@@ -2522,38 +2600,38 @@ fn read_clipboard_text() -> Option<String> {
         return None;
     }
 
-    // SAFETY: the clipboard is open on this thread (every early return closes
-    // it), so the handle stays valid. GlobalLock's result is null-checked and
-    // the slice covers only the GlobalSize bytes of the locked block, copied
-    // into a String before GlobalUnlock.
-    let result = unsafe {
-        let handle: HANDLE = match GetClipboardData(CF_UNICODETEXT) {
-            Ok(h) => h,
-            Err(_) => {
-                let _ = CloseClipboard();
-                return None;
-            }
-        };
-        if handle.0 == 0 {
-            let _ = CloseClipboard();
+    // SAFETY: the clipboard is open on this thread (closed below on every
+    // path), so the handle stays valid until then.
+    let handle: HANDLE = match unsafe { GetClipboardData(CF_UNICODETEXT) } {
+        Ok(h) if h.0 != 0 => h,
+        _ => {
+            // SAFETY: balances the successful open_clipboard_with_retry above.
+            let _ = unsafe { CloseClipboard() };
             return None;
         }
+    };
 
-        let hglobal = HGLOBAL(handle.0 as *mut c_void);
-        let ptr = GlobalLock(hglobal) as *const u16;
-        if ptr.is_null() {
-            let _ = CloseClipboard();
-            return None;
-        }
-        let byte_len = GlobalSize(hglobal);
+    #[expect(clippy::as_conversions, reason = "the clipboard hands back an HGLOBAL as an isize HANDLE")]
+    let hglobal = HGLOBAL(handle.0 as *mut c_void);
+    // SAFETY: `hglobal` is the clipboard's live data block (the clipboard is open).
+    let ptr = unsafe { GlobalLock(hglobal) }.cast::<u16>().cast_const();
+    let result = if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: `hglobal` is the live block locked above.
+        let byte_len = unsafe { GlobalSize(hglobal) };
         let wide_len = byte_len / 2;
-        let slice = std::slice::from_raw_parts(ptr, wide_len);
+        // SAFETY: `ptr` is the non-null start of the locked block, which holds
+        // GlobalSize bytes and stays locked until GlobalUnlock below; the text
+        // is copied into a String before that.
+        let slice = unsafe { std::slice::from_raw_parts(ptr, wide_len) };
         let trimmed: &[u16] = match slice.split(|&c| c == 0).next() {
             Some(s) => s,
             None => slice,
         };
         let text = String::from_utf16_lossy(trimmed);
-        let _ = GlobalUnlock(hglobal);
+        // SAFETY: balances the GlobalLock above; `slice` isn't used after this.
+        let _ = unsafe { GlobalUnlock(hglobal) };
         Some(text)
     };
 
@@ -2598,28 +2676,35 @@ unsafe fn set_clipboard_bytes(format: u32, bytes: &[u8]) -> Result<(), String> {
     use windows::Win32::System::DataExchange::SetClipboardData;
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
-    // SAFETY: the caller guarantees the clipboard is open. The block is
-    // allocated with `bytes.len()` bytes and the lock is null-checked before
-    // the copy, so the copy stays in bounds. The block is freed on every
-    // failure path and given to the system only once SetClipboardData succeeds.
-    unsafe {
-        let hglobal = GlobalAlloc(GMEM_MOVEABLE, bytes.len()).map_err(|e| format!("GlobalAlloc failed: {e}"))?;
-        if hglobal.0.is_null() {
-            return Err("GlobalAlloc returned null".to_string());
-        }
-        let ptr = GlobalLock(hglobal) as *mut u8;
-        if ptr.is_null() {
-            let _ = GlobalFree(hglobal);
-            return Err("GlobalLock failed".to_string());
-        }
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
-        let _ = GlobalUnlock(hglobal);
-        if SetClipboardData(format, HANDLE(hglobal.0 as isize)).is_err() {
-            let _ = GlobalFree(hglobal);
-            return Err(format!("SetClipboardData({format}) failed"));
-        }
-        Ok(())
+    // SAFETY: plain value arguments. The block is freed on every failure path
+    // below and given to the system only once SetClipboardData succeeds.
+    let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }.map_err(|e| format!("GlobalAlloc failed: {e}"))?;
+    if hglobal.0.is_null() {
+        return Err("GlobalAlloc returned null".to_string());
     }
+    // SAFETY: `hglobal` is the live block just allocated.
+    let ptr = unsafe { GlobalLock(hglobal) }.cast::<u8>();
+    if ptr.is_null() {
+        // SAFETY: the block is still ours (never handed to the clipboard).
+        let _ = unsafe { GlobalFree(hglobal) };
+        return Err("GlobalLock failed".to_string());
+    }
+    // SAFETY: `ptr` is the non-null start of the locked block, allocated with
+    // `bytes.len()` bytes, so the copy stays in bounds; a fresh block can't
+    // overlap `bytes`.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+    // SAFETY: balances the GlobalLock above; `ptr` isn't used after this.
+    let _ = unsafe { GlobalUnlock(hglobal) };
+    #[expect(clippy::as_conversions, reason = "SetClipboardData takes the HGLOBAL pointer as an isize HANDLE")]
+    let handle = HANDLE(hglobal.0 as isize);
+    // SAFETY: the caller guarantees the clipboard is open; on success the
+    // system owns the block.
+    if unsafe { SetClipboardData(format, handle) }.is_err() {
+        // SAFETY: SetClipboardData failed, so the block is still ours.
+        let _ = unsafe { GlobalFree(hglobal) };
+        return Err(format!("SetClipboardData({format}) failed"));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -2632,12 +2717,11 @@ fn write_text_to_clipboard(text: &str) -> Result<(), String> {
         return Err("could not open clipboard (held by another app)".to_string());
     };
     // SAFETY: the clipboard is open on this thread until `_open` drops.
-    unsafe {
-        if EmptyClipboard().is_err() {
-            return Err("EmptyClipboard failed".to_string());
-        }
-        set_clipboard_bytes(CF_UNICODETEXT, &bytes)
+    if unsafe { EmptyClipboard() }.is_err() {
+        return Err("EmptyClipboard failed".to_string());
     }
+    // SAFETY: as above.
+    unsafe { set_clipboard_bytes(CF_UNICODETEXT, &bytes) }
 }
 
 #[cfg(windows)]
@@ -2647,40 +2731,44 @@ fn get_foreground_process_name() -> Option<String> {
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ};
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-    // SAFETY: `pid` and `buf` are locals passed with their real sizes. The
-    // process handle is closed right after the one call that uses it, and
-    // `len` is at most `buf.len()`, so the slice is in bounds.
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.0 == 0 {
-            return None;
-        }
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == 0 {
-            return None;
-        }
-        let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid).ok()?;
-        let mut buf = [0u16; 260];
-        let len = GetModuleBaseNameW(handle, None, &mut buf);
-        let _ = CloseHandle(handle);
-        if len == 0 {
-            return None;
-        }
-        let name = String::from_utf16_lossy(&buf[..len as usize]);
-        // Strip the `.exe` suffix case-insensitively. Windows returns process
-        // names in various cases — `WINWORD.EXE`, `chrome.exe`, `Code.exe` —
-        // and a literal `.strip_suffix(".exe")` would miss the uppercase
-        // variants, leaving raw `WINWORD.EXE` in the history for the frontend
-        // to deal with. Doing it here means the rest of the pipeline (mapping
-        // to "Microsoft Word", source-color hashing, etc.) sees a clean name.
-        let cleaned = if name.len() >= 4 && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".exe") {
-            name[..name.len() - 4].to_string()
-        } else {
-            name
-        };
-        Some(cleaned)
+    // SAFETY: GetForegroundWindow takes no arguments.
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0 == 0 {
+        return None;
     }
+    let mut pid: u32 = 0;
+    // SAFETY: `pid` is a local out-param; a stale HWND just leaves it 0.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: plain value arguments; the handle is closed right after the one
+    // call that uses it.
+    let handle: HANDLE =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid) }.ok()?;
+    let mut buf = [0u16; 260];
+    // SAFETY: `handle` is open and `buf` is a local passed with its real size.
+    let len = unsafe { GetModuleBaseNameW(handle, None, &mut buf) };
+    // SAFETY: `handle` came from the OpenProcess above and is closed once.
+    let _ = unsafe { CloseHandle(handle) };
+    if len == 0 {
+        return None;
+    }
+    // At most `buf.len()`, so the slice is in bounds.
+    let len = usize::try_from(len).ok()?;
+    let name = String::from_utf16_lossy(&buf[..len]);
+    // Strip the `.exe` suffix case-insensitively. Windows returns process
+    // names in various cases — `WINWORD.EXE`, `chrome.exe`, `Code.exe` —
+    // and a literal `.strip_suffix(".exe")` would miss the uppercase
+    // variants, leaving raw `WINWORD.EXE` in the history for the frontend
+    // to deal with. Doing it here means the rest of the pipeline (mapping
+    // to "Microsoft Word", source-color hashing, etc.) sees a clean name.
+    let cleaned = if name.len() >= 4 && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".exe") {
+        name[..name.len() - 4].to_string()
+    } else {
+        name
+    };
+    Some(cleaned)
 }
 
 #[cfg(windows)]
@@ -2690,32 +2778,36 @@ fn get_foreground_process_path() -> Option<String> {
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ};
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-    // SAFETY: `pid` and `buf` are locals passed with their real sizes. The
-    // process handle is closed right after the one call that uses it, and
-    // `len` is at most `buf.len()`, so the slice is in bounds.
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.0 == 0 {
-            return None;
-        }
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == 0 {
-            return None;
-        }
-        let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid).ok()?;
-        let mut buf = [0u16; 260];
-        let len = GetModuleFileNameExW(handle, None, &mut buf);
-        let _ = CloseHandle(handle);
-        if len == 0 {
-            return None;
-        }
-        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    // SAFETY: GetForegroundWindow takes no arguments.
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0 == 0 {
+        return None;
     }
+    let mut pid: u32 = 0;
+    // SAFETY: `pid` is a local out-param; a stale HWND just leaves it 0.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: plain value arguments; the handle is closed right after the one
+    // call that uses it.
+    let handle: HANDLE =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid) }.ok()?;
+    let mut buf = [0u16; 260];
+    // SAFETY: `handle` is open and `buf` is a local passed with its real size.
+    let len = unsafe { GetModuleFileNameExW(handle, None, &mut buf) };
+    // SAFETY: `handle` came from the OpenProcess above and is closed once.
+    let _ = unsafe { CloseHandle(handle) };
+    if len == 0 {
+        return None;
+    }
+    // At most `buf.len()`, so the slice is in bounds.
+    let len = usize::try_from(len).ok()?;
+    Some(String::from_utf16_lossy(&buf[..len]))
 }
 
 /// Read a process's token-elevation flag. `process` must be a handle opened
-/// with at least PROCESS_QUERY_LIMITED_INFORMATION. `Ok(_)` is a definitive
+/// with at least `PROCESS_QUERY_LIMITED_INFORMATION`. `Ok(_)` is a definitive
 /// answer; `Err(())` means the token could not be opened or queried — for a
 /// non-elevated caller inspecting an elevated target that failure is itself a
 /// signal, so callers interpret it rather than defaulting it away.
@@ -2725,25 +2817,27 @@ fn token_is_elevated(process: windows::Win32::Foundation::HANDLE) -> Result<bool
     use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
     use windows::Win32::System::Threading::OpenProcessToken;
 
-    // SAFETY: `process` is a valid handle per this function's contract. The
-    // token is closed right after the query, and `info` is a local
-    // TOKEN_ELEVATION whose exact size is passed as the buffer length.
-    unsafe {
-        let mut token = HANDLE::default();
-        OpenProcessToken(process, TOKEN_QUERY, &mut token).map_err(|_| ())?;
-        let mut info = TOKEN_ELEVATION::default();
-        let mut ret_len = 0u32;
-        let res = GetTokenInformation(
+    let mut token = HANDLE::default();
+    // SAFETY: `process` is a valid handle per this function's contract, and
+    // `token` is a local out-param, closed right after the query.
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) }.map_err(|_| ())?;
+    let mut info = TOKEN_ELEVATION::default();
+    let mut ret_len = 0u32;
+    // SAFETY: `token` is open, and `info` is a local TOKEN_ELEVATION whose
+    // exact size is passed as the buffer length.
+    let res = unsafe {
+        GetTokenInformation(
             token,
             TokenElevation,
-            Some(&mut info as *mut _ as *mut core::ffi::c_void),
+            Some((&raw mut info).cast::<core::ffi::c_void>()),
             u32::try_from(std::mem::size_of::<TOKEN_ELEVATION>()).expect("TOKEN_ELEVATION is 4 bytes"),
-            &mut ret_len,
-        );
-        let _ = CloseHandle(token);
-        res.map_err(|_| ())?;
-        Ok(info.TokenIsElevated != 0)
-    }
+            &raw mut ret_len,
+        )
+    };
+    // SAFETY: `token` came from OpenProcessToken above and is closed once.
+    let _ = unsafe { CloseHandle(token) };
+    res.map_err(|_| ())?;
+    Ok(info.TokenIsElevated != 0)
 }
 
 /// Whether this app itself is running elevated. An elevated process can
@@ -2760,7 +2854,7 @@ fn current_process_is_elevated() -> bool {
 /// Decide whether auto-paste into `hwnd`'s process would be silently dropped
 /// by Windows UIPI. That happens when the target runs at a higher integrity
 /// level (e.g. "Run as administrator") than this app, run non-elevated.
-/// SendInput gives no error in that case — it *reports success* and the
+/// `SendInput` gives no error in that case — it *reports success* and the
 /// keystroke vanishes — so it must be detected up front to explain it.
 #[cfg(windows)]
 fn target_blocked_by_elevation(hwnd: windows::Win32::Foundation::HWND) -> bool {
@@ -2774,15 +2868,14 @@ fn target_blocked_by_elevation(hwnd: windows::Win32::Foundation::HWND) -> bool {
     }
     let mut pid = 0u32;
     // SAFETY: `pid` is a local out-param; a stale HWND just leaves it 0.
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
     if pid == 0 {
         return false;
     }
+    // Couldn't get even a limited handle — unknown, don't false-warn.
     // SAFETY: plain value arguments; the returned handle is closed below.
-    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
-        Ok(h) => h,
-        // Couldn't get even a limited handle — unknown, don't false-warn.
-        Err(_) => return false,
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
+        return false;
     };
     let verdict = token_is_elevated(handle);
     // SAFETY: `handle` came from the OpenProcess above and is closed once.
@@ -2793,9 +2886,9 @@ fn target_blocked_by_elevation(hwnd: windows::Win32::Foundation::HWND) -> bool {
 }
 
 /// Poll until the OS reports `hwnd` as the foreground window, or give up
-/// after ~300 ms. SetForegroundWindow returning success does not mean focus
-/// has *settled* — there is a brief transitional window in which a SendInput
-/// keystroke would land in the wrong place. Gating SendInput on this poll is
+/// after ~300 ms. `SetForegroundWindow` returning success does not mean focus
+/// has *settled* — there is a brief transitional window in which a `SendInput`
+/// keystroke would land in the wrong place. Gating `SendInput` on this poll is
 /// what removes the paste-into-the-wrong-app race.
 #[cfg(windows)]
 fn wait_until_foreground(hwnd: windows::Win32::Foundation::HWND) -> bool {
@@ -2811,13 +2904,13 @@ fn wait_until_foreground(hwnd: windows::Win32::Foundation::HWND) -> bool {
     unsafe { GetForegroundWindow() == hwnd }
 }
 
-/// Bring `hwnd` to the foreground reliably. A plain SetForegroundWindow is
+/// Bring `hwnd` to the foreground reliably. A plain `SetForegroundWindow` is
 /// frequently refused by Win32 focus-stealing prevention; the robust fix is
 /// to attach our input thread to the target window's thread for the duration
 /// of the call, which makes Win32 treat the request as coming from the
 /// foreground thread itself. Returns whether the target actually became the
 /// foreground window (confirmed by `wait_until_foreground`, not by trusting
-/// the SetForegroundWindow return value).
+/// the `SetForegroundWindow` return value).
 #[cfg(windows)]
 pub fn focus_window_reliably(hwnd: windows::Win32::Foundation::HWND) -> bool {
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -2839,24 +2932,25 @@ pub fn focus_window_reliably(hwnd: windows::Win32::Foundation::HWND) -> bool {
         return wait_until_foreground(hwnd);
     }
 
-    // SAFETY: value-only Win32 calls. A successful input attachment is undone
-    // before returning, so our thread is never left attached.
-    unsafe {
-        let attached = AttachThreadInput(our_thread, target_thread, true).as_bool();
-        let _ = SetForegroundWindow(hwnd);
-        let _ = SetFocus(hwnd);
-        let ok = wait_until_foreground(hwnd);
-        if attached {
-            let _ = AttachThreadInput(our_thread, target_thread, false);
-        }
-        ok
+    // SAFETY: value-only Win32 call. A successful input attachment is undone
+    // below, before returning, so our thread is never left attached.
+    let attached = unsafe { AttachThreadInput(our_thread, target_thread, true) }.as_bool();
+    // SAFETY: the HWND is only passed by value; a stale one makes the call fail.
+    let _ = unsafe { SetForegroundWindow(hwnd) };
+    // SAFETY: as above.
+    let _ = unsafe { SetFocus(hwnd) };
+    let ok = wait_until_foreground(hwnd);
+    if attached {
+        // SAFETY: value-only Win32 call; undoes the attachment made above.
+        let _ = unsafe { AttachThreadInput(our_thread, target_thread, false) };
     }
+    ok
 }
 
 /// Refocus a previously-captured HWND and inject Ctrl+V into it. Hardened
 /// path: validate the handle is still a live window, detect an elevated
 /// target that would silently swallow the keystroke, then restore focus
-/// reliably (attach-input fallback) and only fire SendInput once the OS
+/// reliably (attach-input fallback) and only fire `SendInput` once the OS
 /// confirms the target is foreground. Every failure mode emits a specific
 /// fallback toast — the text is already on the clipboard, so the worst case
 /// is always a manual Ctrl+V, never lost data.
@@ -2868,6 +2962,13 @@ fn focus_and_paste(hwnd_value: isize) {
         VK_CONTROL, VK_V,
     };
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+
+    fn make_key_event(vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+        }
+    }
 
     let hwnd = HWND(hwnd_value);
 
@@ -2897,13 +2998,6 @@ fn focus_and_paste(hwnd_value: isize) {
     // Ctrl up. This is the same sequence the OS dispatches for a real Ctrl+V
     // press, so the target window's keyboard handler sees an indistinguishable
     // event stream.
-    fn make_key_event(vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
-        }
-    }
-
     let inputs = [
         make_key_event(VK_CONTROL, KEYBD_EVENT_FLAGS(0)),
         make_key_event(VK_V, KEYBD_EVENT_FLAGS(0)),
@@ -2915,7 +3009,7 @@ fn focus_and_paste(hwnd_value: isize) {
     // the real size of INPUT, as SendInput requires.
     unsafe {
         let sent = SendInput(&inputs, i32::try_from(std::mem::size_of::<INPUT>()).expect("INPUT is 40 bytes"));
-        if (sent as usize) != inputs.len() {
+        if usize::try_from(sent) != Ok(inputs.len()) {
             // SendInput was blocked or partially dispatched. Most common
             // cause: another process has a low-level keyboard hook with
             // higher privilege (some AV / parental control tools). The text
@@ -2936,7 +3030,7 @@ fn focus_and_paste(hwnd_value: isize) {
 /// (history-suppressed) so it is never lost, and a specific fallback toast
 /// explains what happened.
 #[cfg(windows)]
-fn focus_and_type(hwnd_value: isize, text: String) {
+fn focus_and_type(hwnd_value: isize, text: &str) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
@@ -2944,41 +3038,6 @@ fn focus_and_type(hwnd_value: isize, text: String) {
     };
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
-    let hwnd = HWND(hwnd_value);
-
-    // The remembered window may have been closed since the key went down.
-    // SAFETY: IsWindow is made to be called with possibly-stale handles.
-    if !unsafe { IsWindow(hwnd) }.as_bool() {
-        rescue_text_to_clipboard(&text);
-        emit_paste_fallback("The previous window is gone — your dictation is on the clipboard, press Ctrl+V to paste.");
-        return;
-    }
-
-    // A non-elevated app cannot inject input into an elevated one:
-    // UIPI drops the keystrokes and SendInput still reports success. Detect
-    // it up front so the user gets a real explanation, not a silent no-op.
-    if target_blocked_by_elevation(hwnd) {
-        rescue_text_to_clipboard(&text);
-        emit_paste_fallback(
-            "The target app is running as administrator — typing is blocked. Your dictation is on the clipboard, press Ctrl+V.",
-        );
-        return;
-    }
-
-    if !focus_window_reliably(hwnd) {
-        rescue_text_to_clipboard(&text);
-        emit_paste_fallback("Couldn't refocus the previous app — your dictation is on the clipboard, press Ctrl+V.");
-        return;
-    }
-
-    // Build the synthetic keystroke stream — a key-down + key-up pair per
-    // character. Printable characters go in via KEYEVENTF_UNICODE (wVk = 0,
-    // wScan = the UTF-16 code unit), so the target sees the literal
-    // character regardless of its active keyboard layout; a non-BMP char is
-    // simply its two surrogate UTF-16 units sent consecutively, which
-    // Windows recombines. Newlines are the exception — a literal U+000A
-    // does NOT produce an Enter press in most editors, so '\n' is sent as a
-    // real VK_RETURN keystroke; a '\r' is dropped so CRLF yields one Enter.
     fn unicode_event(scan: u16, up: bool) -> INPUT {
         let mut flags = KEYEVENTF_UNICODE;
         if up {
@@ -2999,10 +3058,45 @@ fn focus_and_type(hwnd_value: isize, text: String) {
         }
     }
 
+    let hwnd = HWND(hwnd_value);
+
+    // The remembered window may have been closed since the key went down.
+    // SAFETY: IsWindow is made to be called with possibly-stale handles.
+    if !unsafe { IsWindow(hwnd) }.as_bool() {
+        rescue_text_to_clipboard(text);
+        emit_paste_fallback("The previous window is gone — your dictation is on the clipboard, press Ctrl+V to paste.");
+        return;
+    }
+
+    // A non-elevated app cannot inject input into an elevated one:
+    // UIPI drops the keystrokes and SendInput still reports success. Detect
+    // it up front so the user gets a real explanation, not a silent no-op.
+    if target_blocked_by_elevation(hwnd) {
+        rescue_text_to_clipboard(text);
+        emit_paste_fallback(
+            "The target app is running as administrator — typing is blocked. Your dictation is on the clipboard, press Ctrl+V.",
+        );
+        return;
+    }
+
+    if !focus_window_reliably(hwnd) {
+        rescue_text_to_clipboard(text);
+        emit_paste_fallback("Couldn't refocus the previous app — your dictation is on the clipboard, press Ctrl+V.");
+        return;
+    }
+
+    // Build the synthetic keystroke stream — a key-down + key-up pair per
+    // character. Printable characters go in via KEYEVENTF_UNICODE (wVk = 0,
+    // wScan = the UTF-16 code unit), so the target sees the literal
+    // character regardless of its active keyboard layout; a non-BMP char is
+    // simply its two surrogate UTF-16 units sent consecutively, which
+    // Windows recombines. Newlines are the exception — a literal U+000A
+    // does NOT produce an Enter press in most editors, so '\n' is sent as a
+    // real VK_RETURN keystroke; a '\r' is dropped so CRLF yields one Enter.
     let mut inputs: Vec<INPUT> = Vec::with_capacity(text.len() * 2);
     for ch in text.chars() {
         match ch {
-            '\r' => continue,
+            '\r' => {}
             '\n' => {
                 inputs.push(vk_event(VK_RETURN, false));
                 inputs.push(vk_event(VK_RETURN, true));
@@ -3025,12 +3119,12 @@ fn focus_and_type(hwnd_value: isize, text: String) {
     // the real size of INPUT, as SendInput requires.
     unsafe {
         let sent = SendInput(&inputs, i32::try_from(std::mem::size_of::<INPUT>()).expect("INPUT is 40 bytes"));
-        if (sent as usize) != inputs.len() {
+        if usize::try_from(sent) != Ok(inputs.len()) {
             // SendInput was blocked or partially dispatched — most often a
             // higher-privilege low-level keyboard hook (some AV / parental
             // tools). Rescue the full text so nothing is lost.
             eprintln!("clipboard_history: type-out SendInput dispatched {sent}/{} events", inputs.len());
-            rescue_text_to_clipboard(&text);
+            rescue_text_to_clipboard(text);
             emit_paste_fallback("Typing was blocked — your dictation is on the clipboard, press Ctrl+V to paste.");
         }
     }
@@ -3039,7 +3133,7 @@ fn focus_and_type(hwnd_value: isize, text: String) {
 /// Look up a Win32 registered clipboard format ID by its MIME-typed name.
 /// `RegisterClipboardFormatW` is idempotent — repeated calls with the same
 /// name return the same ID for the process's lifetime, and 0 on failure.
-/// We cache the result in a OnceLock so we don't re-do the wide-string
+/// We cache the result in a `OnceLock` so we don't re-do the wide-string
 /// conversion on every clipboard event.
 #[cfg(windows)]
 fn registered_format(slot: &OnceLock<u32>, name: &str) -> u32 {
@@ -3054,12 +3148,12 @@ fn registered_format(slot: &OnceLock<u32>, name: &str) -> u32 {
 
 /// Read raw bytes from the OS clipboard at the given format ID. Caller is
 /// responsible for knowing what those bytes represent (PNG file, JPEG file,
-/// CF_DIB blob, etc.). Returns None if the format isn't present on the
+/// `CF_DIB` blob, etc.). Returns None if the format isn't present on the
 /// clipboard right now, the data is empty, or any of the Win32 calls fail.
 ///
 /// Use this for the registered MIME-typed formats (image/gif, image/png,
 /// image/jpeg, image/webp) where the data IS already the file format the
-/// source app put on the clipboard. The dedicated CF_DIB path stays separate
+/// source app put on the clipboard. The dedicated `CF_DIB` path stays separate
 /// because it needs the BMP-header-wrapping conversion dance.
 #[cfg(windows)]
 fn read_clipboard_raw_bytes(format_id: u32) -> Option<Vec<u8>> {
@@ -3076,31 +3170,31 @@ fn read_clipboard_raw_bytes(format_id: u32) -> Option<Vec<u8>> {
         return None;
     }
 
-    // SAFETY: the clipboard is open on this thread (every early return closes
-    // it), so the handle stays valid. GlobalLock's result is null-checked and
-    // the slice covers only the GlobalSize bytes of the locked block, copied
-    // out before GlobalUnlock.
-    let bytes = unsafe {
-        let handle: HANDLE = match GetClipboardData(format_id) {
-            Ok(h) => h,
-            Err(_) => {
-                let _ = CloseClipboard();
-                return None;
-            }
-        };
-        if handle.0 == 0 {
-            let _ = CloseClipboard();
+    // SAFETY: the clipboard is open on this thread (closed below on every
+    // path), so the handle stays valid until then.
+    let handle: HANDLE = match unsafe { GetClipboardData(format_id) } {
+        Ok(h) if h.0 != 0 => h,
+        _ => {
+            // SAFETY: balances the successful open_clipboard_with_retry above.
+            let _ = unsafe { CloseClipboard() };
             return None;
         }
-        let hglobal = HGLOBAL(handle.0 as *mut c_void);
-        let ptr = GlobalLock(hglobal) as *const u8;
-        if ptr.is_null() {
-            let _ = CloseClipboard();
-            return None;
-        }
-        let size = GlobalSize(hglobal);
-        let copied = std::slice::from_raw_parts(ptr, size).to_vec();
-        let _ = GlobalUnlock(hglobal);
+    };
+    #[expect(clippy::as_conversions, reason = "the clipboard hands back an HGLOBAL as an isize HANDLE")]
+    let hglobal = HGLOBAL(handle.0 as *mut c_void);
+    // SAFETY: `hglobal` is the clipboard's live data block (the clipboard is open).
+    let ptr = unsafe { GlobalLock(hglobal) }.cast::<u8>().cast_const();
+    // A failed lock reads as empty, which returns None below.
+    let bytes = if ptr.is_null() {
+        Vec::new()
+    } else {
+        // SAFETY: `hglobal` is the live block locked above.
+        let size = unsafe { GlobalSize(hglobal) };
+        // SAFETY: `ptr` is the non-null start of the locked block, which holds
+        // GlobalSize bytes and stays locked until GlobalUnlock below.
+        let copied = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
+        // SAFETY: balances the GlobalLock above, after the copy.
+        let _ = unsafe { GlobalUnlock(hglobal) };
         copied
     };
 
@@ -3116,7 +3210,7 @@ fn read_clipboard_raw_bytes(format_id: u32) -> Option<Vec<u8>> {
     }
 }
 
-/// Read CF_HDROP (file-paths-on-clipboard) and return a list of paths.
+/// Read `CF_HDROP` (file-paths-on-clipboard) and return a list of paths.
 /// Empty Vec if no files / read failed. Uses `DragQueryFileW` from the
 /// shell crate which handles the DROPFILES struct unpacking for us — much
 /// safer than walking the bytes by hand.
@@ -3136,44 +3230,41 @@ fn read_clipboard_file_paths() -> Vec<PathBuf> {
         return Vec::new();
     }
 
-    // SAFETY: the clipboard is open on this thread (every early return closes
-    // it), so the CF_HDROP handle stays valid for the DragQueryFileW calls.
-    // Each call gets a local buffer it is told the length of and writes at
-    // most that many characters, so the slice is in bounds.
-    let paths = unsafe {
-        let handle: HANDLE = match GetClipboardData(CF_HDROP) {
-            Ok(h) => h,
-            Err(_) => {
-                let _ = CloseClipboard();
-                return Vec::new();
-            }
-        };
-        if handle.0 == 0 {
-            let _ = CloseClipboard();
+    // SAFETY: the clipboard is open on this thread (closed below on every
+    // path), so the CF_HDROP handle stays valid for the DragQueryFileW calls.
+    let handle: HANDLE = match unsafe { GetClipboardData(CF_HDROP) } {
+        Ok(h) if h.0 != 0 => h,
+        _ => {
+            // SAFETY: balances the successful open_clipboard_with_retry above.
+            let _ = unsafe { CloseClipboard() };
             return Vec::new();
         }
-
-        // HDROP wraps the same HANDLE the clipboard gave us. DragQueryFileW
-        // with index 0xFFFFFFFF returns the count of files; calling it again
-        // with each index returns the path.
-        let hdrop = HDROP(handle.0);
-        let count = DragQueryFileW(hdrop, 0xFFFF_FFFFu32, None);
-        let mut out: Vec<PathBuf> = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            // Win32 path length is bounded by MAX_PATH (260) on legacy APIs
-            // but newer Windows allows longer with the long-path manifest.
-            // We size to 512 wchars for safety; truncation here is preferred
-            // over allocation gymnastics on the hot path.
-            let mut buf: [u16; 512] = [0; 512];
-            let written = DragQueryFileW(hdrop, i, Some(&mut buf));
-            if written == 0 {
-                continue;
-            }
-            let path = String::from_utf16_lossy(&buf[..written as usize]);
-            out.push(PathBuf::from(path));
-        }
-        out
     };
+
+    // HDROP wraps the same HANDLE the clipboard gave us. DragQueryFileW
+    // with index 0xFFFFFFFF returns the count of files; calling it again
+    // with each index returns the path.
+    let hdrop = HDROP(handle.0);
+    // SAFETY: `hdrop` is the clipboard's live CF_HDROP block; no buffer is passed.
+    let count = unsafe { DragQueryFileW(hdrop, 0xFFFF_FFFFu32, None) };
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+    for i in 0..count {
+        // Win32 path length is bounded by MAX_PATH (260) on legacy APIs
+        // but newer Windows allows longer with the long-path manifest.
+        // We size to 512 wchars for safety; truncation here is preferred
+        // over allocation gymnastics on the hot path.
+        let mut buf: [u16; 512] = [0; 512];
+        // SAFETY: as above; `buf` is a local the call is told the length of
+        // and writes at most that many characters into.
+        let written = unsafe { DragQueryFileW(hdrop, i, Some(&mut buf)) };
+        if written == 0 {
+            continue;
+        }
+        // At most `buf.len()`, so the slice is in bounds.
+        let Ok(written) = usize::try_from(written) else { continue };
+        let path = String::from_utf16_lossy(&buf[..written]);
+        paths.push(PathBuf::from(path));
+    }
 
     // SAFETY: balances the successful open_clipboard_with_retry above.
     unsafe {
@@ -3182,11 +3273,11 @@ fn read_clipboard_file_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// Read CF_DIB from the OS clipboard, convert to PNG bytes via the `image`
+/// Read `CF_DIB` from the OS clipboard, convert to PNG bytes via the `image`
 /// crate. Returns None if the clipboard doesn't have image data or if
 /// decoding fails (malformed DIB, unsupported bit depth, etc).
 ///
-/// Conversion trick: the clipboard's CF_DIB blob is exactly the body of a
+/// Conversion trick: the clipboard's `CF_DIB` blob is exactly the body of a
 /// BMP file minus the 14-byte BITMAPFILEHEADER. We prepend a synthetic
 /// header so `image::load_from_memory` can decode it as BMP, then re-encode
 /// to PNG. Round-trip is lossless for 24/32-bit images (the common cases).
@@ -3201,33 +3292,33 @@ fn read_clipboard_image_as_png() -> Option<Vec<u8>> {
         return None;
     }
 
-    // SAFETY: the clipboard is open on this thread (every early return closes
-    // it), so the handle stays valid. GlobalLock's result is null-checked and
-    // the slice covers only the GlobalSize bytes of the locked block, copied
-    // out before GlobalUnlock.
-    let dib_bytes = unsafe {
-        let handle: HANDLE = match GetClipboardData(CF_DIB) {
-            Ok(h) => h,
-            Err(_) => {
-                let _ = CloseClipboard();
-                return None;
-            }
-        };
-        if handle.0 == 0 {
-            let _ = CloseClipboard();
+    // SAFETY: the clipboard is open on this thread (closed below on every
+    // path), so the handle stays valid until then.
+    let handle: HANDLE = match unsafe { GetClipboardData(CF_DIB) } {
+        Ok(h) if h.0 != 0 => h,
+        _ => {
+            // SAFETY: balances the successful open_clipboard_with_retry above.
+            let _ = unsafe { CloseClipboard() };
             return None;
         }
-        let hglobal = HGLOBAL(handle.0 as *mut c_void);
-        let ptr = GlobalLock(hglobal) as *const u8;
-        if ptr.is_null() {
-            let _ = CloseClipboard();
-            return None;
-        }
-        let size = GlobalSize(hglobal);
+    };
+    #[expect(clippy::as_conversions, reason = "the clipboard hands back an HGLOBAL as an isize HANDLE")]
+    let hglobal = HGLOBAL(handle.0 as *mut c_void);
+    // SAFETY: `hglobal` is the clipboard's live data block (the clipboard is open).
+    let ptr = unsafe { GlobalLock(hglobal) }.cast::<u8>().cast_const();
+    // A failed lock reads as empty, which returns None below.
+    let dib_bytes = if ptr.is_null() {
+        Vec::new()
+    } else {
+        // SAFETY: `hglobal` is the live block locked above.
+        let size = unsafe { GlobalSize(hglobal) };
         // Copy the DIB out of the locked global before unlocking — we'll
         // process it after the clipboard is closed.
-        let copied = std::slice::from_raw_parts(ptr, size).to_vec();
-        let _ = GlobalUnlock(hglobal);
+        // SAFETY: `ptr` is the non-null start of the locked block, which holds
+        // GlobalSize bytes and stays locked until GlobalUnlock below.
+        let copied = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
+        // SAFETY: balances the GlobalLock above, after the copy.
+        let _ = unsafe { GlobalUnlock(hglobal) };
         copied
     };
 
@@ -3278,10 +3369,10 @@ fn read_clipboard_image_as_png() -> Option<Vec<u8>> {
 }
 
 /// Where the pixels start in a BMP file made of a 14-byte file header plus
-/// `dib` (a CF_DIB blob): after the DIB header, the three (or four) colour
+/// `dib` (a `CF_DIB` blob): after the DIB header, the three (or four) colour
 /// masks a 40-byte header carries for `BI_BITFIELDS` / `BI_ALPHABITFIELDS`,
 /// and the colour table. `None` when the header is implausible or truncated.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "only the Windows CF_DIB reader uses it"))]
 fn dib_pixel_offset(dib: &[u8]) -> Option<usize> {
     let u16_at = |at: usize| Some(u16::from_le_bytes(dib.get(at..at + 2)?.try_into().ok()?));
     let u32_at = |at: usize| Some(u32::from_le_bytes(dib.get(at..at + 4)?.try_into().ok()?));
@@ -3321,18 +3412,18 @@ fn dib_pixel_offset(dib: &[u8]) -> Option<usize> {
 
 /// Write an image (read from disk) back to the OS clipboard in *multiple*
 /// formats simultaneously: the original MIME registered format (so
-/// animation/quality survive) AND CF_DIB (so apps that only read the
+/// animation/quality survive) AND `CF_DIB` (so apps that only read the
 /// standard format still get a usable bitmap, even if it's only the first
 /// frame for animated images).
 ///
 /// Format matrix:
-///   "gif"  → image/gif (animated) + CF_DIB (first frame)
-///   "png"  → image/png (lossless) + CF_DIB
-///   "jpeg" → image/jpeg (preserves quality) + CF_DIB
-///   "webp" → image/webp (animated for WebP-anim) + CF_DIB
-///   "bmp" or None → CF_DIB only (our PNG-from-CF_DIB fallback path)
+///   "gif"  → image/gif (animated) + `CF_DIB` (first frame)
+///   "png"  → image/png (lossless) + `CF_DIB`
+///   "jpeg" → image/jpeg (preserves quality) + `CF_DIB`
+///   "webp" → image/webp (animated for WebP-anim) + `CF_DIB`
+///   "bmp" or None → `CF_DIB` only (our PNG-from-CF_DIB fallback path)
 ///
-/// The CF_DIB part requires re-decoding the image and re-encoding as BMP.
+/// The `CF_DIB` part requires re-decoding the image and re-encoding as BMP.
 /// For static images this is fast and lossless. For animated formats, the
 /// decode produces the FIRST FRAME — which is what Paint/Word want anyway
 /// (they don't support animation in pastes).
@@ -3373,27 +3464,27 @@ fn write_image_to_clipboard(image_path: &std::path::Path, image_format: Option<&
         return Err("could not open clipboard (held by another app)".to_string());
     };
     // SAFETY: the clipboard is open on this thread until `_open` drops.
-    unsafe {
-        if EmptyClipboard().is_err() {
-            return Err("EmptyClipboard failed".to_string());
-        }
+    if unsafe { EmptyClipboard() }.is_err() {
+        return Err("EmptyClipboard failed".to_string());
+    }
 
-        // Write CF_DIB first — it's the lowest-common-denominator format and
-        // must always succeed for the paste to work in at-minimum apps like
-        // Paint. Failure here is fatal.
-        set_clipboard_bytes(CF_DIB, &dib_bytes)?;
+    // Write CF_DIB first — it's the lowest-common-denominator format and
+    // must always succeed for the paste to work in at-minimum apps like
+    // Paint. Failure here is fatal.
+    // SAFETY: as above.
+    unsafe { set_clipboard_bytes(CF_DIB, &dib_bytes) }?;
 
-        // Optionally also publish the registered MIME format so animated/
-        // higher-fidelity pastes work in browsers, Discord, etc. Failure
-        // here is non-fatal: the CF_DIB write already succeeded, so paste
-        // still works — animation just doesn't survive.
-        if let Some(fmt_id) = registered_id {
-            if fmt_id != 0 {
-                if let Err(error) = set_clipboard_bytes(fmt_id, &raw_bytes) {
-                    eprintln!(
-                        "clipboard_history: registered format {fmt_id} not set ({error}); paste will fall back to CF_DIB"
-                    );
-                }
+    // Optionally also publish the registered MIME format so animated/
+    // higher-fidelity pastes work in browsers, Discord, etc. Failure
+    // here is non-fatal: the CF_DIB write already succeeded, so paste
+    // still works — animation just doesn't survive.
+    if let Some(fmt_id) = registered_id {
+        if fmt_id != 0 {
+            // SAFETY: as above.
+            if let Err(error) = unsafe { set_clipboard_bytes(fmt_id, &raw_bytes) } {
+                eprintln!(
+                    "clipboard_history: registered format {fmt_id} not set ({error}); paste will fall back to CF_DIB"
+                );
             }
         }
     }
@@ -3407,7 +3498,11 @@ fn write_image_to_clipboard(image_path: &std::path::Path, image_format: Option<&
 #[cfg(not(windows))]
 fn read_clipboard_image_as_png() -> Option<Vec<u8>> {
     let image = arboard::Clipboard::new().ok()?.get_image().ok()?;
-    let rgba = image::RgbaImage::from_raw(image.width as u32, image.height as u32, image.bytes.into_owned())?;
+    let rgba = image::RgbaImage::from_raw(
+        u32::try_from(image.width).ok()?,
+        u32::try_from(image.height).ok()?,
+        image.bytes.into_owned(),
+    )?;
     let mut png = Vec::new();
     rgba.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
     Some(png)
@@ -3418,8 +3513,8 @@ fn write_image_to_clipboard(image_path: &std::path::Path, _image_format: Option<
     let rgba = image::open(image_path).map_err(|e| e.to_string())?.into_rgba8();
     let (width, height) = rgba.dimensions();
     let data = arboard::ImageData {
-        width: width as usize,
-        height: height as usize,
+        width: usize::try_from(width).map_err(|e| e.to_string())?,
+        height: usize::try_from(height).map_err(|e| e.to_string())?,
         bytes: std::borrow::Cow::Owned(rgba.into_raw()),
     };
     arboard::Clipboard::new().and_then(|mut c| c.set_image(data)).map_err(|e| e.to_string())
@@ -3494,10 +3589,10 @@ mod tests {
         assert_eq!(floor_char_boundary("hello world", 7), 7);
     }
 
-    /// The Snipping Tool bug: one snip fired several WM_CLIPBOARDUPDATE and
+    /// The Snipping Tool bug: one snip fired several `WM_CLIPBOARDUPDATE` and
     /// landed as duplicate entries. Same bytes back-to-back = one copy.
     /// Different bytes must always pass, or we'd swallow real copies.
-    /// (Serialized against the other LAST_IMAGE test — they share a global.)
+    /// (Serialized against the other `LAST_IMAGE` test — they share a global.)
     #[test]
     fn image_burst_drops_only_immediate_identical_repeats() {
         let _g = image_test_lock();
@@ -3530,7 +3625,7 @@ mod tests {
         // Backdate the recorded sighting to just outside the burst window,
         // rather than sleeping for two real seconds in a unit test.
         {
-            let mut guard = last_image().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = last_image().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some((_, ts)) = guard.as_mut() {
                 *ts -= IMAGE_BURST_WINDOW_MS + 1;
             }
@@ -3540,14 +3635,14 @@ mod tests {
     }
 
     fn reset_last_image() {
-        *last_image().lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *last_image().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
-    /// LAST_IMAGE is process-global, so the two tests above would race under
+    /// `LAST_IMAGE` is process-global, so the two tests above would race under
     /// cargo's default threaded runner.
     fn image_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[test]
@@ -3570,7 +3665,7 @@ mod tests {
     #[test]
     fn categorizes_json() {
         assert_eq!(categorize(r#"{"name":"Alice"}"#), Category::Json);
-        assert_eq!(categorize(r#"[1, 2, 3]"#), Category::Json);
+        assert_eq!(categorize(r"[1, 2, 3]"), Category::Json);
         // Has braces but isn't really JSON-shaped → falls back.
         assert_eq!(categorize("{not really json}"), Category::Text);
     }
@@ -3777,7 +3872,7 @@ mod tests {
         assert!(state.entries.is_empty());
         assert!(file.exists(), "not deleted by the evictor");
 
-        for id in 0..=MAX_ENTRIES as u64 {
+        for id in 0..=u64::try_from(MAX_ENTRIES).unwrap() {
             let mut entry = test_text_entry(0);
             entry.id = id;
             state.entries.push_front(entry);

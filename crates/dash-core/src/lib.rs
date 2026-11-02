@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+pub mod at_rest;
 #[cfg(windows)]
 pub mod dpapi;
 pub mod link;
@@ -20,6 +21,9 @@ pub mod shared;
 pub trait Host: Send + Sync + 'static {
     /// The folder the engine keeps its files in (created by the engine as
     /// needed).
+    ///
+    /// # Errors
+    /// Returns `Err` if the host can't tell where its data folder is.
     fn data_dir(&self) -> Result<PathBuf, String>;
 
     /// Something changed that a UI may want to show (`event` is a stable
@@ -34,6 +38,6 @@ impl<T: Host + ?Sized> Host for std::sync::Arc<T> {
     }
 
     fn emit(&self, event: &str, payload: serde_json::Value) {
-        (**self).emit(event, payload)
+        (**self).emit(event, payload);
     }
 }

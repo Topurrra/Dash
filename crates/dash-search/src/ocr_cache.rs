@@ -72,6 +72,9 @@ pub fn cache_path_for_dir(dir: &Path) -> PathBuf {
 /// whole file — only invoke on files we'd OCR anyway (images, PDFs).
 /// Callers MUST treat any error as a cache miss and proceed with
 /// normal extraction; never propagate.
+///
+/// # Errors
+/// When the file can't be opened or read.
 pub fn hash_file(path: &Path) -> std::io::Result<ContentHash> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = blake3::Hasher::new();
@@ -124,7 +127,7 @@ fn pack_key(hash: &ContentHash, lang: &str) -> Vec<u8> {
 }
 
 /// Pack a cache entry. Layout (little-endian):
-///   [u64 last_used_at_secs][u64 created_at_secs][u32 text_len][text utf-8]
+///   [u64 `last_used_at_secs`][u64 created_at_secs][u32 `text_len`][text utf-8]
 fn pack_value(text: &str, last_used_at: u64, created_at: u64) -> Vec<u8> {
     let text_bytes = text.as_bytes();
     let mut value = Vec::with_capacity(8 + 8 + 4 + text_bytes.len());
@@ -145,7 +148,7 @@ fn unpack_value(bytes: &[u8]) -> Option<(String, u64, u64)> {
     }
     let last_used_at = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
     let created_at = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
-    let text_len = u32::from_le_bytes(bytes[16..20].try_into().ok()?) as usize;
+    let text_len = usize::try_from(u32::from_le_bytes(bytes[16..20].try_into().ok()?)).ok()?;
     if bytes.len() != 20 + text_len {
         return None;
     }
@@ -186,7 +189,7 @@ fn decrypt_value(stored: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 fn open_db(path: &Path) -> Result<Database, String> {
@@ -222,7 +225,7 @@ fn open_db(path: &Path) -> Result<Database, String> {
 }
 
 fn quarantine(path: &Path) {
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
     let quarantined = path.with_extension(format!("corrupt-{ts}.redb"));
     let _ = fs::rename(path, quarantined);
 }
@@ -269,9 +272,8 @@ pub fn lookup(ctx: &OcrCacheCtx, hash: &ContentHash) -> Option<String> {
 /// failure must not break the rebuild (the path is still indexed
 /// normally; only the dedup win is lost).
 pub fn store(ctx: &OcrCacheCtx, hash: &ContentHash, text: &str) {
-    let _guard = match OCR_CACHE_LOCK.lock() {
-        Ok(g) => g,
-        Err(_) => return,
+    let Ok(_guard) = OCR_CACHE_LOCK.lock() else {
+        return;
     };
     let db = match open_db(&ctx.db_path) {
         Ok(db) => db,
@@ -320,6 +322,10 @@ pub struct GcStats {
 /// size cap (LRU pass). Called at the end of every successful full
 /// rebuild from `search.rs::build_index_in_worker`. Safe to call when
 /// the cache file doesn't exist (returns default stats).
+///
+/// # Errors
+/// When the cache lock is poisoned or the cache database can't be opened,
+/// read or written.
 pub fn gc(db_path: &Path, ttl_days: u64, max_bytes: u64) -> Result<GcStats, String> {
     let _guard = OCR_CACHE_LOCK.lock().map_err(|_| "OCR cache lock was poisoned".to_string())?;
     if !db_path.exists() {
@@ -344,7 +350,7 @@ pub fn gc(db_path: &Path, ttl_days: u64, max_bytes: u64) -> Result<GcStats, Stri
             entries_before += 1;
             let key = entry.0.value().to_vec();
             let val_bytes = entry.1.value();
-            let val_len = val_bytes.len() as u64;
+            let val_len = u64::try_from(val_bytes.len()).unwrap_or(u64::MAX);
             bytes_before += val_len;
             match unpack_value(val_bytes) {
                 Some((_text, last_used, _created)) if last_used >= ttl_cutoff => {

@@ -24,8 +24,7 @@ pub(super) fn should_include_path(path: &Path, options: &FileSearchIndexOptions)
 }
 
 pub(super) fn is_hidden(path: &Path) -> bool {
-    path.components()
-        .any(|component| component.as_os_str().to_str().map(|value| value.starts_with('.')).unwrap_or(false))
+    path.components().any(|component| component.as_os_str().to_str().is_some_and(|value| value.starts_with('.')))
 }
 
 pub(super) fn normalize_exclude_folders(values: &[String]) -> Vec<String> {
@@ -76,14 +75,10 @@ pub(super) fn has_excluded_folder(path: &Path, exclude_folders: &[String]) -> bo
     }
 
     path.components().any(|component| {
-        component
-            .as_os_str()
-            .to_str()
-            .map(|value| {
-                let normalized = value.to_lowercase();
-                exclude_folders.iter().any(|excluded| excluded == &normalized)
-            })
-            .unwrap_or(false)
+        component.as_os_str().to_str().is_some_and(|value| {
+            let normalized = value.to_lowercase();
+            exclude_folders.iter().any(|excluded| excluded == &normalized)
+        })
     })
 }
 
@@ -153,6 +148,7 @@ pub(super) fn read_text_for_index(path: &Path, max_bytes: usize) -> Option<Strin
 /// protocol handles images/audio/video directly, so those never reach here.
 /// Rich formats are parsed in the sandboxed extractor child (see
 /// `extract_text_sandboxed`).
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn read_file_preview(path: String, max_bytes: Option<usize>) -> Option<String> {
     let cap = max_bytes.unwrap_or(64 * 1024).clamp(1024, 512 * 1024);
     let p = Path::new(&path);
@@ -204,7 +200,7 @@ pub(super) fn extract_text_sandboxed(path: &Path, max_bytes: usize) -> Option<St
     if !crate::text_extract::is_text_or_doc_extension(&ext) {
         return None;
     }
-    let mut slot = PREVIEW_EXTRACTOR.lock().unwrap_or_else(|p| p.into_inner());
+    let mut slot = PREVIEW_EXTRACTOR.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if slot.is_none() {
         *slot = spawn_preview_extractor().ok();
     }
@@ -231,7 +227,7 @@ pub fn list_logical_drives() -> Vec<String> {
     {
         let mut out = Vec::new();
         for letter in b'A'..=b'Z' {
-            let root = format!("{}:\\", letter as char);
+            let root = format!("{}:\\", char::from(letter));
             if Path::new(&root).is_dir() {
                 out.push(root);
             }
@@ -286,6 +282,6 @@ pub(super) fn ocr_path_in_scope(path: &Path, folders: &[String]) -> bool {
     folders.iter().any(|root| {
         let root_str = root.to_lowercase().replace('\\', "/");
         let root_str = root_str.trim_end_matches('/');
-        path_str == root_str || path_str.starts_with(&format!("{}/", root_str))
+        path_str == root_str || path_str.starts_with(&format!("{root_str}/"))
     })
 }

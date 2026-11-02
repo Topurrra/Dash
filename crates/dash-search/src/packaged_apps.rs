@@ -4,13 +4,13 @@
 //! WHY THIS EXISTS. The launch-target cache is built by walking Start Menu and
 //! Desktop for `.lnk`/`.exe`/`.url`/`.msc` files. Packaged apps have **none of
 //! those** — they are installed under `C:\Program Files\WindowsApps` (an ACL'd
-//! directory) and are launched by **AppUserModelID (AUMID)** through the shell,
+//! directory) and are launched by **`AppUserModelID` (AUMID)** through the shell,
 //! not by a filesystem path. So they were structurally invisible to the
 //! launcher no matter how the scan was tuned.
 //!
 //! Measured on a real machine (2026-07-27): 10 of 221 launchable apps were
-//! missing, and they were not obscure — **Settings, Terminal, ChatGPT, Claude,
-//! Sticky Notes, DuckDuckGo, NVIDIA Control Panel**. "Settings" being
+//! missing, and they were not obscure — **Settings, Terminal, `ChatGPT`, Claude,
+//! Sticky Notes, `DuckDuckGo`, NVIDIA Control Panel**. "Settings" being
 //! unreachable is a serious hole for a launcher whose whole pitch is that if it
 //! exists on your machine, you can get to it.
 //!
@@ -32,7 +32,7 @@
 pub struct PackagedApp {
     /// Friendly display name as the shell reports it (e.g. "Sticky Notes").
     pub name: String,
-    /// AppUserModelID — `<PackageFamilyName>!<ApplicationId>`. This is the only
+    /// `AppUserModelID` — `<PackageFamilyName>!<ApplicationId>`. This is the only
     /// launch handle a packaged app has; there is no exe path to run.
     pub aumid: String,
 }
@@ -65,75 +65,78 @@ pub fn enumerate_packaged_apps() -> Vec<PackagedApp> {
         SIGDN_NORMALDISPLAY,
     };
 
+    /// Copy a shell-allocated wide string into an owned String and free it.
+    /// `raw` must be null or a NUL-terminated string from `CoTaskMemAlloc`
+    /// that the caller owns.
+    unsafe fn take_pwstr(raw: PWSTR) -> Option<String> {
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: per the contract above, `raw` is a NUL-terminated string
+        // we own (from GetDisplayName); it is read once here, then freed.
+        let text = unsafe { raw.to_string() }.ok();
+        // SAFETY: freed with the allocator it came from and never touched again.
+        unsafe { CoTaskMemFree(Some(raw.0.cast_const().cast())) };
+        text
+    }
+
     let mut out = Vec::new();
 
-    // SAFETY: all calls below are standard read-only shell COM. Every raw
-    // pointer we receive (PWSTR from GetDisplayName) is copied into an owned
-    // String and then freed with CoTaskMemFree, per the shell's contract.
-    unsafe {
-        // Apartment-threaded, matching `launcher_icons`. We never
-        // CoUninitialize for the same reason it doesn't: this may run on a
-        // pooled thread that other COM users share.
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    // All calls below are standard read-only shell COM. Every raw pointer we
+    // receive (PWSTR from GetDisplayName) is copied into an owned String and
+    // then freed with CoTaskMemFree, per the shell's contract.
 
-        /// Copy a shell-allocated wide string into an owned String and free it.
-        /// `raw` must be null or a NUL-terminated string from CoTaskMemAlloc
-        /// that the caller owns.
-        unsafe fn take_pwstr(raw: PWSTR) -> Option<String> {
-            if raw.is_null() {
-                return None;
-            }
-            // SAFETY: per the contract above, `raw` is a NUL-terminated string
-            // we own (from GetDisplayName); it is read once, then freed with
-            // the allocator it came from and never touched again.
-            unsafe {
-                let text = raw.to_string().ok();
-                CoTaskMemFree(Some(raw.0 as *const _));
-                text
-            }
+    // Apartment-threaded, matching `launcher_icons`. We never
+    // CoUninitialize for the same reason it doesn't: this may run on a
+    // pooled thread that other COM users share.
+    // SAFETY: CoInitializeEx is always safe to call; a repeat or a different
+    // apartment just returns an error code, which we ignore.
+    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+
+    // SAFETY: `w!` gives a static NUL-terminated string.
+    let Ok(folder) = (unsafe { SHCreateItemFromParsingName::<_, _, IShellItem>(w!("shell:AppsFolder"), None) }) else {
+        return out;
+    };
+    // SAFETY: `folder` is a live shell item; BHID_EnumItems is a static GUID.
+    let Ok(items) = (unsafe { folder.BindToHandler::<_, IEnumShellItems>(None, &BHID_EnumItems) }) else {
+        return out;
+    };
+
+    loop {
+        let mut fetched = [None; 1];
+        let mut count = 0u32;
+        // Next() returns S_FALSE (not an Err) when the enumeration is done,
+        // so drive the loop off the fetched count rather than the HRESULT.
+        // SAFETY: `fetched` and `count` are valid out slots for one item.
+        if unsafe { items.Next(&mut fetched, Some(&raw mut count)) }.is_err() || count == 0 {
+            break;
+        }
+        let Some(item) = fetched[0].take() else { break };
+
+        // The parsing name is the AUMID for packaged apps and a filesystem
+        // path for classic ones. The `!` is what separates the two cases.
+        // SAFETY: `item` is a live shell item; the string it returns is ours.
+        let Ok(parsing_raw) = (unsafe { item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) }) else {
+            continue;
+        };
+        // SAFETY: a string GetDisplayName just handed us, used nowhere else.
+        let Some(aumid) = (unsafe { take_pwstr(parsing_raw) }) else { continue };
+        if !aumid.contains('!') {
+            continue; // classic Win32 app — already covered by the .lnk walk
         }
 
-        let folder: IShellItem = match SHCreateItemFromParsingName(w!("shell:AppsFolder"), None) {
-            Ok(item) => item,
-            Err(_) => return out,
+        // SAFETY: as above.
+        let Ok(name_raw) = (unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) }) else {
+            continue;
         };
-
-        let items: IEnumShellItems = match folder.BindToHandler(None, &BHID_EnumItems) {
-            Ok(enumerator) => enumerator,
-            Err(_) => return out,
-        };
-
-        loop {
-            let mut fetched = [None; 1];
-            let mut count = 0u32;
-            // Next() returns S_FALSE (not an Err) when the enumeration is done,
-            // so drive the loop off the fetched count rather than the HRESULT.
-            if items.Next(&mut fetched, Some(&mut count)).is_err() || count == 0 {
-                break;
-            }
-            let Some(item) = fetched[0].take() else { break };
-
-            // The parsing name is the AUMID for packaged apps and a filesystem
-            // path for classic ones. The `!` is what separates the two cases.
-            let Ok(parsing_raw) = item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) else {
-                continue;
-            };
-            let Some(aumid) = take_pwstr(parsing_raw) else { continue };
-            if !aumid.contains('!') {
-                continue; // classic Win32 app — already covered by the .lnk walk
-            }
-
-            let Ok(name_raw) = item.GetDisplayName(SIGDN_NORMALDISPLAY) else {
-                continue;
-            };
-            let Some(name) = take_pwstr(name_raw) else { continue };
-            let name = name.trim().to_string();
-            if name.is_empty() {
-                continue;
-            }
-
-            out.push(PackagedApp { name, aumid });
+        // SAFETY: as above.
+        let Some(name) = (unsafe { take_pwstr(name_raw) }) else { continue };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            continue;
         }
+
+        out.push(PackagedApp { name, aumid });
     }
 
     out
@@ -180,7 +183,7 @@ pub fn resolve_packaged_exe(aumid: &str) -> Option<std::path::PathBuf> {
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(&root)
         .ok()?
         .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter(|e| {
             let dir = e.file_name().to_string_lossy().to_ascii_lowercase();
             dir.starts_with(&name_prefix) && dir.ends_with(&hash_suffix)
@@ -210,7 +213,7 @@ pub fn resolve_packaged_exe(aumid: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Pull `Executable` off the `<Application>` whose `Id` matches, from an
-/// AppxManifest. Returns the manifest-relative path.
+/// `AppxManifest`. Returns the manifest-relative path.
 #[cfg(windows)]
 fn executable_for_app_id(manifest: &std::path::Path, app_id: &str) -> Option<String> {
     use quick_xml::events::Event;
@@ -225,7 +228,7 @@ fn executable_for_app_id(manifest: &std::path::Path, app_id: &str) -> Option<Str
             Err(_) | Ok(Event::Eof) => return None,
             // `<Application …/>` is usually a Start element (it has children like
             // VisualElements) but can be Empty; handle both.
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+            Ok(Event::Start(e) | Event::Empty(e)) => {
                 // Element names are namespace-prefixed in some manifests
                 // (`uap:Application` never occurs, but be tolerant anyway).
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();

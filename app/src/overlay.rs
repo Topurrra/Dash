@@ -164,6 +164,7 @@ struct Clip {
     app_path: Option<String>,
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "independent view flags, not states of one machine")]
 pub struct Overlay {
     input: Entity<TextInput>,
     focus: FocusHandle,
@@ -402,7 +403,7 @@ impl Overlay {
             }
             let host = crate::host::host();
             let rt = crate::host::runtime();
-            let files = rt.spawn(dash_search::names::search_names(host.clone(), names));
+            let files = rt.spawn(dash_search::names::search_names(Arc::clone(&host), names));
             let inside = (!query.is_empty()).then(|| {
                 rt.spawn(dash_search::search::search_file_contents(
                     host,
@@ -426,15 +427,12 @@ impl Overlay {
                     return;
                 }
                 this.searching = false;
-                match inside {
-                    Some(Ok(r)) => {
-                        this.inside_total = r.total_hits;
-                        this.inside = r.results.into_iter().map(inside_row).collect();
-                    }
-                    Some(Err(_)) | None => {
-                        this.inside.clear();
-                        this.inside_total = 0;
-                    }
+                if let Some(Ok(r)) = inside {
+                    this.inside_total = r.total_hits;
+                    this.inside = r.results.into_iter().map(inside_row).collect();
+                } else {
+                    this.inside.clear();
+                    this.inside_total = 0;
                 }
                 this.selected = 0;
                 let wanted: Vec<(String, bool)> = this.inside.iter().map(|r| (r.path.to_string(), r.folder)).collect();
@@ -499,7 +497,7 @@ impl Overlay {
                     }
                     match &p.body {
                         Body::Text { hit: Some(line), .. } => {
-                            this.preview_scroll.scroll_to_item(line.saturating_sub(3))
+                            this.preview_scroll.scroll_to_item(line.saturating_sub(3));
                         }
                         _ => this.preview_scroll.set_offset(Point::default()),
                     }
@@ -559,7 +557,7 @@ impl Overlay {
                         .into_iter()
                         .map(|(key, path, kind)| {
                             let icon = dash_search::launcher_icons::ensure_launcher_icon(
-                                host.clone(),
+                                Arc::clone(&host),
                                 path,
                                 Some(kind.into()),
                             )
@@ -621,10 +619,10 @@ impl Overlay {
         self.select(if self.grid_active() { -3 * self.step() } else { -8 }, cx);
     }
     fn on_first(&mut self, _: &SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
-        self.select(-(self.count() as isize), cx);
+        self.select(-isize::try_from(self.count()).unwrap_or(isize::MAX), cx);
     }
     fn on_last(&mut self, _: &SelectLast, _: &mut Window, cx: &mut Context<Self>) {
-        self.select(self.count() as isize, cx);
+        self.select(isize::try_from(self.count()).unwrap_or(isize::MAX), cx);
     }
 
     fn on_open(&mut self, _: &OpenSelected, window: &mut Window, cx: &mut Context<Self>) {
@@ -714,7 +712,7 @@ impl Overlay {
     fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pause_video();
         // A hotkey being recorded in Settings: give the global hotkeys back.
-        self.settings.update(cx, |settings, cx| settings.stop_recording(cx));
+        self.settings.update(cx, super::settings::Settings::stop_recording);
         // A delete question or rename left open mustn't run on the next Enter.
         self.table_forget_pending();
         self.clip_menu = None;
@@ -1069,13 +1067,13 @@ impl Overlay {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                    this.click_clip(ix, event.click_count, window, cx)
+                                    this.click_clip(ix, event.click_count, window, cx);
                                 }),
                             )
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                                    this.clip_right_click(ix, event.position, cx)
+                                    this.clip_right_click(ix, event.position, cx);
                                 }),
                             )
                             .child(match clip.image.clone() {
@@ -1166,8 +1164,7 @@ impl Overlay {
             Body::Text { full, .. } => Some(
                 shown
                     .and_then(|(_, lines)| self.pane_sel.text(&lines))
-                    .map(SharedString::from)
-                    .unwrap_or_else(|| full.clone()),
+                    .map_or_else(|| full.clone(), SharedString::from),
             ),
             _ => None,
         };
@@ -1382,7 +1379,7 @@ impl Overlay {
                                 div()
                                     .text_color(theme::text_2())
                                     .when(wrap, |d| d.flex_1().min_w_0())
-                                    .when(!wrap, |d| d.whitespace_nowrap())
+                                    .when(!wrap, gpui::Styled::whitespace_nowrap)
                                     .child(line),
                             )
                     }))
@@ -1429,12 +1426,14 @@ impl Overlay {
 
 impl Overlay {
     /// Ten steps; click one to set the volume (Alt+Up / Alt+Down too).
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the volume is kept in 0..=1 (set_volume), so the level is 0..=10; steps are 1..=10, exact as f32"
+    )]
     fn render_volume(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "the volume is kept in 0..=1 (set_volume), so the level is 0..=10"
-        )]
         let level = if self.muted { 0 } else { (self.volume * 10.).round() as usize };
         div()
             .id("volume")
@@ -1460,6 +1459,8 @@ impl Overlay {
     }
 
     fn render_player(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // Seek bar cells.
+        const CELLS: usize = 80;
         let Some(player) = self.player() else {
             return div().flex_1().into_any_element();
         };
@@ -1527,9 +1528,18 @@ impl Overlay {
         };
         // A row of thin cells: clicking one jumps there. The track is
         // drawn once underneath, so it reads as one rounded bar.
-        const CELLS: usize = 80;
-        #[expect(clippy::cast_possible_truncation, reason = "a 0..=1 fraction for drawing; f32 is precise enough")]
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "times are far below 2^52 hns, so exact as f64; a 0..=1 fraction for drawing; f32 is precise enough"
+        )]
         let done = if duration > 0 { (position as f64 / duration as f64).clamp(0., 1.) as f32 } else { 0. };
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_precision_loss,
+            reason = "cell indexes are below CELLS (80), exact as f32"
+        )]
         let cells = div().absolute().inset_0().flex().children((0..CELLS).map(|i| {
             div().id(("seek", i)).flex_1().h_full().cursor_pointer().on_mouse_down(
                 MouseButton::Left,
@@ -1796,7 +1806,7 @@ impl Render for Overlay {
             .with_animation(
                 ("appear", self.appear),
                 Animation::new(Duration::from_millis(140)).with_easing(ease_out_quint()),
-                |d, t| d.opacity(t),
+                gpui::Styled::opacity,
             )
     }
 }
@@ -1958,8 +1968,7 @@ fn empty_state(glyph: Icon, title: impl Into<SharedString>, hint: Option<&str>) 
 fn age(modified_ms: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     let days = now.saturating_sub(modified_ms) / 86_400_000;
     match days {
         0 => "today".into(),
@@ -2126,7 +2135,6 @@ fn keep_alive(cx: &mut App) {
 /// Windows 11 rounds the window's corners and draws a thin outline (older
 /// Windows ignores both).
 #[cfg(windows)]
-#[expect(clippy::cast_possible_truncation, reason = "the sizes are of 4-byte DWM values")]
 fn round_corners(window: &Window) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::HWND;
@@ -2139,22 +2147,17 @@ fn round_corners(window: &Window) {
     let hwnd = HWND(handle.hwnd.get());
     let corners = DWMWCP_ROUND;
     let border = theme::window_border();
-    // SAFETY: `hwnd` is this live window's; each value points at a local of
+    // Both are 4-byte DWM values.
+    let (corners_size, border_size) =
+        (u32::try_from(size_of_val(&corners)).unwrap_or(0), u32::try_from(size_of_val(&border)).unwrap_or(0));
+    // SAFETY: `hwnd` is this live window's; the value points at a local of
     // the size passed, which the call only reads.
-    unsafe {
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            std::ptr::from_ref(&corners).cast(),
-            size_of_val(&corners) as u32,
-        );
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_BORDER_COLOR,
-            std::ptr::from_ref(&border).cast(),
-            size_of_val(&border) as u32,
-        );
-    }
+    let _ = unsafe {
+        DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, std::ptr::from_ref(&corners).cast(), corners_size)
+    };
+    // SAFETY: `hwnd` is this live window's; `border` is a local of the
+    // size passed, which the call only reads.
+    let _ = unsafe { DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, std::ptr::from_ref(&border).cast(), border_size) };
 }
 
 #[cfg(not(windows))]

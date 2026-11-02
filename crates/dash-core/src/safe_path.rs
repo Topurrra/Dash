@@ -74,6 +74,10 @@ const FORBIDDEN_DRIVE_ROOT_FILES: &[&str] = &["pagefile.sys", "hiberfil.sys", "s
 ///
 /// The input is canonicalized internally so case + slash + symlink
 /// normalization happen before the substring check.
+///
+/// # Errors
+/// Returns `Err` if the path (or, for a new file, its parent) can't be
+/// resolved, or if it's a protected system location.
 pub fn forbid_system_path<P: AsRef<Path>>(input: P) -> Result<PathBuf, String> {
     let input = input.as_ref();
     // If the path doesn't exist yet (write target), canonicalize the
@@ -127,14 +131,6 @@ pub fn forbid_system_path<P: AsRef<Path>>(input: P) -> Result<PathBuf, String> {
     Ok(candidate)
 }
 
-/// Convenience for the most common Class B call site: a Tauri command
-/// receives a path string from the frontend, expects it to be a real
-/// file (not a write target), and wants both:
-///   1. canonicalization (no `..` traversal, real path resolution), and
-///   2. rejection if it lands on a forbidden system location.
-///
-/// Returns the canonical PathBuf on success — callers can pass it
-/// directly to fs::read, image::open, etc. without re-canonicalizing.
 /// `path` without Windows' verbatim prefix (`\\?\D:\x` → `D:\x`,
 /// `\\?\UNC\server\share` → `\\server\share`), which canonicalizing adds and
 /// many apps don't understand when handed a file to open.
@@ -150,6 +146,18 @@ pub fn without_verbatim_prefix(path: &Path) -> PathBuf {
     }
 }
 
+/// Convenience for the most common Class B call site: a Tauri command
+/// receives a path string from the frontend, expects it to be a real
+/// file (not a write target), and wants both:
+///   1. canonicalization (no `..` traversal, real path resolution), and
+///   2. rejection if it lands on a forbidden system location.
+///
+/// Returns the canonical `PathBuf` on success — callers can pass it
+/// directly to `fs::read`, `image::open`, etc. without re-canonicalizing.
+///
+/// # Errors
+/// Returns `Err` if the path doesn't exist or can't be read, or if it's a
+/// protected system location.
 pub fn validate_user_path<P: AsRef<Path>>(input: P) -> Result<PathBuf, String> {
     let canonical = input.as_ref().canonicalize().map_err(|_| "Invalid or inaccessible path".to_string())?;
     forbid_system_path(&canonical)
@@ -157,7 +165,11 @@ pub fn validate_user_path<P: AsRef<Path>>(input: P) -> Result<PathBuf, String> {
 
 /// Same as `validate_user_path` but for write targets — the path itself
 /// may not exist yet, but its parent must. Returns parent.join(filename)
-/// after both forbid_system_path passes.
+/// after both `forbid_system_path` passes.
+///
+/// # Errors
+/// Returns `Err` if the path has no parent or file name, the parent can't be
+/// resolved, or the target is a protected system location.
 pub fn validate_user_write_target<P: AsRef<Path>>(input: P) -> Result<PathBuf, String> {
     let input = input.as_ref();
     let parent = input.parent().ok_or_else(|| "Path has no parent directory".to_string())?;
@@ -204,7 +216,7 @@ mod tests {
         // to verify the substring check works on the lowercased input.
         let p = PathBuf::from(r"C:\Windows\System32\cmd.exe");
         let result = forbid_system_path(&p);
-        assert!(result.is_err(), "Windows path should be rejected: {:?}", result);
+        assert!(result.is_err(), "Windows path should be rejected: {result:?}");
     }
 
     #[test]
@@ -224,12 +236,12 @@ mod tests {
         // to verify the substring path; construct one that exists.
         let user_profile = std::env::var("USERPROFILE").unwrap_or_else(|_| String::from(r"C:\Users\Default"));
         let startup =
-            format!(r"{}\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\malicious.bat", user_profile);
+            format!(r"{user_profile}\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\malicious.bat");
         let result = forbid_system_path(PathBuf::from(&startup));
         // If the path doesn't exist and the parent doesn't either, we
         // get "Invalid or inaccessible parent" — also a rejection.
         // Either way, we should NOT get Ok back.
-        assert!(result.is_err(), "Startup folder path should be rejected: {:?}", result);
+        assert!(result.is_err(), "Startup folder path should be rejected: {result:?}");
     }
 
     #[test]

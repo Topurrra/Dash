@@ -95,6 +95,11 @@ pub const EXT_PRIORITY_BONUS: f32 = 1.5;
 /// `count`-long extension filter (0 = first / highest priority). Linear from
 /// [`EXT_PRIORITY_BONUS`] (first) down toward `EXT_PRIORITY_BONUS / count`
 /// (last). Returns 0 for a single-extension or empty filter — nothing to order.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "an extension filter has a handful of entries, exact in f32"
+)]
 pub fn ext_priority_bonus(position: usize, count: usize) -> f32 {
     if count <= 1 || position >= count {
         return 0.0;
@@ -128,6 +133,7 @@ pub struct LexicalHits {
 /// grading in the order decision 1 fixes: an exact phrase in the name is the
 /// strongest signal, a fuzzy-only match the weakest. The component weights were
 /// calibrated 2026-05-17 (13d).
+#[expect(clippy::as_conversions, clippy::cast_precision_loss, reason = "keyword counts are tiny, exact in f32")]
 pub fn lexical_quality(hits: &LexicalHits) -> f32 {
     let mut quality = 0.0f32;
 
@@ -162,12 +168,17 @@ pub fn lexical_quality(hits: &LexicalHits) -> f32 {
 /// epoch). Exponential decay: modified now → ~1.0, modified
 /// `RECENCY_HALF_LIFE_DAYS` ago → 0.5, fading smoothly toward 0. A `0`
 /// timestamp means "unknown" and scores 0.
-#[expect(clippy::cast_possible_truncation, reason = "the decay is in 0..=1, so f64 to f32 only drops precision")]
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "an age in ms only rounds in f64 (far finer than the days it becomes); the decay is in 0..=1, so f64 to f32 only drops precision"
+)]
 pub fn recency_score(modified_ms: u64, now_ms: u128) -> f32 {
     if modified_ms == 0 {
         return 0.0;
     }
-    let age_ms = now_ms.saturating_sub(modified_ms as u128) as f64;
+    let age_ms = now_ms.saturating_sub(u128::from(modified_ms)) as f64;
     let age_days = age_ms / (1000.0 * 60.0 * 60.0 * 24.0);
     (-age_days * std::f64::consts::LN_2 / RECENCY_HALF_LIFE_DAYS).exp() as f32
 }

@@ -7,9 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(windows)]
-#[cfg(windows)]
-use crate::dpapi;
+use crate::at_rest;
 
 pub const LOCAL_DB_FILE: &str = "store.redb";
 
@@ -28,7 +26,7 @@ const JSON_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("json");
 /// We now open each database ONCE, cache the handle, and let redb's own MVCC
 /// do the concurrency: many concurrent readers + a single serialized writer,
 /// with readers seeing a consistent snapshot even mid-write. The mutex below
-/// guards only the cache map (a fast HashMap lookup, plus the one-time open
+/// guards only the cache map (a fast `HashMap` lookup, plus the one-time open
 /// per path); it is never held across a database read/write transaction, so a
 /// reader no longer blocks behind an unrelated write's fsync.
 static DB_CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<Database>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -50,35 +48,17 @@ pub fn take_db_corruption_recovered() -> bool {
     DB_CORRUPTION_RECOVERED.swap(false, Ordering::Relaxed)
 }
 
-/// Wrap a JSON payload with DPAPI on Windows. On non-Windows builds we
-/// fall through to plaintext — the cfg-gating mirrors the dpapi module's
-/// own `#![cfg(windows)]`. Centralizing the gate here means every call
-/// site reads as if encryption always happens, which is correct for the
-/// only platform we ship on today.
+/// Encrypts a JSON payload (DPAPI on Windows, the keychain's key on macOS /
+/// Linux; see `at_rest`).
 fn encrypt_for_db(plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    #[cfg(windows)]
-    {
-        dpapi::protect(plaintext)
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(plaintext.to_vec())
-    }
+    at_rest::protect(plaintext)
 }
 
-/// Reverse of `encrypt_for_db`. On Windows the dpapi module already
-/// transparently handles legacy plaintext (returns input unchanged if it
-/// lacks the version byte), so reads of a pre-encryption database keep
-/// working — the next write will re-protect the value automatically.
+/// Reverse of `encrypt_for_db`. Legacy plaintext (no version byte) comes
+/// back unchanged, so a pre-encryption database keeps working; the next
+/// write protects the value.
 fn decrypt_from_db(stored: &[u8]) -> Result<Vec<u8>, String> {
-    #[cfg(windows)]
-    {
-        dpapi::unprotect(stored)
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(stored.to_vec())
-    }
+    at_rest::unprotect(stored)
 }
 
 pub fn database_path_for_dir(dir: &Path) -> PathBuf {
@@ -147,10 +127,10 @@ fn is_corruption(error: &redb::DatabaseError) -> bool {
 fn get_db(path: &Path) -> Result<Arc<Database>, String> {
     let mut cache = DB_CACHE.lock().map_err(|_| "Local database cache lock was poisoned".to_string())?;
     if let Some(db) = cache.get(path) {
-        return Ok(db.clone());
+        return Ok(Arc::clone(db));
     }
     let db = Arc::new(open_db(path)?);
-    cache.insert(path.to_path_buf(), db.clone());
+    cache.insert(path.to_path_buf(), Arc::clone(&db));
     Ok(db)
 }
 
@@ -163,7 +143,7 @@ fn get_db(path: &Path) -> Result<Arc<Database>, String> {
 /// Sets `DB_CORRUPTION_RECOVERED` so the frontend can show a one-time
 /// warning banner informing the user that their preferences were reset.
 fn quarantine_corrupt_db(path: &Path) -> Result<(), String> {
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0);
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |value| value.as_millis());
     let quarantine = path.with_extension(format!("corrupt-{timestamp}.redb"));
     fs::rename(path, quarantine).map_err(|error| format!("Cannot quarantine corrupt database: {error}"))?;
     // Signal the frontend that a corruption recovery happened. The flag
@@ -173,6 +153,11 @@ fn quarantine_corrupt_db(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Reads `key`, or stores and returns `fallback` if it isn't there yet. A
+/// stored value that can't be read is left alone and `fallback` returned.
+///
+/// # Errors
+/// Returns `Err` if the database can't be opened, read or written.
 pub fn read_json_or_default<T>(db_path: &Path, key: &str, fallback: T) -> Result<T, String>
 where
     T: Clone + DeserializeOwned + Serialize,
@@ -212,6 +197,11 @@ where
     Ok(fallback)
 }
 
+/// Reads `key`; `None` if the database or the key doesn't exist.
+///
+/// # Errors
+/// Returns `Err` if the database can't be opened or read, or the stored
+/// value can't be decrypted or parsed.
 pub fn read_json<T>(db_path: &Path, key: &str) -> Result<Option<T>, String>
 where
     T: DeserializeOwned,
@@ -235,6 +225,11 @@ where
     Ok(Some(parsed))
 }
 
+/// Stores `value` under `key` as JSON.
+///
+/// # Errors
+/// Returns `Err` if the value can't be serialized, or the database can't be
+/// opened or written.
 pub fn write_json<T>(db_path: &Path, key: &str, value: &T) -> Result<(), String>
 where
     T: Serialize,
@@ -244,6 +239,11 @@ where
     write_json_bytes(db_path, key, &data)
 }
 
+/// Stores already-serialized JSON under `key`.
+///
+/// # Errors
+/// Returns `Err` if the value can't be encrypted, or the database can't be
+/// opened or written.
 pub fn write_json_bytes(db_path: &Path, key: &str, data: &[u8]) -> Result<(), String> {
     let db = get_db(db_path)?;
     write_json_bytes_to_db(&db, key, data)
@@ -268,6 +268,9 @@ fn write_json_bytes_to_db(db: &Database, key: &str, data: &[u8]) -> Result<(), S
 /// Remove a single key from the local DB. Used by features that legitimately
 /// drop individual values (e.g. Time Tracker retention pruning + wipe). No-op
 /// when the DB file or the key is absent.
+///
+/// # Errors
+/// Returns `Err` if the database can't be opened or written.
 pub fn remove_json(db_path: &Path, key: &str) -> Result<(), String> {
     if !db_path.exists() {
         return Ok(());

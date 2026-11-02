@@ -249,15 +249,14 @@ fn welcome_stat(value: String, label: &'static str) -> impl IntoElement {
 /// redraw would be a new texture each time).
 fn logo_image() -> Arc<RenderImage> {
     static LOGO: std::sync::OnceLock<Arc<RenderImage>> = std::sync::OnceLock::new();
-    LOGO.get_or_init(|| {
+    Arc::clone(LOGO.get_or_init(|| {
         const N: u32 = 96;
         let mut rgba = crate::logo::rgba(N);
         // GPUI wants BGRA.
-        for px in rgba.chunks_exact_mut(4) {
+        for px in rgba.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
         let buffer = image::RgbaImage::from_raw(N, N, rgba).expect("logo size");
         Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]))
-    })
-    .clone()
+    }))
 }

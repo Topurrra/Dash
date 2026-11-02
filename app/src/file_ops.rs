@@ -36,7 +36,7 @@ pub fn rename_in_place(path: &Path, new_name: &str) -> Result<PathBuf, String> {
     Ok(target)
 }
 
-/// Renames `from` to `to`, failing (AlreadyExists) rather than replacing
+/// Renames `from` to `to`, failing (`AlreadyExists`) rather than replacing
 /// anything at `to`, even something that appeared after a check.
 #[cfg(windows)]
 fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -46,7 +46,7 @@ fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     // MOVEFILE_COPY_ALLOWED (other drives fail with ERROR_NOT_SAME_DEVICE,
     // which `move_into` handles by copying).
     // SAFETY: both paths are NUL-terminated wide strings that outlive the call.
-    unsafe { MoveFileExW(&HSTRING::from(from), &HSTRING::from(to), MOVE_FILE_FLAGS(0)) }.map_err(win_io)
+    unsafe { MoveFileExW(&HSTRING::from(from), &HSTRING::from(to), MOVE_FILE_FLAGS(0)) }.map_err(|e| win_io(&e))
 }
 
 /// Elsewhere: no portable no-replace rename in std, so check, then rename.
@@ -62,12 +62,12 @@ fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 /// A Win32 error as an `io::Error` with its real error code (so `kind()`
 /// works; the `windows` crate's own conversion keeps the HRESULT).
 #[cfg(windows)]
-fn win_io(e: windows::core::Error) -> std::io::Error {
+fn win_io(e: &windows::core::Error) -> std::io::Error {
     let code = e.code().0.cast_unsigned();
     if code & 0xFFFF_0000 == 0x8007_0000 {
-        std::io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+        std::io::Error::from_raw_os_error((code & 0xFFFF).cast_signed())
     } else {
-        std::io::Error::other(e.message().to_string())
+        std::io::Error::other(e.message().clone())
     }
 }
 
@@ -137,7 +137,7 @@ fn copy_recursive(from: &Path, to: &Path, made: &mut bool) -> Result<(), String>
     }
 }
 
-/// Copies one file; fails (AlreadyExists) if `to` exists.
+/// Copies one file; fails (`AlreadyExists`) if `to` exists.
 #[cfg(windows)]
 fn copy_file_new(from: &Path, to: &Path) -> std::io::Result<()> {
     use windows::core::HSTRING;
@@ -146,7 +146,7 @@ fn copy_file_new(from: &Path, to: &Path) -> std::io::Result<()> {
     // SAFETY: both paths are NUL-terminated wide strings that outlive the
     // call; no progress callback, callback data or cancel flag is passed.
     unsafe { CopyFileExW(&HSTRING::from(from), &HSTRING::from(to), None, None, None, COPY_FILE_FAIL_IF_EXISTS) }
-        .map_err(win_io)
+        .map_err(|e| win_io(&e))
 }
 
 #[cfg(not(windows))]
@@ -208,6 +208,9 @@ pub fn recycle(paths: &[String]) -> Result<(), String> {
         SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, FO_DELETE,
         SHFILEOPSTRUCTW,
     };
+    // "No" to the shell's question shows as aborted (and sometimes as
+    // ERROR_CANCELLED); the caller counts what actually went.
+    const ERROR_CANCELLED: i32 = 1223;
     if paths.is_empty() {
         return Ok(());
     }
@@ -229,14 +232,11 @@ pub fn recycle(paths: &[String]) -> Result<(), String> {
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
     // SAFETY: `op` is fully initialized and `from` (the double-NUL list
     // `pFrom` points into) lives until after the call.
-    let code = unsafe { SHFileOperationW(&mut op) };
+    let code = unsafe { SHFileOperationW(&raw mut op) };
     if com {
         // SAFETY: pairs the successful CoInitializeEx on this thread.
         unsafe { CoUninitialize() };
     }
-    // "No" to the shell's question shows as aborted (and sometimes as
-    // ERROR_CANCELLED); the caller counts what actually went.
-    const ERROR_CANCELLED: i32 = 1223;
     if op.fAnyOperationsAborted.as_bool() || code == ERROR_CANCELLED {
         return Err("Some items weren't deleted".into());
     }
@@ -265,7 +265,7 @@ impl Pidls {
             let mut pidl = std::ptr::null_mut();
             // SAFETY: the HSTRING outlives the call; `pidl` receives an
             // allocation this guard frees on drop.
-            unsafe { SHParseDisplayName(&HSTRING::from(p.as_str()), None, &mut pidl, 0, None) }
+            unsafe { SHParseDisplayName(&HSTRING::from(p.as_str()), None, &raw mut pidl, 0, None) }
                 .map_err(|e| format!("{p}: {}", e.message()))?;
             out.0.push(pidl);
         }
@@ -273,7 +273,7 @@ impl Pidls {
     }
 
     fn as_const(&self) -> Vec<*const windows::Win32::UI::Shell::Common::ITEMIDLIST> {
-        self.0.iter().map(|p| *p as *const _).collect()
+        self.0.iter().map(|p| (*p).cast_const()).collect()
     }
 }
 
@@ -283,7 +283,7 @@ impl Drop for Pidls {
         for p in &self.0 {
             // SAFETY: each pointer came from a successful SHParseDisplayName,
             // is owned only by this guard and is freed exactly once here.
-            unsafe { windows::Win32::UI::Shell::ILFree(Some(*p as *const _)) };
+            unsafe { windows::Win32::UI::Shell::ILFree(Some((*p).cast_const())) };
         }
     }
 }
@@ -298,15 +298,16 @@ pub fn reveal_many(paths: &[String]) -> Result<(), String> {
         let items = Pidls::parse(&items)?;
         // SAFETY: each pidl is a valid id list owned by `items`; the result
         // points inside it, and `items` outlives `children`.
-        let children: Vec<_> = items.0.iter().map(|p| unsafe { ILFindLastID(*p as *const _) } as *const _).collect();
+        let children: Vec<_> =
+            items.0.iter().map(|p| unsafe { ILFindLastID((*p).cast_const()) }.cast_const()).collect();
         // SAFETY: `folder` holds exactly one valid pidl (parse of one path)
         // and `children` point into `items`, both alive for the call.
-        unsafe { SHOpenFolderAndSelectItems(folder.0[0], Some(&children), 0) }.map_err(|e| e.message().to_string())?;
+        unsafe { SHOpenFolderAndSelectItems(folder.0[0], Some(&children), 0) }.map_err(|e| e.message().clone())?;
     }
     Ok(())
 }
 
-/// Drags files out of Dash: the shell builds the data object (CF_HDROP and
+/// Drags files out of Dash: the shell builds the data object (`CF_HDROP` and
 /// the rest Explorer wants) and runs the drag loop with its own drag image.
 /// Blocks until the drop; call it outside any GPUI update (it pumps
 /// messages, and GPUI repaints meanwhile).
@@ -320,20 +321,23 @@ pub fn drag_out(paths: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let pidls = Pidls::parse(paths)?;
-    // SAFETY: the pidls are valid and alive until the end of the function;
-    // the shell item array and data object are COM objects we own here, and
-    // this runs on the UI thread where OLE is initialized (see doc comment).
-    unsafe {
-        let items = SHCreateShellItemArrayFromIDLists(&pidls.as_const()).map_err(|e| e.message().to_string())?;
-        let data: IDataObject = items.BindToHandler(None, &BHID_DataObject).map_err(|e| e.message().to_string())?;
-        // No drop source of ours: the shell supplies the default one.
-        let _ = SHDoDragDrop(
-            GetActiveWindow(),
+    // SAFETY: the pidls are valid and alive until the end of the function.
+    let items = unsafe { SHCreateShellItemArrayFromIDLists(&pidls.as_const()) }.map_err(|e| e.message().clone())?;
+    // SAFETY: `items` is a live COM object we own; no bind context is passed.
+    let data: IDataObject = unsafe { items.BindToHandler(None, &BHID_DataObject) }.map_err(|e| e.message().clone())?;
+    // SAFETY: no arguments; it only reads this thread's active window.
+    let window = unsafe { GetActiveWindow() };
+    // No drop source of ours: the shell supplies the default one.
+    // SAFETY: `data` is a live data object we own, and this runs on the UI
+    // thread where OLE is initialized (see doc comment).
+    let _ = unsafe {
+        SHDoDragDrop(
+            window,
             &data,
             None::<&windows::Win32::System::Ole::IDropSource>,
             DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
-        );
-    }
+        )
+    };
     Ok(())
 }
 
@@ -502,7 +506,7 @@ mod tests {
     #[test]
     fn double_null_list_layout() {
         let list = double_null_list(&["a".into(), "bc".into()]);
-        assert_eq!(list, vec![b'a' as u16, 0, b'b' as u16, b'c' as u16, 0, 0]);
+        assert_eq!(list, vec![u16::from(b'a'), 0, u16::from(b'b'), u16::from(b'c'), 0, 0]);
         assert_eq!(double_null_list(&[]), vec![0]);
     }
 

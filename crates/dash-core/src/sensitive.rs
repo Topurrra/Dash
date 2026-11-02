@@ -15,13 +15,13 @@
 //! ## Phase 6.5-1 (2026-05-27): tiers, spans, fancy-regex
 //!
 //! The kinds-only API was promoted to a span-aware `Finding` shape so the
-//! PrivacyBlur primitive can wrap exact match positions in blurred spans.
+//! `PrivacyBlur` primitive can wrap exact match positions in blurred spans.
 //! Three explicit tiers replace the implicit "high-confidence vs. validated"
 //! split:
 //!
 //!   • **HIGH** — prefixed / structured tokens (AWS `AKIA…`, GitHub `ghp_…`,
 //!     Stripe `sk_live_…`, PEM, PGP, Ethereum, Bitcoin WIF, JWT, npm, Slack,
-//!     OpenAI), plus Luhn-validated credit cards and DB URLs with embedded
+//!     `OpenAI`), plus Luhn-validated credit cards and DB URLs with embedded
 //!     passwords. All structurally unambiguous → default to BLUR ON.
 //!   • **MEDIUM** — validated noisy shapes: generic `key = value`
 //!     assignments, `Bearer …` headers, structurally-valid US SSNs. Default
@@ -34,7 +34,7 @@
 //!
 //! HIGH stays on `regex::RegexSet` — one O(n) pass for "does *anything*
 //! match?", then a per-pattern `Regex::find_iter` extracts spans only for
-//! the rows that hit. RegexSet's parallelism is the whole point.
+//! the rows that hit. `RegexSet`'s parallelism is the whole point.
 //!
 //! MEDIUM moves to **`fancy-regex`** so we can embed negative-lookahead
 //! placeholder rejection inside the pattern: `(?!process\.env|getenv|YOUR|
@@ -146,13 +146,13 @@ const PATTERNS: &[(&str, &str, Tier)] = &[
     ("solana_address", r"\b[1-9A-HJ-NP-Za-km-z]{44}\b", Tier::High),
 ];
 
-/// HIGH-tier RegexSet — O(n) "does anything match?" first-pass. Spans
+/// HIGH-tier `RegexSet` — O(n) "does anything match?" first-pass. Spans
 /// are NOT extracted here; this is the fast filter.
 static REGEX_SET: LazyLock<RegexSet> =
     LazyLock::new(|| RegexSet::new(PATTERNS.iter().map(|(_, p, _)| *p)).expect("invalid pattern"));
 
 /// HIGH-tier patterns compiled individually for span extraction. Same
-/// indexing as PATTERNS, so a RegexSet hit at index N → INDIVIDUAL[N].
+/// indexing as PATTERNS, so a `RegexSet` hit at index N → INDIVIDUAL[N].
 static INDIVIDUAL_REGEXES: LazyLock<Vec<Regex>> =
     LazyLock::new(|| PATTERNS.iter().map(|(_, p, _)| Regex::new(p).expect("invalid pattern")).collect());
 
@@ -329,7 +329,7 @@ static DUTCH_BSN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{8,9}\b").
 // ─── Scan API ──────────────────────────────────────────────────────────
 
 /// Span-aware scan returning every finding with its byte range. Used by
-/// the Secret Leak Scanner UI and the PrivacyBlur primitive.
+/// the Secret Leak Scanner UI and the `PrivacyBlur` primitive.
 ///
 /// `include_low` opts in to LOW-tier patterns (email/phone/IP); the
 /// default-OFF behavior matches the "no PII flood on every document"
@@ -338,6 +338,10 @@ static DUTCH_BSN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{8,9}\b").
 /// Findings are sorted by start position. Overlapping spans are NOT
 /// deduplicated — multiple detectors can legitimately point at the same
 /// region, and the UI chooses how to render (highest tier wins typically).
+///
+/// # Panics
+/// Only if a built-in pattern fails to compile (a bug the tests catch); a
+/// regex match always has its whole-match group.
 pub fn scan_text_detailed(text: &str, include_low: bool) -> Vec<Finding> {
     if text.is_empty() {
         return Vec::new();
@@ -364,7 +368,7 @@ pub fn scan_text_detailed(text: &str, include_low: bool) -> Vec<Finding> {
     //      (c) Placeholder rejection — fewer than 3 distinct digit values means
     //          a test/example card (e.g. "4111 1111 1111 1111"), not a real one
     for m in CREDIT_CARD_REGEX.find_iter(text) {
-        let digits: String = m.as_str().chars().filter(|c| c.is_ascii_digit()).collect();
+        let digits: String = m.as_str().chars().filter(char::is_ascii_digit).collect();
         if !(13..=19).contains(&digits.len()) {
             continue;
         }
@@ -442,9 +446,9 @@ pub fn scan_text_detailed(text: &str, include_low: bool) -> Vec<Finding> {
     // Spain DNI (8 digits) / NIE ([XYZ]+7 digits) — check-letter validated.
     for caps in SPAIN_DNI.captures_iter(text) {
         let whole = caps.get(0).expect("group 0 always present");
-        let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        let digits = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-        let letter = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+        let prefix = caps.get(1).map_or("", |m| m.as_str());
+        let digits = caps.get(2).map_or("", |m| m.as_str());
+        let letter = caps.get(3).map_or("", |m| m.as_str());
         let len_ok = (prefix.is_empty() && digits.len() == 8) || (!prefix.is_empty() && digits.len() == 7);
         if len_ok && is_valid_dni(prefix, digits, letter) {
             findings.push(Finding { kind: "spain_dni", tier: Tier::Medium, start: whole.start(), end: whole.end() });
@@ -546,7 +550,7 @@ pub fn scan_text(text: &str) -> Vec<&'static str> {
         return Vec::new();
     }
     let mut kinds: Vec<&'static str> = findings.into_iter().map(|f| f.kind).collect();
-    kinds.sort();
+    kinds.sort_unstable();
     kinds.dedup();
     // Universal tag so `kind:sensitive` finds anything regardless of the
     // specific category.
@@ -580,7 +584,7 @@ pub struct FilePreview {
 /// One excerpt — a contiguous slice of the file containing one or more
 /// findings, plus ±N lines of context. Spans inside `findings` are
 /// REWRITTEN to be relative to `content` (the excerpt slice), so the
-/// PrivacyBlur primitive on the frontend Just Works against this
+/// `PrivacyBlur` primitive on the frontend Just Works against this
 /// `text` + `findings` pair.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -721,34 +725,12 @@ pub fn extract_excerpts(content: &str, findings: &[Finding], context_lines: usiz
 ///   - all-same-char masks (`***`, `xxxxxx`)
 ///   - entropy gate for unquoted prose
 fn is_plausible_secret_value(raw: &str, quoted: bool) -> bool {
-    let value = raw.trim_end_matches([',', ';', '.']);
-    if value.len() < 6 {
-        return false;
-    }
-    let lower = value.to_ascii_lowercase();
-
-    // Defense-in-depth: regex already rejects the `$`/`%` prefix +
-    // function call shapes, but a paranoid second check costs nothing.
-    if value.starts_with('$') || value.starts_with('%') {
-        return false;
-    }
-    if value.contains('(') {
-        return false;
-    }
     const REF_MARKERS: &[&str] =
         &["process.env", "os.environ", "import.meta.env", "getenv", "config.", "settings.", "{{", "}}"];
-    if REF_MARKERS.iter().any(|m| lower.contains(m)) {
-        return false;
-    }
-
     // Placeholder / mask substrings — safe words that never appear in
     // a real high-entropy secret.
     const PLACEHOLDER_SUBSTR: &[&str] =
         &["your", "example", "placeholder", "redacted", "changethis", "xxxx", "....", "dummy", "sample"];
-    if PLACEHOLDER_SUBSTR.iter().any(|m| lower.contains(m)) {
-        return false;
-    }
-
     // Exact common placeholders.
     const PLACEHOLDER_EXACT: &[&str] = &[
         "password",
@@ -768,6 +750,29 @@ fn is_plausible_secret_value(raw: &str, quoted: bool) -> bool {
         "enabled",
         "disabled",
     ];
+
+    let value = raw.trim_end_matches([',', ';', '.']);
+    if value.len() < 6 {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+
+    // Defense-in-depth: regex already rejects the `$`/`%` prefix +
+    // function call shapes, but a paranoid second check costs nothing.
+    if value.starts_with('$') || value.starts_with('%') {
+        return false;
+    }
+    if value.contains('(') {
+        return false;
+    }
+    if REF_MARKERS.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+
+    if PLACEHOLDER_SUBSTR.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+
     if PLACEHOLDER_EXACT.contains(&lower.as_str()) {
         return false;
     }
@@ -830,10 +835,10 @@ fn is_valid_card_iin(digits: &str) -> bool {
                     if len != 16 || b.len() < 4 {
                         return false;
                     }
-                    let p: u16 = (b[0] - b'0') as u16 * 1000
-                        + (b[1] - b'0') as u16 * 100
-                        + (b[2] - b'0') as u16 * 10
-                        + (b[3] - b'0') as u16;
+                    let p: u16 = u16::from(b[0] - b'0') * 1000
+                        + u16::from(b[1] - b'0') * 100
+                        + u16::from(b[2] - b'0') * 10
+                        + u16::from(b[3] - b'0');
                     (3528..=3589).contains(&p)
                 }
                 0 => {
@@ -859,7 +864,7 @@ fn is_monotonic_placeholder(digits: &str) -> bool {
     let mut seen = [false; 10];
     let mut count = 0usize;
     for b in digits.bytes() {
-        let d = (b - b'0') as usize;
+        let d = usize::from(b - b'0');
         if !seen[d] {
             seen[d] = true;
             count += 1;
@@ -878,10 +883,7 @@ fn luhn_valid(digits: &str) -> bool {
     let mut sum: u32 = 0;
     let mut alternate = false;
     for ch in digits.chars().rev() {
-        let mut n = match ch.to_digit(10) {
-            Some(d) => d,
-            None => return false,
-        };
+        let Some(mut n) = ch.to_digit(10) else { return false };
         if alternate {
             n *= 2;
             if n > 9 {
@@ -918,7 +920,7 @@ fn is_valid_dni(prefix: &str, digits: &str, letter: &str) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    letter.as_bytes().first().map(|b| b.to_ascii_uppercase()) == Some(LETTERS[(n % 23) as usize])
+    letter.as_bytes().first().map(u8::to_ascii_uppercase) == Some(LETTERS[usize::try_from(n % 23).unwrap_or_default()])
 }
 
 /// Dutch BSN modulo-11 validation (elfproef).
@@ -927,7 +929,7 @@ fn is_valid_dni(prefix: &str, digits: &str, letter: &str) -> bool {
 /// Result must be divisible by 11 and non-zero. 8-digit BSNs are padded with
 /// a leading zero to 9 digits before validation.
 fn is_valid_bsn(raw: &str) -> bool {
-    let digits: Vec<u32> = raw.chars().filter(|c| c.is_ascii_digit()).filter_map(|c| c.to_digit(10)).collect();
+    let digits: Vec<u32> = raw.chars().filter(char::is_ascii_digit).filter_map(|c| c.to_digit(10)).collect();
     // Accept 8 or 9 digit runs; pad 8-digit to 9 for the formula.
     let d: Vec<u32> = match digits.len() {
         9 => digits,
@@ -942,7 +944,7 @@ fn is_valid_bsn(raw: &str) -> bool {
         return false; // leading zero only valid in the padded 8-digit case, handled above
     }
     let weights: [i64; 9] = [9, 8, 7, 6, 5, 4, 3, 2, -1];
-    let sum: i64 = d.iter().zip(weights.iter()).map(|(&di, &w)| w * di as i64).sum();
+    let sum: i64 = d.iter().zip(weights.iter()).map(|(&di, &w)| w * i64::from(di)).sum();
     sum > 0 && sum % 11 == 0
 }
 
@@ -1298,7 +1300,7 @@ mod tests {
         let findings = scan_text_detailed(text, false);
         let starts: Vec<usize> = findings.iter().map(|f| f.start).collect();
         let mut sorted = starts.clone();
-        sorted.sort();
+        sorted.sort_unstable();
         assert_eq!(starts, sorted);
     }
 

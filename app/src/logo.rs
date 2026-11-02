@@ -4,14 +4,16 @@
 
 /// The logo as RGBA pixels, `size` × `size`.
 #[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "mark <= tile <= samples, so both 255 * ratio values are in 0..=255"
+    reason = "pixel math: coordinates are below `size` (an icon size), so exact as f32;               mark <= tile <= samples, so both 255 * ratio values are in 0..=255"
 )]
 pub fn rgba(size: u32) -> Vec<u8> {
     // Each pixel averages 4×4 samples, for smooth edges at small sizes.
     const SUB: u32 = 4;
-    let mut out = Vec::with_capacity((size * size * 4) as usize);
+    let mut out = Vec::with_capacity(usize::try_from(size * size * 4).unwrap_or(0));
     for y in 0..size {
         for x in 0..size {
             let (mut tile, mut mark) = (0f32, 0f32);
@@ -60,8 +62,8 @@ fn in_mark(x: f32, y: f32) -> bool {
 /// Distance from (x, y) to the segment a–b.
 fn segment(x: f32, y: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let t = (((x - a.0) * dx + (y - a.1) * dy) / (dx * dx + dy * dy)).clamp(0., 1.);
-    ((x - a.0 - t * dx).powi(2) + (y - a.1 - t * dy).powi(2)).sqrt()
+    let along = (((x - a.0) * dx + (y - a.1) * dy) / (dx * dx + dy * dy)).clamp(0., 1.);
+    ((x - a.0 - along * dx).powi(2) + (y - a.1 - along * dy).powi(2)).sqrt()
 }
 
 #[cfg(test)]
@@ -70,6 +72,7 @@ mod tests {
 
     #[test]
     #[expect(
+        clippy::as_conversions,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "constant, positive pixel coordinates inside the 64 px image"
@@ -89,7 +92,7 @@ mod tests {
     /// Writes `installer/dash.ico` (16–256 px). Run after changing the logo:
     /// `cargo test -p dash write_installer_icon -- --ignored`.
     #[test]
-    #[ignore]
+    #[ignore = "writes installer/dash.ico; run by hand after changing the logo"]
     fn write_installer_icon() {
         use image::codecs::ico::{IcoEncoder, IcoFrame};
         let frames: Vec<IcoFrame> = [16, 20, 24, 32, 40, 48, 64, 256]

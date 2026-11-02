@@ -53,13 +53,13 @@ pub fn scrollbar(id: impl Into<ElementId>, handle: &ScrollHandle) -> AnyElement 
     }
     let (height, top) = thumb(view, max, -f32::from(handle.offset().y));
     let grab = Rc::new(Cell::new(height / 2.));
-    let drag = ThumbDrag { id: id.clone(), grab: grab.clone() };
+    let drag = ThumbDrag { id: id.clone(), grab: Rc::clone(&grab) };
     let (on_track, on_move, on_thumb) = (handle.clone(), handle.clone(), handle.clone());
-    let thumb_grab = grab.clone();
+    let thumb_grab = Rc::clone(&grab);
     // The press was on the thumb (it runs first): the track mustn't jump.
     // It isn't stopped there, or the track would never start the drag.
     let pressed_thumb = Rc::new(Cell::new(false));
-    let thumb_pressed = pressed_thumb.clone();
+    let thumb_pressed = Rc::clone(&pressed_thumb);
     div()
         .id(id.clone())
         .absolute()

@@ -9,6 +9,7 @@ pub(super) struct SearchIndexWorkerProcess {
     pub(super) cancel_path: PathBuf,
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "serialized settings and status: each bool is an independent flag")]
 #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileSearchIndexOptions {
@@ -156,7 +157,7 @@ pub struct ContentSearchResultItem {
     /// secondary ranking signal and shown to the user as a confidence cue.
     pub match_count: u32,
     pub matched_keywords: Vec<String>,
-    /// Sensitive-content kinds detected at index time. See FileSearchResultItem.
+    /// Sensitive-content kinds detected at index time. See `FileSearchResultItem`.
     pub sensitive_kinds: Vec<String>,
     /// Semantic (embedding cosine) similarity to the query, 0..1. > 0 means the
     /// meaning-search pass rated this document related; 0 means it surfaced on
@@ -230,8 +231,8 @@ pub struct FileSearchResultItem {
     pub score: f32,
     pub matched_keywords: Vec<String>,
     pub match_reason: String,
-    /// Sensitive-content findings detected at index time (e.g. "aws_access_key",
-    /// "private_key_pem"). Empty when nothing was detected or content wasn't
+    /// Sensitive-content findings detected at index time (e.g. "`aws_access_key`",
+    /// "`private_key_pem`"). Empty when nothing was detected or content wasn't
     /// indexed for this file. Always contains "sensitive" as the first entry
     /// when anything else is present.
     pub sensitive_kinds: Vec<String>,
@@ -259,6 +260,7 @@ pub struct FileSearchBuildResult {
     pub message: String,
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "serialized settings and status: each bool is an independent flag")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileSearchProgressEvent {
@@ -307,6 +309,7 @@ impl Default for FileSearchDiagnostics {
     }
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "serialized settings and status: each bool is an independent flag")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileSearchStatus {
@@ -531,6 +534,7 @@ pub(super) struct StoredSearchConfig {
     pub(super) rebuild_schedule: FileSearchRebuildSchedule,
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "serialized settings and status: each bool is an independent flag")]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct IndexWorkerStatusFile {
@@ -651,7 +655,7 @@ pub(super) fn is_on_battery() -> bool {
     use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
     let mut status = SYSTEM_POWER_STATUS::default();
     // SAFETY: GetSystemPowerStatus fills the caller-owned struct in place.
-    let ok = unsafe { GetSystemPowerStatus(&mut status) }.is_ok();
+    let ok = unsafe { GetSystemPowerStatus(&raw mut status) }.is_ok();
     // ACLineStatus: 0 = on battery, 1 = on AC, 255 = unknown.
     ok && status.ACLineStatus == 0
 }
@@ -678,7 +682,7 @@ pub(super) fn available_ram_bytes() -> u64 {
         ..Default::default()
     };
     // SAFETY: `GlobalMemoryStatusEx` writes into a caller-owned struct.
-    if unsafe { GlobalMemoryStatusEx(&mut ms) }.is_ok() {
+    if unsafe { GlobalMemoryStatusEx(&raw mut ms) }.is_ok() {
         ms.ullAvailPhys
     } else {
         4 * 1024 * 1024 * 1024 // conservative fallback

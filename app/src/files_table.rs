@@ -35,7 +35,7 @@ impl Selection {
     }
 
     pub fn count(&self) -> usize {
-        self.ranges.iter().map(|r| r.len()).sum()
+        self.ranges.iter().map(std::iter::ExactSizeIterator::len).sum()
     }
 
     pub fn contains(&self, ix: usize) -> bool {
@@ -44,7 +44,7 @@ impl Selection {
 
     /// Every selected row, in order.
     pub fn indices(&self) -> impl Iterator<Item = usize> + '_ {
-        self.ranges.iter().flat_map(|r| r.clone())
+        self.ranges.iter().flat_map(std::clone::Clone::clone)
     }
 
     /// A plain click (or arrow key): just this row.
@@ -353,7 +353,7 @@ pub fn modified_text(ms: u64) -> String {
     if ms == 0 {
         return String::new();
     }
-    match chrono::DateTime::from_timestamp_millis(ms as i64) {
+    match chrono::DateTime::from_timestamp_millis(ms.cast_signed()) {
         Some(t) => t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string(),
         None => String::new(),
     }

@@ -93,7 +93,7 @@ impl TextInput {
         cx.notify();
     }
 
-    fn changed(&mut self, cx: &mut Context<Self>) {
+    fn changed(cx: &mut Context<Self>) {
         cx.emit(InputEvent::Changed);
         cx.notify();
     }
@@ -102,7 +102,7 @@ impl TextInput {
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);
         } else {
-            self.move_to(self.selected_range.start, cx)
+            self.move_to(self.selected_range.start, cx);
         }
     }
 
@@ -110,7 +110,7 @@ impl TextInput {
         if self.selected_range.is_empty() {
             self.move_to(self.next_boundary(self.selected_range.end), cx);
         } else {
-            self.move_to(self.selected_range.end, cx)
+            self.move_to(self.selected_range.end, cx);
         }
     }
 
@@ -130,7 +130,7 @@ impl TextInput {
             return;
         }
         self.move_to(0, cx);
-        self.select_to(self.content.len(), cx)
+        self.select_to(self.content.len(), cx);
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
@@ -143,9 +143,9 @@ impl TextInput {
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
-            self.select_to(self.previous_boundary(self.cursor_offset()), cx)
+            self.select_to(self.previous_boundary(self.cursor_offset()), cx);
         }
-        self.replace_text_in_range(None, "", window, cx)
+        self.replace_text_in_range(None, "", window, cx);
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
@@ -156,9 +156,9 @@ impl TextInput {
             return;
         }
         if self.selected_range.is_empty() {
-            self.select_to(self.next_boundary(self.cursor_offset()), cx)
+            self.select_to(self.next_boundary(self.cursor_offset()), cx);
         }
-        self.replace_text_in_range(None, "", window, cx)
+        self.replace_text_in_range(None, "", window, cx);
     }
 
     /// One click places the caret (Shift: extends), two select the word,
@@ -184,7 +184,7 @@ impl TextInput {
                 if event.modifiers.shift {
                     self.select_to(at, cx);
                 } else {
-                    self.move_to(at, cx)
+                    self.move_to(at, cx);
                 }
             }
         }
@@ -208,10 +208,10 @@ impl TextInput {
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         let range = clamp_range(&self.content, &self.selected_range);
-        if !range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.content[range].to_string()));
-        } else {
+        if range.is_empty() {
             cx.propagate();
+        } else {
+            cx.write_to_clipboard(ClipboardItem::new_string(self.content[range].to_string()));
         }
     }
 
@@ -219,13 +219,13 @@ impl TextInput {
         let range = clamp_range(&self.content, &self.selected_range);
         if !range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(self.content[range].to_string()));
-            self.replace_text_in_range(None, "", window, cx)
+            self.replace_text_in_range(None, "", window, cx);
         }
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
-        cx.notify()
+        cx.notify();
     }
 
     fn cursor_offset(&self) -> usize {
@@ -254,15 +254,15 @@ impl TextInput {
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         if self.selection_reversed {
-            self.selected_range.start = offset
+            self.selected_range.start = offset;
         } else {
-            self.selected_range.end = offset
-        };
+            self.selected_range.end = offset;
+        }
         if self.selected_range.end < self.selected_range.start {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
-        cx.notify()
+        cx.notify();
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
@@ -403,10 +403,10 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
         let range = clamp_range(&self.content, &range);
-        self.content = (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
+        self.content = [&self.content[0..range.start], new_text, &self.content[range.end..]].concat().into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
-        self.changed(cx);
+        Self::changed(cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -423,16 +423,18 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
         let range = clamp_range(&self.content, &range);
-        self.content = (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
+        self.content = [&self.content[0..range.start], new_text, &self.content[range.end..]].concat().into();
         self.marked_range = if new_text.is_empty() { None } else { Some(range.start..range.start + new_text.len()) };
         // The new selection is in UTF-16 within the inserted text.
         let selected = new_selected_range_utf16
             .as_ref()
             .map(|r| utf8_offset(new_text, r.start)..utf8_offset(new_text, r.end))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.start)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+            .map_or_else(
+                || range.start + new_text.len()..range.start + new_text.len(),
+                |new_range| new_range.start + range.start..new_range.end + range.start,
+            );
         self.selected_range = clamp_range(&self.content, &selected);
-        self.changed(cx);
+        Self::changed(cx);
     }
 
     fn bounds_for_range(
@@ -583,7 +585,7 @@ impl Element for TextElement {
                         point(left + line.x_for_index(selected_range.start), bounds.top()),
                         point(left + line.x_for_index(selected_range.end), bounds.bottom()),
                     ),
-                    rgba(0x4f8cff55),
+                    rgba(0x4f8c_ff55),
                 )),
                 None,
             )
@@ -608,7 +610,7 @@ impl Element for TextElement {
         // Text scrolled sideways stays inside the box.
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             if let Some(selection) = prepaint.selection.take() {
-                window.paint_quad(selection)
+                window.paint_quad(selection);
             }
             // A failed paint loses this frame's text, nothing more.
             if let Err(e) = line.paint(origin, window.line_height(), window, cx) {

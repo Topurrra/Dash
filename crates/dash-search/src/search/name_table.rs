@@ -8,8 +8,8 @@ pub(super) fn update_status(update: impl FnOnce(&mut FileSearchStatus)) {
     }
 }
 
-pub(super) fn emit_progress(app: &std::sync::Arc<dyn dash_core::Host>, payload: FileSearchProgressEvent) {
-    app.emit(INDEX_PROGRESS_EVENT, serde_json::to_value(&payload).unwrap_or_default());
+pub(super) fn emit_progress(app: &std::sync::Arc<dyn dash_core::Host>, payload: &FileSearchProgressEvent) {
+    app.emit(INDEX_PROGRESS_EVENT, serde_json::to_value(payload).unwrap_or_default());
 }
 
 // ---- Read access for the in-memory name table (`names.rs`, F1) ----
@@ -59,7 +59,7 @@ pub(crate) fn visit_filename_index_docs(
         let handle = guard.as_ref()?;
         (handle.reader.searcher(), handle.fields)
     };
-    let still_open = || FILENAME_ENGINE.lock().map(|guard| guard.is_some()).unwrap_or(false);
+    let still_open = || FILENAME_ENGINE.lock().is_ok_and(|guard| guard.is_some());
     visit_filename_searcher(&searcher, fields, &still_open, visit)
 }
 
@@ -104,7 +104,7 @@ pub(super) fn visit_filename_searcher(
 }
 
 pub(super) fn doc_text(document: &TantivyDocument, field: Field) -> Option<String> {
-    document.get_first(field).and_then(|value| value.as_str().map(|text| text.to_string()))
+    document.get_first(field).and_then(|value| value.as_str().map(std::string::ToString::to_string))
 }
 
 pub(super) fn doc_u64(document: &TantivyDocument, field: Field) -> Option<u64> {
@@ -113,8 +113,8 @@ pub(super) fn doc_u64(document: &TantivyDocument, field: Field) -> Option<u64> {
 
 /// Collect every text value stored under `field` as a `Vec<String>`. Used for
 /// multi-valued tag fields like `sensitive_kinds`. Returns an empty vec when
-/// the field is absent (Option::None) so old indexes simply yield no findings.
+/// the field is absent (`Option::None`) so old indexes simply yield no findings.
 pub(super) fn collect_doc_text_values(document: &TantivyDocument, field: Option<Field>) -> Vec<String> {
     let Some(field) = field else { return Vec::new() };
-    document.get_all(field).filter_map(|value| value.as_str().map(|s| s.to_string())).collect()
+    document.get_all(field).filter_map(|value| value.as_str().map(std::string::ToString::to_string)).collect()
 }

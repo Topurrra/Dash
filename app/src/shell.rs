@@ -103,12 +103,11 @@ pub fn label(hotkey: HotKey) -> String {
 /// The hotkey's current combination, for Settings.
 pub fn current(which: Which, cx: &App) -> String {
     // No hotkeys set up (`dash --shots`): show the saved or default ones.
-    match cx.try_global::<Shell>() {
-        Some(shell) => label(shell.get(which)),
-        None => {
-            let (search, clipboard) = saved_or_default();
-            label(if which == Which::Search { search } else { clipboard })
-        }
+    if let Some(shell) = cx.try_global::<Shell>() {
+        label(shell.get(which))
+    } else {
+        let (search, clipboard) = saved_or_default();
+        label(if which == Which::Search { search } else { clipboard })
     }
 }
 
@@ -160,7 +159,7 @@ pub fn from_keystroke(keystroke: &gpui::Keystroke) -> Result<HotKey, String> {
         return Err("Use Ctrl, Alt or Win with a key.".into());
     }
     let key = match keystroke.key.as_str() {
-        "up" | "down" | "left" | "right" => format!("Arrow{}", &keystroke.key),
+        "up" | "down" | "left" | "right" => format!("Arrow{}", keystroke.key),
         "\\" => "Backslash".into(),
         k => k.to_string(),
     };

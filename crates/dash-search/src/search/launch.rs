@@ -21,7 +21,7 @@ pub(super) fn ensure_launch_target_watcher() {
         return; // already watching
     }
 
-    let mut watcher = match notify::recommended_watcher(|res: notify::Result<Event>| {
+    let Ok(mut watcher) = notify::recommended_watcher(|res: notify::Result<Event>| {
         let Ok(event) = res else { return };
         // An app install / uninstall / rename surfaces as a create / remove /
         // rename under a launcher root. Invalidate the cache; the next
@@ -31,9 +31,8 @@ pub(super) fn ensure_launch_target_watcher() {
                 *cache = None;
             }
         }
-    }) {
-        Ok(watcher) => watcher,
-        Err(_) => return,
+    }) else {
+        return;
     };
 
     let mut watching = false;
@@ -81,7 +80,7 @@ pub(super) fn build_launch_target_cache() -> LaunchTargetCache {
 
         let iter = WalkDir::new(&root).follow_links(false).max_depth(MAX_LAUNCH_SCAN_DEPTH).into_iter();
 
-        for entry in iter.filter_map(|item| item.ok()) {
+        for entry in iter.filter_map(std::result::Result::ok) {
             if records.len() >= MAX_LAUNCH_TARGETS {
                 break;
             }
@@ -108,8 +107,7 @@ pub(super) fn build_launch_target_cache() -> LaunchTargetCache {
             let kind = if path
                 .extension()
                 .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("lnk") || ext.eq_ignore_ascii_case("desktop"))
-                .unwrap_or(false)
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk") || ext.eq_ignore_ascii_case("desktop"))
             {
                 "shortcut"
             } else {
@@ -145,7 +143,7 @@ pub(super) fn build_launch_target_cache() -> LaunchTargetCache {
         add_packaged_launch_target_record(&mut records, &mut seen_paths, &app.name, &launch_path);
     }
 
-    let built_at_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0);
+    let built_at_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |value| value.as_millis());
 
     LaunchTargetCache { built_at_ms, records }
 }
@@ -234,7 +232,7 @@ pub(super) fn is_launch_target_file(path: &Path) -> bool {
         return matches!(extension.as_str(), "desktop" | "appimage" | "sh");
     }
 
-    #[allow(unreachable_code)]
+    #[allow(unreachable_code, reason = "the fallback for targets none of the blocks above cover")]
     false
 }
 
@@ -403,6 +401,7 @@ pub(super) fn score_launch_target(
         return None;
     }
 
+    #[expect(clippy::as_conversions, clippy::cast_precision_loss, reason = "query token counts are tiny, exact in f32")]
     let token_bonus =
         if query_tokens.is_empty() { 0.0 } else { (matched_tokens as f32 / query_tokens.len() as f32) * 40.0 };
 

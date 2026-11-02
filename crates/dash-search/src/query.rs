@@ -1,5 +1,5 @@
 //! The search box's query language (F2), in the style of Everything and
-//! FSearch. Plain words work as before: each must appear somewhere in the
+//! `FSearch`. Plain words work as before: each must appear somewhere in the
 //! name, ignoring case.
 //!
 //! | Syntax | Meaning |
@@ -76,18 +76,27 @@ impl Query {
 
 /// Parses what's typed; `Err` explains what's wrong (shown to the user).
 /// `@name` is plain text here; use `parse_with_filters` for saved filters.
+///
+/// # Errors
+/// When the query doesn't parse; the message says why.
 pub fn parse(text: &str) -> Result<Query, String> {
     parse_inner(text, Clock::local(), None)
 }
 
 /// Like `parse`, with dates worked out relative to `now` (and its offset as
 /// local time). For tests and for callers that already know the time.
+///
+/// # Errors
+/// When the query doesn't parse; the message says why.
 pub fn parse_at(text: &str, now: OffsetDateTime) -> Result<Query, String> {
     parse_inner(text, Clock { now, follow_local: false }, None)
 }
 
 /// Like `parse`, expanding `@name` and `filter:name` from the filters saved
 /// under `dir` (see `saved_filters`).
+///
+/// # Errors
+/// When the query doesn't parse; the message says why.
 pub fn parse_with_filters(text: &str, dir: &Path) -> Result<Query, String> {
     let filters = saved_filters(dir);
     parse_inner(text, Clock::local(), Some(&filters))
@@ -138,6 +147,10 @@ pub fn saved_filters(dir: &Path) -> Vec<(String, String)> {
 
 /// Saves (or replaces, ignoring case) the filter `name`. The query must parse,
 /// and may use other saved filters but not itself.
+///
+/// # Errors
+/// When the name is empty or has other characters than letters, digits,
+/// `-`, `_` and `.`, the query doesn't parse, or the file can't be written.
 pub fn save_filter(dir: &Path, name: &str, query: &str) -> Result<(), String> {
     let name = name.trim().trim_start_matches('@');
     if name.is_empty() {
@@ -160,6 +173,9 @@ pub fn save_filter(dir: &Path, name: &str, query: &str) -> Result<(), String> {
 }
 
 /// Removes the saved filter `name` (ignoring case).
+///
+/// # Errors
+/// When there's no such filter or the file can't be written.
 pub fn delete_filter(dir: &Path, name: &str) -> Result<(), String> {
     let name = name.trim().trim_start_matches('@');
     let key = name.to_lowercase();
@@ -228,8 +244,8 @@ impl Node {
                 }
             }
             Node::Parent(want) => path_eq(e.parent, want),
-            Node::Depth(s) => s.contains(e.depth as u64),
-            Node::ChildCount(s) => e.is_dir && e.child_count.is_some_and(|c| s.contains(c as u64)),
+            Node::Depth(s) => s.contains(u64::from(e.depth)),
+            Node::ChildCount(s) => e.is_dir && e.child_count.is_some_and(|c| s.contains(u64::from(c))),
             Node::Empty => {
                 if e.is_dir {
                     e.child_count == Some(0)
@@ -536,7 +552,7 @@ fn tokenize(text: &str) -> Vec<Tok> {
             }
             '!' if cur.is_empty() && quote_at.is_none() => toks.push(Tok::Not),
             '-' if cur.is_empty() && quote_at.is_none() && chars.peek().is_some_and(|n| !n.is_whitespace()) => {
-                toks.push(Tok::Not)
+                toks.push(Tok::Not);
             }
             _ => {
                 cur.push(c);
@@ -645,7 +661,7 @@ impl<'a> Parser<'a> {
         let mut parts = Vec::new();
         loop {
             match self.peek() {
-                None | Some(Tok::Close) | Some(Tok::Or) => break,
+                None | Some(Tok::Close | Tok::Or) => break,
                 Some(Tok::And) => self.pos += 1,
                 _ => {
                     if let Some(n) = self.parse_unary(mods)? {
@@ -664,7 +680,7 @@ impl<'a> Parser<'a> {
         self.pos += 1;
         match tok {
             Tok::Not => match self.peek() {
-                None | Some(Tok::Close) | Some(Tok::Or) => Ok(None),
+                None | Some(Tok::Close | Tok::Or) => Ok(None),
                 _ => {
                     self.enter()?;
                     let node = self.parse_unary(mods)?.map(|n| Node::Not(Box::new(n)));
@@ -906,6 +922,11 @@ const SIZE_HELP: &str = "size: needs a number like 10mb, >1gb or 1mb..5mb";
 
 /// Bytes in `10mb`, `1.5 GB`, `500`. Alone with a unit it covers everything
 /// that shows as that many units; in comparisons it's the exact value.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "unit sizes are powers of two (exact in f64), and u64::MAX as f64 is only a bound"
+)]
 fn size_atom(t: &str, bare: bool) -> Result<(u64, u64), String> {
     let t = t.trim().to_ascii_lowercase();
     let split = t.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(t.len());
@@ -984,7 +1005,7 @@ impl Clock {
     fn date_atom(&self, t: &str) -> Option<(u64, u64)> {
         let t = t.trim().to_ascii_lowercase();
         let today = self.now.date();
-        let monday = today.checked_sub(Duration::days(today.weekday().number_days_from_monday() as i64))?;
+        let monday = today.checked_sub(Duration::days(i64::from(today.weekday().number_days_from_monday())))?;
         let first = Date::from_calendar_date(today.year(), today.month(), 1).ok()?;
         let jan1 = |y: i32| Date::from_calendar_date(y, Month::January, 1).ok();
         match t.as_str() {
@@ -1085,7 +1106,7 @@ fn split_count(s: &str) -> Option<(i64, &str)> {
 
 /// `date` moved by `delta` months, the day clamped to the month's length.
 fn add_months(date: Date, delta: i64) -> Option<Date> {
-    let total = (date.year() as i64) * 12 + (date.month() as i64 - 1) + delta;
+    let total = i64::from(date.year()) * 12 + (i64::from(u8::from(date.month())) - 1) + delta;
     let year: i32 = total.div_euclid(12).try_into().ok()?;
     let month = Month::try_from(u8::try_from(total.rem_euclid(12) + 1).ok()?).ok()?;
     let day = date.day().min(month_len(year, month));

@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) fn index_writer_threads() -> usize {
-    let available = thread::available_parallelism().map(|value| value.get()).unwrap_or(2);
+    let available = thread::available_parallelism().map_or(2, std::num::NonZero::get);
     available.clamp(1, INDEX_WRITER_THREADS_MAX)
 }
 
@@ -39,7 +39,7 @@ pub(super) fn index_walker_threads(performance_mode: &str, on_battery: bool) -> 
 /// Battery halving still applies on top, so a laptop on battery in
 /// balanced mode still gets ~6 instead of 12.
 pub(super) fn index_walker_threads_with_ocr(performance_mode: &str, on_battery: bool, ocr_enabled: bool) -> usize {
-    let available = thread::available_parallelism().map(|value| value.get()).unwrap_or(INDEX_WALKER_THREADS_FALLBACK);
+    let available = thread::available_parallelism().map_or(INDEX_WALKER_THREADS_FALLBACK, std::num::NonZero::get);
     let threads = match normalize_index_performance_mode(performance_mode).as_str() {
         "fast" => available.saturating_sub(1).clamp(2, 16),
         "quiet" => {
@@ -70,7 +70,7 @@ pub(super) fn apply_watch_event_to_writer(
     fields: &SearchFields,
     options: &FileSearchIndexOptions,
     max_content_bytes: usize,
-) -> Result<(u64, u64), String> {
+) -> (u64, u64) {
     let mut updated = 0_u64;
     let mut deleted = 0_u64;
 
@@ -121,10 +121,10 @@ pub(super) fn apply_watch_event_to_writer(
                 }
             }
         }
-        _ => {}
+        EventKind::Access(_) => {}
     }
 
-    Ok((updated, deleted))
+    (updated, deleted)
 }
 
 pub(super) fn upsert_path_document(
@@ -157,14 +157,12 @@ pub(super) fn upsert_path_document(
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
+        .map_or(0, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
     let created_ms = metadata
         .created()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(modified_ms);
+        .map_or(modified_ms, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
     let content =
         if is_file { read_text_for_index(path, max_content_bytes).unwrap_or_default() } else { String::new() };
     let entry_type = if is_dir { ENTRY_TYPE_FOLDER } else { ENTRY_TYPE_FILE };
@@ -203,11 +201,16 @@ pub(super) fn upsert_path_document(
 /// any of this, so a bug here cannot break Notes OR the search pillars. The
 /// caller fire-and-forgets. `upserts` = note files to (re)index; `deletes` =
 /// note paths whose docs to drop (on delete).
+///
+/// # Errors
+/// When the index folder can't be found (on a follower, also when the
+/// owner's call fails).
 // `(async)` so the heavy Tantivy index commits (two short-lived writers +
 // commit + wait_merging_threads) run on a worker thread, not the Tauri main/
 // event-loop thread. The frontend fire-and-forgets this on a 2500ms debounce
 // after a note save; on the main thread the commit would stall the UI the same
 // way a sync `write_note` does. Note-saving never depends on this either way.
+#[expect(clippy::needless_pass_by_value, reason = "public API shared with other apps")]
 pub fn update_notes_index(
     app: std::sync::Arc<dyn dash_core::Host>,
     upserts: Vec<String>,
@@ -226,7 +229,7 @@ pub fn update_notes_index(
 /// True if `path` has the `.ki` note extension (case-insensitive). Cheap —
 /// touches the path only, never the filesystem.
 pub(super) fn is_ki_path(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("ki")) == Some(true)
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("ki"))
 }
 
 /// True if `path` is an existing `.ki` file (notes only — never index arbitrary
@@ -244,9 +247,8 @@ pub(super) fn is_note_file(path: &str) -> bool {
 /// the full-walk hot path for non-note files.
 pub(super) fn note_display_title(path: &Path) -> String {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled").to_string();
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return stem,
+    let Ok(content) = fs::read_to_string(path) else {
+        return stem;
     };
     let normalized = content.replace("\r\n", "\n");
     // Frontmatter `title:` (the form the Notes editor writes).
@@ -398,7 +400,7 @@ pub(super) fn extract_fields(schema: &Schema) -> Result<SearchFields, String> {
 /// no file content. Kept separate from the content index so filename search is
 /// never blocked by content indexing. Any field change here must bump
 /// `FILENAME_SCHEMA_VERSION`. Wired in by Phase 2 steps 6b–6e.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "filename-index scaffolding, wired in step by step")]
 pub(super) fn build_filename_index_schema() -> Schema {
     let mut builder = SchemaBuilder::new();
     builder.add_text_field("path", TEXT | STORED);

@@ -52,17 +52,17 @@ const CORRUPT_SEARCH_INDEX_PREFIX: &str = "index-corrupt-";
 // in the same `file-search-index/` state directory under distinct names so the
 // two indexes have fully independent lifecycles. The `#[allow(dead_code)]`
 // markers on the filename-index scaffolding come off as later 6x steps wire it in.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "filename-index scaffolding, wired in step by step")]
 const FILENAME_INDEX_ACTIVE_DIR: &str = "filename";
-#[allow(dead_code)]
+#[allow(dead_code, reason = "filename-index scaffolding, wired in step by step")]
 const FILENAME_INDEX_PREVIOUS_DIR: &str = "filename-previous";
-#[allow(dead_code)]
+#[allow(dead_code, reason = "filename-index scaffolding, wired in step by step")]
 const FILENAME_STAGING_INDEX_PREFIX: &str = "filename-build-";
 // Quarantined copy of a corrupt filename index, preserved for diagnostics.
 const FILENAME_CORRUPT_INDEX_PREFIX: &str = "filename-corrupt-";
-#[allow(dead_code)]
+#[allow(dead_code, reason = "filename-index scaffolding, wired in step by step")]
 const FILENAME_SCHEMA_VERSION_FILE: &str = "filename_schema_version.json";
-#[allow(dead_code)]
+#[allow(dead_code, reason = "filename-index scaffolding, wired in step by step")]
 const FILENAME_SCHEMA_VERSION: u32 = 1;
 const SEARCH_CONFIG_FILE: &str = "search-config.json";
 const INDEX_WORKER_OPTIONS_FILE: &str = "index-worker-options.json";
@@ -179,7 +179,7 @@ static ALWAYS_EXCLUDED: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::n
 /// if the user's settings don't list it. For an app embedding the engines.
 pub fn exclude_always(folder: &str) {
     let token = folder.trim().replace('\\', "/").to_lowercase();
-    let mut list = ALWAYS_EXCLUDED.lock().unwrap_or_else(|p| p.into_inner());
+    let mut list = ALWAYS_EXCLUDED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !token.is_empty() && !list.contains(&token) {
         list.push(token);
     }
@@ -190,7 +190,7 @@ pub fn exclude_always(folder: &str) {
 fn required_exclude_folders() -> Vec<String> {
     let own = dash_core::shared::shared_data_dir().to_string_lossy().replace('\\', "/").to_lowercase();
     let mut list = vec![own.trim_end_matches('/').to_string()];
-    list.extend(ALWAYS_EXCLUDED.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned());
+    list.extend(ALWAYS_EXCLUDED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned());
     list
 }
 const DEFAULT_EXCLUDE_EXTENSIONS: &[&str] = &[

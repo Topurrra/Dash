@@ -25,7 +25,7 @@ impl dash_core::Host for DashHost {
 /// The one host of this process.
 pub fn host() -> Arc<dyn dash_core::Host> {
     static HOST: OnceLock<Arc<dyn dash_core::Host>> = OnceLock::new();
-    HOST.get_or_init(|| Arc::new(DashHost { dir: dash_core::shared::shared_data_dir() })).clone()
+    Arc::clone(HOST.get_or_init(|| Arc::new(DashHost { dir: dash_core::shared::shared_data_dir() })))
 }
 
 /// The async runtime the engines' async APIs run on.
@@ -78,7 +78,7 @@ pub fn start_search_engines() {
     use dash_search::search as s;
     dash_core::link::when_owner(|| {
         let host = host();
-        if matches!(s::get_file_search_index_options(host.clone()), Ok(None)) {
+        if matches!(s::get_file_search_index_options(Arc::clone(&host)), Ok(None)) {
             seed_first_index(host);
         }
     });
@@ -105,9 +105,9 @@ fn seed_first_index(host: Arc<dyn dash_core::Host>) {
     // first index of a big drive take hours. Names first: they're what
     // search needs; the contents take longer.
     if let Ok(options) = options {
-        let _ = s::save_file_search_index_options(host.clone(), options.clone());
+        let _ = s::save_file_search_index_options(Arc::clone(&host), options.clone());
         runtime().spawn(async move {
-            let _ = s::start_filename_search_index(host.clone(), options.clone()).await;
+            let _ = s::start_filename_search_index(Arc::clone(&host), options.clone()).await;
             let _ = s::start_content_search_index(host, options).await;
         });
     }
