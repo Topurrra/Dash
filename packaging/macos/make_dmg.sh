@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds Dash.app around target/release/dash and packs it in a .dmg (with a
 # link to /Applications to drag it onto), plus the .dmg's .sha256 for the
-# updater. Not signed: the first start needs right-click > Open.
+# updater. Signed ad hoc only (no Apple Developer ID): the first start needs
+# System Settings > Privacy & Security > Open Anyway.
 # Run from the repository root after `cargo build --release -p dash`.
 set -euo pipefail
 
@@ -39,6 +40,13 @@ cat > "$app/Contents/Info.plist" <<EOF
 </dict>
 </plist>
 EOF
+
+# Sign the finished bundle ad hoc. The linker signs only the binary; a
+# downloaded bundle whose signature doesn't cover its Info.plist and icon is
+# what macOS calls "damaged and can't be opened". The check fails the build
+# if the bundle doesn't verify.
+codesign --force --sign - "$app"
+codesign --verify --strict --verbose=2 "$app"
 
 ln -s /Applications "$out/stage/Applications"
 # hdiutil's own size guess is sometimes too small ("No space left on
