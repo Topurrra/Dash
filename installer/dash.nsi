@@ -12,7 +12,7 @@ Unicode true
 !include "MUI2.nsh"
 
 !ifndef VERSION
-  !define VERSION "0.2.1"
+  !define VERSION "1.0.0"
 !endif
 !ifndef OUTFILE
   !define OUTFILE "Dash_${VERSION}_x64-setup.exe"
