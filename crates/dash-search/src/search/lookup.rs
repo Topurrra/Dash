@@ -594,6 +594,9 @@ pub(super) fn search_filename_index(
 /// every rebuild, and the `OnCommitWithDelay` reader picks up the tailer's /
 /// watcher's live commits on its own.
 pub(super) fn ensure_filename_engine_loaded(app: &std::sync::Arc<dyn dash_core::Host>) {
+    if FILENAME_BUILD_RUNNING.load(Ordering::Relaxed) {
+        return;
+    }
     {
         let Ok(guard) = FILENAME_ENGINE.lock() else {
             return;

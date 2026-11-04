@@ -168,7 +168,20 @@ fn tesseract_runs(program: &str) -> bool {
 ///      that don't see the latest installer's PATH update.
 ///
 /// `None` means OCR is unavailable. UI shows the install card.
+///
+/// Found once per process: the lookup runs `tesseract --version`, which
+/// used to happen before every OCR call. A miss isn't remembered, so a
+/// Tesseract installed while Dash runs is still found.
 fn resolve_tesseract() -> Option<String> {
+    static FOUND: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(found) = FOUND.get() {
+        return Some(found.clone());
+    }
+    let found = find_tesseract()?;
+    Some(FOUND.get_or_init(|| found).clone())
+}
+
+fn find_tesseract() -> Option<String> {
     // Wave 8.4: bundled tesseract.exe alongside the app's executable.
     // tauri.conf.json's "tesseract-runtime/**/*.exe": "." rule places it
     // there for installer builds; in dev mode the same files land next to

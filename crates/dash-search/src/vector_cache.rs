@@ -123,6 +123,17 @@ fn unpack(bytes: &[u8]) -> Option<Vec<Vec<i8>>> {
     Some(chunks)
 }
 
+/// Whether an open error means the file itself is unusable (corrupt, or a
+/// format too old to read), so setting it aside is right. Anything else —
+/// the store open in another process, a passing I/O error — is not: the
+/// file is fine, and throwing it away lost every entry.
+pub(crate) fn is_corrupt(error: &redb::DatabaseError) -> bool {
+    matches!(
+        error,
+        redb::DatabaseError::UpgradeRequired(_) | redb::DatabaseError::Storage(redb::StorageError::Corrupted(_))
+    )
+}
+
 fn open_db(path: &Path) -> Result<Database, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Cannot create vector cache directory: {e}"))?;
@@ -130,12 +141,13 @@ fn open_db(path: &Path) -> Result<Database, String> {
     let db = if path.exists() {
         match Database::open(path) {
             Ok(db) => db,
-            Err(error) => {
+            Err(error) if is_corrupt(&error) => {
                 eprintln!("vector_cache: cannot open existing store ({error}); quarantining and starting fresh.");
                 let quarantined = path.with_extension("corrupt.redb");
                 let _ = fs::rename(path, quarantined);
                 Database::create(path).map_err(|e| format!("Cannot create vector cache: {e}"))?
             }
+            Err(error) => return Err(format!("Vector cache is unavailable: {error}")),
         }
     } else {
         Database::create(path).map_err(|e| format!("Cannot create vector cache: {e}"))?

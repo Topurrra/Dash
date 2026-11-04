@@ -79,7 +79,9 @@ const FILENAME_WORKER_CANCEL_FILE: &str = "filename-index-cancel";
 const INDEX_WORKER_ARG: &str = "--dash-index-worker";
 const MAX_INDEXED_FILES: usize = 5_000_000;
 const WRITER_MEMORY_BUDGET_BYTES_IDLE: usize = 32 * 1024 * 1024;
+/// The least a full build's writer gets (see `index_writer_sizing`).
 const WRITER_MEMORY_BUDGET_BYTES_INDEXING: usize = 96 * 1024 * 1024;
+const WRITER_MEMORY_PER_THREAD_BYTES: usize = 64 * 1024 * 1024;
 // Global ceiling on per-file content indexing. Each format has its own
 // tier limit in `text_extract::tier_bytes_for_path`; the effective limit
 // per file is min(tier, this). Default of 1024 KB lets every tier hit
@@ -89,7 +91,7 @@ const MIN_COMMIT_EVERY: usize = 300;
 const DEFAULT_COMMIT_EVERY: usize = 25_000;
 const ENTRY_TYPE_FILE: &str = "file";
 const ENTRY_TYPE_FOLDER: &str = "folder";
-const INDEX_WRITER_THREADS_MAX: usize = 2;
+const INDEX_WRITER_THREADS_MAX: usize = 6;
 // Default fallback if available_parallelism() can't be queried. Real value
 // comes from `index_walker_threads()` which scales with CPU cores.
 const INDEX_WALKER_THREADS_FALLBACK: usize = 4;
@@ -227,6 +229,11 @@ static SEARCH_ENGINE: LazyLock<Mutex<Option<SearchEngine>>> = LazyLock::new(|| M
 /// are built independently, so file/name search must work even when no content
 /// index exists — keeping this handle out of `SearchEngine` is what allows that.
 static FILENAME_ENGINE: LazyLock<Mutex<Option<FilenameIndexHandle>>> = LazyLock::new(|| Mutex::new(None));
+/// A filename build is running: `FILENAME_ENGINE` stays closed until it
+/// finishes. A search used to reopen it lazily, and the open memory map then
+/// blocked the build's final folder rename on Windows, throwing the finished
+/// build away. Name search keeps working from the in-memory name table.
+static FILENAME_BUILD_RUNNING: AtomicBool = AtomicBool::new(false);
 static SEARCH_STATUS: LazyLock<Mutex<FileSearchStatus>> = LazyLock::new(|| Mutex::new(FileSearchStatus::default()));
 static LAUNCH_TARGET_CACHE: LazyLock<Mutex<Option<LaunchTargetCache>>> = LazyLock::new(|| Mutex::new(None));
 /// Process-global folder watcher that invalidates `LAUNCH_TARGET_CACHE` when an

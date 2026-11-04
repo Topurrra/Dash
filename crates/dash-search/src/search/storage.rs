@@ -188,18 +188,48 @@ pub(super) fn request_stale_worker_stop(status_path: &Path, cancel_path: &Path) 
 /// behind by an indexer run that crashed before it could swap or clean up.
 /// Best-effort: a failed `read_dir` or `remove_dir_all` is ignored, since a
 /// leftover staging dir is harmless and gets overwritten on the next build.
+/// A content build with saved progress (`RESUME_MARKER_FILE`) is kept for
+/// the next build to continue (`take_resumable_staging`).
 pub(super) fn remove_staging_index_dirs(state_dir: &Path, prefix: &str) {
-    let Ok(entries) = fs::read_dir(state_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_staging = path.is_dir()
-            && path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(prefix));
-        if is_staging {
+    for path in staging_index_dirs(state_dir, prefix) {
+        if !path.join(RESUME_MARKER_FILE).exists() {
             let _ = fs::remove_dir_all(&path);
         }
     }
+}
+
+fn staging_index_dirs(state_dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(state_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(prefix))
+        })
+        .collect()
+}
+
+/// Inside a content build's staging dir once it has saved progress: the
+/// `resume_key` of the build, so an interrupted build (quit, crash, the
+/// engines moving to another app) is continued instead of started over.
+pub(super) const RESUME_MARKER_FILE: &str = "resume.json";
+
+/// The interrupted content build to continue for `key`, if one was left; any
+/// other leftover builds (made with other settings) are deleted.
+pub(super) fn take_resumable_staging(state_dir: &Path, key: &str) -> Option<PathBuf> {
+    let mut resumable = None;
+    for path in staging_index_dirs(state_dir, STAGING_SEARCH_INDEX_PREFIX) {
+        let matches = fs::read_to_string(path.join(RESUME_MARKER_FILE)).is_ok_and(|saved| saved == key);
+        if matches && resumable.is_none() {
+            resumable = Some(path);
+        } else {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+    resumable
 }
 
 pub(super) fn recover_search_index_dirs(app: &std::sync::Arc<dyn dash_core::Host>) -> Result<(), String> {
@@ -286,11 +316,11 @@ pub(super) fn swap_staging_index_dir(staging_dir: &Path, active_dir: &Path, prev
     }
 
     if active_dir.exists() {
-        fs::rename(active_dir, previous_dir)
+        rename_with_retry(active_dir, previous_dir)
             .map_err(|error| format!("Cannot prepare previous search index backup: {error}"))?;
     }
 
-    match fs::rename(staging_dir, active_dir) {
+    match rename_with_retry(staging_dir, active_dir) {
         Ok(()) => {
             if previous_dir.exists() {
                 let _ = fs::remove_dir_all(previous_dir);
@@ -302,6 +332,23 @@ pub(super) fn swap_staging_index_dir(staging_dir: &Path, active_dir: &Path, prev
                 let _ = fs::rename(previous_dir, active_dir);
             }
             Err(format!("Cannot activate new search index: {error}"))
+        }
+    }
+}
+
+/// A folder rename that waits out short holds. On Windows a folder can't be
+/// renamed while any file in it is open — briefly, often, by an antivirus
+/// scan or Windows Search — and a failed rename discarded a finished build.
+/// Tries for about 5 s.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match fs::rename(from, to) {
+            Err(_) if attempt < 20 && from.exists() => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            result => return result,
         }
     }
 }
@@ -555,7 +602,9 @@ pub(super) fn hydrate_status_from_watcher_worker_files(app: &std::sync::Arc<dyn 
     let Ok(Some(status_file)) = read_index_worker_status(&status_path) else {
         return;
     };
-    if !status_file.running || status_file.finished {
+    // A watcher that was killed or crashed never writes "finished": without
+    // a live watcher process, "running" is stale.
+    if !status_file.running || status_file.finished || !worker_process_running(&SEARCH_WATCHER_WORKER) {
         return;
     }
 

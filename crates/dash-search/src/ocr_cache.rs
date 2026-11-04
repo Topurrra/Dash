@@ -54,11 +54,22 @@ pub const DEFAULT_TTL_DAYS: u64 = 90;
 /// bring total back under the cap.
 pub const DEFAULT_MAX_BYTES: u64 = 200 * 1024 * 1024;
 
-/// Serialize cache file access at the process level. Mirrors the
-/// `LOCAL_DB_LOCK` pattern in `local_db.rs` — redb has its own internal
-/// locks, but serializing `Database::open` at the Rust level avoids
-/// races when the dispatcher and the GC pass both want it.
-static OCR_CACHE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+/// The cache database, opened once per process and kept open, behind one
+/// lock that serializes every access (the dispatcher and the GC pass both
+/// use it). Opening runs a write transaction — a disk sync — which used to
+/// happen on every lookup and store. Only the content-index worker uses
+/// the cache, so holding it open blocks no other process.
+static OCR_CACHE: LazyLock<Mutex<Option<(PathBuf, Database)>>> = LazyLock::new(|| Mutex::new(None));
+
+/// The open database for `path` in `open`, opening it on first use (or
+/// when a different path is asked for).
+fn cached_db<'a>(open: &'a mut Option<(PathBuf, Database)>, path: &Path) -> Result<&'a Database, String> {
+    if open.as_ref().is_none_or(|(at, _)| at != path) {
+        *open = None;
+        *open = Some((path.to_path_buf(), open_db(path)?));
+    }
+    open.as_ref().map(|(_, db)| db).ok_or_else(|| "OCR cache is not open".to_string())
+}
 
 /// Where the cache DB lives. Sibling of `store.redb` under the
 /// search-index state dir, so the cache disappears cleanly if a user
@@ -190,11 +201,14 @@ fn open_db(path: &Path) -> Result<Database, String> {
     let db = if path.exists() {
         match Database::open(path) {
             Ok(db) => db,
-            Err(error) => {
+            Err(error) if crate::vector_cache::is_corrupt(&error) => {
                 eprintln!("ocr_cache: cannot open existing cache ({error}); quarantining and starting fresh.");
                 quarantine(path);
                 Database::create(path).map_err(|e| format!("Cannot create OCR cache: {e}"))?
             }
+            // Open elsewhere, or a passing I/O error: a miss for now, never
+            // a reason to throw the cache away.
+            Err(error) => return Err(format!("OCR cache is unavailable: {error}")),
         }
     } else {
         Database::create(path).map_err(|e| format!("Cannot create OCR cache: {e}"))?
@@ -220,8 +234,8 @@ fn quarantine(path: &Path) {
 /// any error. Safe to ignore errors here — a miss is the correct
 /// fallback (run OCR as normal).
 pub fn lookup(ctx: &OcrCacheCtx, hash: &ContentHash) -> Option<String> {
-    let _guard = OCR_CACHE_LOCK.lock().ok()?;
-    let db = open_db(&ctx.db_path).ok()?;
+    let mut open = OCR_CACHE.lock().ok()?;
+    let db = cached_db(&mut open, &ctx.db_path).ok()?;
     let key = pack_key(hash, &ctx.lang);
 
     // Read the value in its own scope so the read txn drops before we
@@ -257,10 +271,10 @@ pub fn lookup(ctx: &OcrCacheCtx, hash: &ContentHash) -> Option<String> {
 /// failure must not break the rebuild (the path is still indexed
 /// normally; only the dedup win is lost).
 pub fn store(ctx: &OcrCacheCtx, hash: &ContentHash, text: &str) {
-    let Ok(_guard) = OCR_CACHE_LOCK.lock() else {
+    let Ok(mut open) = OCR_CACHE.lock() else {
         return;
     };
-    let db = match open_db(&ctx.db_path) {
+    let db = match cached_db(&mut open, &ctx.db_path) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("ocr_cache: cannot open for store ({e})");
@@ -312,11 +326,11 @@ pub struct GcStats {
 /// When the cache lock is poisoned or the cache database can't be opened,
 /// read or written.
 pub fn gc(db_path: &Path, ttl_days: u64, max_bytes: u64) -> Result<GcStats, String> {
-    let _guard = OCR_CACHE_LOCK.lock().map_err(|_| "OCR cache lock was poisoned".to_string())?;
+    let mut open = OCR_CACHE.lock().map_err(|_| "OCR cache lock was poisoned".to_string())?;
     if !db_path.exists() {
         return Ok(GcStats::default());
     }
-    let db = open_db(db_path)?;
+    let db = cached_db(&mut open, db_path)?;
     let now = now_secs();
     let ttl_cutoff = now.saturating_sub(ttl_days.saturating_mul(86_400));
 
@@ -337,7 +351,15 @@ pub fn gc(db_path: &Path, ttl_days: u64, max_bytes: u64) -> Result<GcStats, Stri
             let val_bytes = entry.1.value();
             let val_len = u64::try_from(val_bytes.len()).unwrap_or(u64::MAX);
             bytes_before += val_len;
-            match unpack_value(val_bytes) {
+            // Values are stored encrypted. Reading them raw made every entry
+            // look malformed, so each rebuild's GC emptied the whole cache.
+            let Some(plain) = decrypt_value(val_bytes) else {
+                // Can't decrypt right now (e.g. the keychain is locked):
+                // keep it, first in line for the size trim.
+                survivors.push((key, 0, val_len));
+                continue;
+            };
+            match unpack_value(&plain) {
                 Some((_text, last_used, _created)) if last_used >= ttl_cutoff => {
                     survivors.push((key, last_used, val_len));
                 }
@@ -391,4 +413,22 @@ pub fn gc(db_path: &Path, ttl_days: u64, max_bytes: u64) -> Result<GcStats, Stri
 
     let entries_after = entries_before.saturating_sub(ttl_dropped).saturating_sub(lru_drops.len());
     Ok(GcStats { entries_before, entries_after, bytes_before, bytes_after, ttl_dropped, lru_dropped: lru_drops.len() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gc_keeps_fresh_entries() {
+        let dir = std::env::temp_dir().join(format!("dash-ocr-gc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = OcrCacheCtx::new(&dir, "eng");
+        store(&ctx, &[7; 32], "scanned receipt");
+        let stats = gc(&ctx.db_path, 90, 0).unwrap();
+        assert_eq!((stats.entries_before, stats.entries_after), (1, 1), "{stats:?}");
+        assert_eq!(lookup(&ctx, &[7; 32]).as_deref(), Some("scanned receipt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

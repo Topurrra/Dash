@@ -2,9 +2,19 @@
 
 use super::*;
 
-pub(super) fn index_writer_threads() -> usize {
-    let available = thread::available_parallelism().map_or(2, std::num::NonZero::get);
-    available.clamp(1, INDEX_WRITER_THREADS_MAX)
+/// Threads and memory for a full build's index writer. Tokenising and
+/// writing segments happen on these threads, so with a fixed 2 threads and
+/// 96 MB they were the build's ceiling on any machine. Now about half the
+/// cores (at most `INDEX_WRITER_THREADS_MAX`), with 64 MB each while that
+/// stays under an eighth of free RAM; low-memory machines keep 96 MB.
+pub(super) fn index_writer_sizing() -> (usize, usize) {
+    let cores = thread::available_parallelism().map_or(2, std::num::NonZero::get);
+    let threads = (cores / 2).clamp(1, INDEX_WRITER_THREADS_MAX);
+    let ram_share = usize::try_from(available_ram_bytes() / 8).unwrap_or(usize::MAX);
+    let budget = (threads * WRITER_MEMORY_PER_THREAD_BYTES).min(ram_share).max(WRITER_MEMORY_BUDGET_BYTES_INDEXING);
+    // Tantivy wants at least ~15 MB per thread: fewer threads on a small budget.
+    let threads = threads.min(budget / (16 * 1024 * 1024)).max(1);
+    (threads, budget)
 }
 
 /// How many worker threads to use for the parallel bulk indexer. Each thread
@@ -64,15 +74,20 @@ pub(super) fn index_walker_threads_with_ocr(performance_mode: &str, on_battery: 
     }
 }
 
+/// Applies one watcher event. Returns (updated, deleted, `missing_text`):
+/// `missing_text` is set when an extractable file was indexed without text
+/// (the watcher can't OCR, and its sandbox gives up sooner than a build), so
+/// the next full build must not trust that empty text.
 pub(super) fn apply_watch_event_to_writer(
     event: &Event,
     writer: &mut IndexWriter,
     fields: &SearchFields,
     options: &FileSearchIndexOptions,
     max_content_bytes: usize,
-) -> (u64, u64) {
+) -> (u64, u64, bool) {
     let mut updated = 0_u64;
     let mut deleted = 0_u64;
+    let mut missing_text = false;
 
     match &event.kind {
         EventKind::Remove(_) => {
@@ -81,8 +96,7 @@ pub(super) fn apply_watch_event_to_writer(
                 if !path.is_file() && !is_confirmed_gone(path) {
                     continue;
                 }
-                let path_text = path.to_string_lossy().to_string();
-                writer.delete_term(Term::from_field_text(fields.path_exact, &path_text));
+                delete_path_and_children(writer, fields.path_exact, path);
                 deleted += 1;
             }
         }
@@ -91,8 +105,8 @@ pub(super) fn apply_watch_event_to_writer(
                 match path.try_exists() {
                     Ok(true) => {}
                     Ok(false) => {
-                        let path_text = path.to_string_lossy().to_string();
-                        writer.delete_term(Term::from_field_text(fields.path_exact, &path_text));
+                        // Gone, or renamed away: a folder takes its files with it.
+                        delete_path_and_children(writer, fields.path_exact, path);
                         deleted += 1;
                         continue;
                     }
@@ -103,41 +117,72 @@ pub(super) fn apply_watch_event_to_writer(
                     continue;
                 }
                 if !should_include_path(path, options) {
-                    let path_text = path.to_string_lossy().to_string();
-                    writer.delete_term(Term::from_field_text(fields.path_exact, &path_text));
+                    delete_path_and_children(writer, fields.path_exact, path);
                     deleted += 1;
                     continue;
                 }
+                // A folder that appeared (created, moved or renamed in)
+                // arrives as one event: index the files inside it.
+                let files: Vec<PathBuf> = if path.is_dir() {
+                    index_walker(&path.to_string_lossy(), options, true)
+                        .build()
+                        .flatten()
+                        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+                        .map(ignore::DirEntry::into_path)
+                        .filter(|file| should_include_path(file, options))
+                        .collect()
+                } else {
+                    vec![path.clone()]
+                };
                 // Content index = readable document files only (matching the
                 // build walk). Folders and media/binary files are not indexed
                 // here — they stay searchable by name in the filename index.
                 // Wave 8.1 (2026-05-28): same OCR-aware gate as the build
                 // walk — images only when OCR is enabled + path in scope.
-                if !path.is_file() || !should_index_for_content(path, options) {
-                    continue;
-                }
-                if upsert_path_document(path, writer, fields, max_content_bytes).is_ok() {
-                    updated += 1;
+                for file in files.iter().filter(|file| should_index_for_content(file, options)) {
+                    if let Ok(has_text) = upsert_path_document(file, writer, fields, max_content_bytes) {
+                        updated += 1;
+                        missing_text |= !has_text;
+                    }
                 }
             }
         }
         EventKind::Access(_) => {}
     }
 
-    (updated, deleted)
+    (updated, deleted, missing_text)
 }
 
+/// Removes `path`'s document and every document under it (`path` was a
+/// folder). `path_exact` terms sort bytewise, and every path under
+/// `C:\a` starts with `C:\a\`: the terms from there up to (not including)
+/// `C:\a]` — `]` follows `\` — are exactly its descendants.
+pub(super) fn delete_path_and_children(writer: &IndexWriter, path_exact: tantivy::schema::Field, path: &Path) {
+    let path_text = path.to_string_lossy().trim_end_matches(['\\', '/']).to_string();
+    writer.delete_term(Term::from_field_text(path_exact, &path_text));
+    let separator = if path_text.contains('\\') { '\\' } else { '/' };
+    let next = char::from(u8::try_from(u32::from(separator) + 1).unwrap_or(b']'));
+    let children = tantivy::query::RangeQuery::new(
+        std::ops::Bound::Included(Term::from_field_text(path_exact, &format!("{path_text}{separator}"))),
+        std::ops::Bound::Excluded(Term::from_field_text(path_exact, &format!("{path_text}{next}"))),
+    );
+    let _ = writer.delete_query(Box::new(children));
+}
+
+/// Indexes `path` again; `Ok(true)` when text was found in it. Documents are
+/// parsed in the sandboxed extractor child (memory cap, timeout), never in
+/// this process: one hostile or huge file used to hang or crash the watcher.
 pub(super) fn upsert_path_document(
     path: &Path,
     writer: &mut IndexWriter,
     fields: &SearchFields,
     max_content_bytes: usize,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let metadata = fs::metadata(path).map_err(|error| format!("Cannot stat file: {error}"))?;
     let is_file = metadata.is_file();
     let is_dir = metadata.is_dir();
     if !is_file && !is_dir {
-        return Ok(());
+        return Ok(false);
     }
 
     let file_path = path.to_string_lossy().to_string();
@@ -164,7 +209,8 @@ pub(super) fn upsert_path_document(
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map_or(modified_ms, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
     let content =
-        if is_file { read_text_for_index(path, max_content_bytes).unwrap_or_default() } else { String::new() };
+        if is_file { extract_text_sandboxed(path, max_content_bytes).unwrap_or_default() } else { String::new() };
+    let has_text = !content.is_empty();
     let entry_type = if is_dir { ENTRY_TYPE_FOLDER } else { ENTRY_TYPE_FILE };
 
     writer.delete_term(Term::from_field_text(fields.path_exact, &file_path));
@@ -185,7 +231,7 @@ pub(super) fn upsert_path_document(
     }
     writer.add_document(document).map_err(|error| format!("Cannot index path update: {error}"))?;
 
-    Ok(())
+    Ok(has_text)
 }
 
 /// Incrementally update BOTH local indexes — CONTENT ("Inside" search) and

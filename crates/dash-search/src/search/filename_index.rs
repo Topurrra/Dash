@@ -102,7 +102,8 @@ pub(super) fn apply_filename_watch_event(
                 if !is_confirmed_gone(path) {
                     continue;
                 }
-                delete_filename_doc(writer, fields, &path.to_string_lossy());
+                // A folder takes everything under it along.
+                delete_path_and_children(writer, fields.path_exact, path);
                 deleted += 1;
             }
         }
@@ -111,7 +112,8 @@ pub(super) fn apply_filename_watch_event(
                 match path.try_exists() {
                     Ok(true) => {}
                     Ok(false) => {
-                        delete_filename_doc(writer, fields, &path.to_string_lossy());
+                        // Gone, or renamed away: with whatever was under it.
+                        delete_path_and_children(writer, fields.path_exact, path);
                         deleted += 1;
                         continue;
                     }
@@ -121,12 +123,23 @@ pub(super) fn apply_filename_watch_event(
                     continue;
                 }
                 if !should_include_path(path, options) {
-                    delete_filename_doc(writer, fields, &path.to_string_lossy());
+                    delete_path_and_children(writer, fields.path_exact, path);
                     deleted += 1;
                     continue;
                 }
                 if upsert_filename_document(path, writer, fields).is_ok() {
                     updated += 1;
+                }
+                // A folder that appeared (created, moved or renamed in)
+                // arrives as one event: its contents are new names too.
+                if path.is_dir() {
+                    for entry in index_walker(&path.to_string_lossy(), options, false).build().flatten().skip(1) {
+                        if should_include_path(entry.path(), options)
+                            && upsert_filename_document(entry.path(), writer, fields).is_ok()
+                        {
+                            updated += 1;
+                        }
+                    }
                 }
             }
         }
@@ -189,11 +202,20 @@ pub(super) fn apply_filename_watch_batch(
 /// find every name. Hidden entries follow the setting. Never follows links
 /// (see `FileSearchStatus`). `standard_filters` must come first: it also turns
 /// hidden-skipping on, which used to override the setting.
+///
+/// Excluded and system folders are never entered: rejecting only their
+/// files still walked every one of them (`node_modules`, `AppData`, ...).
 pub(super) fn index_walker(root: &str, options: &FileSearchIndexOptions, honour_ignore_files: bool) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder.standard_filters(honour_ignore_files);
     builder.hidden(!options.include_hidden);
     builder.follow_links(false);
+    let exclude_folders = options.exclude_folders.clone();
+    builder.filter_entry(move |entry| {
+        entry.depth() == 0
+            || !entry.file_type().is_some_and(|kind| kind.is_dir())
+            || !(is_system_protected_path(entry.path()) || has_excluded_folder(entry.path(), &exclude_folders))
+    });
     builder
 }
 
@@ -358,6 +380,9 @@ pub(super) fn watch_filename_index(
     // implies the process was suspended (sleep/hibernate dropped events).
     const RECONCILE_INTERVAL_MS: u128 = 6 * 60 * 60 * 1_000;
     const SLEEP_GAP_THRESHOLD_MS: u128 = 2 * 60 * 1_000;
+    // After a failed batch or lost events, a reconciliation this soon heals
+    // what was missed (not at once: a persistent error shouldn't spin).
+    const RECONCILE_SOON_MS: u128 = 60 * 1_000;
     if cancel_path.exists() || !options.watcher_enabled {
         return Ok(());
     }
@@ -387,9 +412,12 @@ pub(super) fn watch_filename_index(
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
         // Drop noise events at the source — reads and metadata-only changes
         // never alter a name or path, so they never change the filename index.
+        // Kept: "rescan" notices (Windows' event buffer overflowed, so changes
+        // were lost) arrive as `Other` events.
         if let Ok(ref event) = result {
             use notify::event::ModifyKind;
             match &event.kind {
+                _ if event.need_rescan() => {}
                 EventKind::Access(_)
                 | EventKind::Modify(ModifyKind::Metadata(_) | ModifyKind::Other)
                 | EventKind::Any
@@ -414,6 +442,7 @@ pub(super) fn watch_filename_index(
     let strategy = WatcherStrategy { name: "filename watcher", debounce_ms: 2_000, max_batch: 1_024 };
     let mut last_apply_ms: u128 = 0;
     let mut last_reconcile_ms: u128 = unix_now_ms();
+    let reconcile_soon = |now_ms: u128| now_ms.saturating_sub(RECONCILE_INTERVAL_MS - RECONCILE_SOON_MS);
     let mut last_loop_iter_ms: u128 = unix_now_ms();
     let mut updated_total = 0_u64;
     let mut deleted_total = 0_u64;
@@ -432,9 +461,12 @@ pub(super) fn watch_filename_index(
         let resumed_from_suspend = loop_gap_ms > SLEEP_GAP_THRESHOLD_MS;
         if resumed_from_suspend || now_ms.saturating_sub(last_reconcile_ms) >= RECONCILE_INTERVAL_MS {
             last_reconcile_ms = now_ms;
-            if let Ok((reconciled_updates, reconciled_deletes)) = reconcile_filename_index(&active_dir, options) {
-                updated_total += reconciled_updates;
-                deleted_total += reconciled_deletes;
+            match reconcile_filename_index(&active_dir, options) {
+                Ok((reconciled_updates, reconciled_deletes)) => {
+                    updated_total += reconciled_updates;
+                    deleted_total += reconciled_deletes;
+                }
+                Err(_) => last_reconcile_ms = reconcile_soon(now_ms),
             }
             // Re-stamp the sentinel so the scheduler keeps treating this
             // watcher-owned index as current (mirrors the USN tailer).
@@ -473,13 +505,20 @@ pub(super) fn watch_filename_index(
         }
         collect_watcher_events(&rx, &mut pending, strategy, cancel_path);
 
-        // A failed apply is not a build failure — the index is already built
-        // and valid. Stop watching cleanly and let the scheduled rebuild
-        // resume as the backstop rather than marking the whole build failed.
-        let Ok((updated_batch, deleted_batch)) = apply_filename_watch_batch(&active_dir, options, pending) else {
-            return Ok(());
-        };
+        // A watcher error or a rescan notice means events were lost.
+        if pending.iter().any(|event| event.as_ref().map_or(true, Event::need_rescan)) {
+            last_reconcile_ms = last_reconcile_ms.min(reconcile_soon(unix_now_ms()));
+        }
+
+        // A failed apply (the index busy, a file locked, ...) used to stop
+        // watching until the next rebuild, hours away. Now a reconciliation
+        // soon picks up what the batch would have changed.
+        let applied = apply_filename_watch_batch(&active_dir, options, pending);
         last_apply_ms = unix_now_ms();
+        let Ok((updated_batch, deleted_batch)) = applied else {
+            last_reconcile_ms = last_reconcile_ms.min(reconcile_soon(last_apply_ms));
+            continue;
+        };
         if updated_batch == 0 && deleted_batch == 0 {
             continue;
         }

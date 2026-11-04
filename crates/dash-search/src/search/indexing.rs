@@ -36,11 +36,17 @@ pub(super) fn run_index_worker_index_mode_inner(
         &IndexWorkerStatusFile::progress(0, 0, 0, "Preparing search index".to_string()),
     )?;
 
-    let staging_dir = staging_search_index_dir_for_state(state_dir, unix_now_ms());
-    if staging_dir.exists() {
-        fs::remove_dir_all(&staging_dir).map_err(|error| format!("Cannot reset staging search index: {error}"))?;
-    }
-    fs::create_dir_all(&staging_dir).map_err(|error| format!("Cannot create staging search index: {error}"))?;
+    // An interrupted build with the same settings is continued.
+    let staging_dir = if let Some(resumable) = take_resumable_staging(state_dir, &resume_key(&options)) {
+        resumable
+    } else {
+        let staging_dir = staging_search_index_dir_for_state(state_dir, unix_now_ms());
+        if staging_dir.exists() {
+            fs::remove_dir_all(&staging_dir).map_err(|error| format!("Cannot reset staging search index: {error}"))?;
+        }
+        fs::create_dir_all(&staging_dir).map_err(|error| format!("Cannot create staging search index: {error}"))?;
+        staging_dir
+    };
 
     let result = build_index_in_worker(state_dir, &staging_dir, &options, status_path, cancel_path);
     if result.is_err() {
@@ -117,7 +123,43 @@ pub(super) struct ExistingIndexCache {
     /// Lowercase path → existing doc info. Case-insensitive because Windows
     /// paths are case-insensitive and the file walker may emit different casing.
     pub(super) map: HashMap<String, ExistingDocLookup>,
+    /// Reuse documents that have no text too. Set when the previous build
+    /// extracted the same way (`extraction_signature`): an unchanged file
+    /// that had no text then (a scanned PDF without OCR, an encrypted file,
+    /// one that crashed or timed out an extractor) has none now, and
+    /// extracting it again on every rebuild only costs time.
+    pub(super) keep_empty: bool,
 }
+
+/// What decides a file's extracted text besides the file itself: Dash's
+/// version (its extractors) and the extraction settings. Saved after each
+/// successful content build (`EXTRACTION_SIGNATURE_FILE`).
+pub(super) fn extraction_signature(options: &FileSearchIndexOptions) -> String {
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "maxContentKb": options.max_content_kb,
+        "ocr": options.ocr_on_index_enabled,
+        "ocrFolders": options.ocr_on_index_folders,
+        "ocrMaxPages": options.ocr_max_pages_per_file,
+        "ocrLangs": options.ocr_langs,
+        "ocrMinImageDim": options.ocr_min_image_dim,
+        "ocrMaxAspectRatio": options.ocr_max_aspect_ratio,
+        "ocrTimeoutSecs": options.ocr_per_file_timeout_secs,
+    })
+    .to_string()
+}
+
+/// The signature the last successful content build used.
+pub(super) const EXTRACTION_SIGNATURE_FILE: &str = "content-extraction.json";
+
+/// What an interrupted content build must match to be continued: the same
+/// extraction and the same options (roots, exclusions, ...).
+pub(super) fn resume_key(options: &FileSearchIndexOptions) -> String {
+    format!("{}{}", extraction_signature(options), serde_json::to_string(options).unwrap_or_default())
+}
+
+/// How often a content build saves its progress (commits its staging index).
+const CHECKPOINT_INTERVAL: Duration = Duration::from_mins(3);
 
 /// Open the previous active index (if any) and build a path → doc lookup map
 /// so the rebuild can reuse cached content for unchanged files.
@@ -126,6 +168,7 @@ pub(super) struct ExistingIndexCache {
 /// schema doesn't match — in any of those cases the caller falls back to
 /// full content extraction for every file.
 pub(super) fn load_existing_index_for_reuse(active_dir: &Path) -> Option<ExistingIndexCache> {
+    use tantivy::DocSet as _;
     if !active_dir.exists() {
         return None;
     }
@@ -136,32 +179,43 @@ pub(super) fn load_existing_index_for_reuse(active_dir: &Path) -> Option<Existin
     let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into().ok()?;
     let searcher: tantivy::Searcher = reader.searcher();
 
-    // Walk every alive document by iterating segment readers directly. This
-    // avoids the scoring overhead a Query+Collector path would add — for a
-    // 270k-doc index, building this map should take a few seconds at most.
+    // Paths come from `path_exact`'s term dictionary (one raw term per
+    // document) and size / mtime from their fast-field columns, so nothing
+    // is read from the document store: it holds each file's extracted text
+    // (up to 1 MB), which used to be decompressed for every document just to
+    // learn its path. Text is read later, only for files that are reused.
     let mut map: HashMap<String, ExistingDocLookup> = HashMap::with_capacity(8192);
     for (segment_ord, segment_reader) in (0u32..).zip(searcher.segment_readers()) {
-        let Ok(store_reader) = segment_reader.get_store_reader(0) else { continue };
-        let max_doc = segment_reader.max_doc();
-        let alive_bitset = segment_reader.alive_bitset();
-        for doc_id in 0..max_doc {
-            if let Some(bitset) = alive_bitset {
-                if !bitset.is_alive(doc_id) {
-                    continue;
+        let Ok(paths) = segment_reader.inverted_index(fields.path_exact) else { continue };
+        let fast = segment_reader.fast_fields();
+        let (Ok(modified), Ok(sizes)) = (fast.u64("modified_ms"), fast.u64("size")) else { continue };
+        let alive = segment_reader.alive_bitset();
+        let Ok(mut terms) = paths.terms().stream() else { continue };
+        while terms.advance() {
+            let Ok(path) = std::str::from_utf8(terms.key()) else { continue };
+            let Ok(mut docs) =
+                paths.read_postings_from_terminfo(terms.value(), tantivy::schema::IndexRecordOption::Basic)
+            else {
+                continue;
+            };
+            let mut doc_id = docs.doc();
+            while doc_id != tantivy::TERMINATED {
+                if alive.is_none_or(|bits| bits.is_alive(doc_id)) {
+                    map.insert(
+                        path.to_lowercase(),
+                        ExistingDocLookup {
+                            modified_ms: modified.first(doc_id).unwrap_or(0),
+                            size: sizes.first(doc_id).unwrap_or(0),
+                            address: tantivy::DocAddress::new(segment_ord, doc_id),
+                        },
+                    );
                 }
+                doc_id = docs.advance();
             }
-            let Ok(doc): Result<TantivyDocument, _> = store_reader.get(doc_id) else { continue };
-            let Some(path) = doc_text(&doc, fields.path) else { continue };
-            let modified_ms = doc_u64(&doc, fields.modified_ms).unwrap_or(0);
-            let size = doc_u64(&doc, fields.size).unwrap_or(0);
-            map.insert(
-                path.to_lowercase(),
-                ExistingDocLookup { modified_ms, size, address: tantivy::DocAddress::new(segment_ord, doc_id) },
-            );
         }
     }
 
-    Some(ExistingIndexCache { searcher, fields, map })
+    Some(ExistingIndexCache { searcher, fields, map, keep_empty: false })
 }
 
 /// Returns cached content if the previous index has this exact file unchanged
@@ -179,11 +233,10 @@ pub(super) fn reuse_cached_content(
     }
     let doc: TantivyDocument = cache.searcher.doc(entry.address).ok()?;
     let content = doc_text(&doc, cache.fields.content).unwrap_or_default();
-    // Skip empty cached content — happens for old indexes built before content
-    // was STORED, plus genuine "no extractable text" cases. Forcing a fresh
-    // extract handles both: it's idempotent for empty files, and self-heals
-    // old indexes on first rebuild.
-    if content.is_empty() {
+    // Empty content is extracted again unless the last build extracted the
+    // same way (`keep_empty`): changed settings or a new version may now
+    // find text there (e.g. OCR just turned on).
+    if content.is_empty() && !cache.keep_empty {
         return None;
     }
     Some(content)
@@ -288,7 +341,7 @@ pub(super) fn report_index_progress(
 )]
 pub(super) fn run_content_indexer(
     result_rx: &Mutex<std::sync::mpsc::Receiver<ExtractResult>>,
-    writer: &IndexWriter,
+    writer: &std::sync::RwLock<IndexWriter>,
     fields: SearchFields,
     indexed_files: &std::sync::atomic::AtomicU64,
     scanned: &std::sync::atomic::AtomicU64,
@@ -351,7 +404,11 @@ pub(super) fn run_content_indexer(
             modified_ms,
             created_ms,
         };
-        if let Err(error) = add_content_document(writer, fields, &meta, &content) {
+        let added = writer
+            .read()
+            .map_err(|_| "Search writer lock was poisoned".to_string())
+            .and_then(|writer| add_content_document(&writer, fields, &meta, &content));
+        if let Err(error) = added {
             if let Ok(mut guard) = first_error.lock() {
                 if guard.is_none() {
                     *guard = Some(error);
@@ -512,7 +569,11 @@ pub(super) fn build_index_in_worker(
     // a "reindex with no changes" from ~a minute (re-add + commit + merge + swap
     // of every doc) into the cost of one metadata walk.
     let active_dir = active_search_index_dir_for_state(state_dir);
-    let existing_cache = load_existing_index_for_reuse(&active_dir);
+    let existing_cache = load_existing_index_for_reuse(&active_dir).map(|mut cache| {
+        cache.keep_empty = fs::read_to_string(state_dir.join(EXTRACTION_SIGNATURE_FILE))
+            .is_ok_and(|saved| saved == extraction_signature(options));
+        cache
+    });
     if let Some(cache) = &existing_cache {
         if content_index_unchanged(options, cache, cancel_path) {
             let doc_count = u64::try_from(cache.map.len()).unwrap_or(u64::MAX);
@@ -551,16 +612,24 @@ pub(super) fn build_index_in_worker(
         }
     }
 
+    // What an interrupted build already saved in this staging dir (see
+    // `take_resumable_staging`): those files, unchanged since, are skipped.
+    let resumed =
+        staging_dir.join(RESUME_MARKER_FILE).exists().then(|| load_existing_index_for_reuse(staging_dir)).flatten();
+    let resuming = resumed.is_some();
+
     let schema = build_search_schema();
     let directory = MmapDirectory::open(staging_dir)
         .map_err(|error| format!("Cannot open staging search index directory: {error}"))?;
     let index = Index::open_or_create(directory, schema.clone())
         .map_err(|error| format!("Cannot create staging search index: {error}"))?;
     let fields = extract_fields(&schema)?;
-    // No `mut` — the writer is wrapped in Arc for the parallel walk and we
-    // reclaim sole ownership afterward via Arc::try_unwrap for the final commit.
+    // No `mut` — the writer is shared (Arc + RwLock) by the parallel walk, the
+    // indexer threads and the checkpoint thread; we reclaim sole ownership
+    // afterward via Arc::try_unwrap for the final commit.
+    let (writer_threads, writer_budget) = index_writer_sizing();
     let writer = index
-        .writer_with_num_threads(index_writer_threads(), WRITER_MEMORY_BUDGET_BYTES_INDEXING)
+        .writer_with_num_threads(writer_threads, writer_budget)
         .map_err(|error| format!("Cannot create search writer: {error}"))?;
 
     // The filename index is built separately by the standalone filename
@@ -596,8 +665,11 @@ pub(super) fn build_index_in_worker(
     // Shared state for the parallel walker. Counters use atomics so workers
     // never block each other. Errors and progress timing use small mutexes
     // because they're touched rarely.
-    let writer = Arc::new(writer);
+    // Documents are added under the read lock (any number at once); the
+    // checkpoint thread takes the write lock to commit.
+    let writer = Arc::new(std::sync::RwLock::new(writer));
     let existing_cache = Arc::new(existing_cache);
+    let resumed = Arc::new(resumed);
     let indexed_files_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let scanned_entries_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let skipped_files_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -685,10 +757,13 @@ pub(super) fn build_index_in_worker(
     // per document beside the search index. `None` — the default, or any build
     // without the feature — makes the indexer threads skip all embedding work.
     // Cleared up front so vectors for files deleted since the last build don't
-    // linger as orphans (this is the full-rebuild path).
+    // linger as orphans (this is the full-rebuild path) — but not when
+    // resuming: the interrupted build already stored vectors for its files.
     let vector_db_path = if options.semantic_search_enabled && crate::embedding::is_available() {
         let path = crate::vector_cache::cache_path_for_dir(state_dir);
-        crate::vector_cache::clear(&path);
+        if !resuming {
+            crate::vector_cache::clear(&path);
+        }
         Some(path)
     } else {
         None
@@ -745,6 +820,44 @@ pub(super) fn build_index_in_worker(
         })
         .collect();
 
+    // Checkpoints: every `CHECKPOINT_INTERVAL` the staging index is committed
+    // and marked resumable, so a quit, crash or ownership change loses at
+    // most a few minutes of work instead of the whole build.
+    let checkpoint_done = Arc::new(AtomicBool::new(false));
+    let checkpoint = {
+        let writer = Arc::clone(&writer);
+        let done = Arc::clone(&checkpoint_done);
+        let should_stop = Arc::clone(&should_stop_walker);
+        let first_error = Arc::clone(&first_error);
+        let marker = staging_dir.join(RESUME_MARKER_FILE);
+        let key = resume_key(options);
+        thread::spawn(move || {
+            let mut last = std::time::Instant::now();
+            while !done.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(500));
+                if last.elapsed() < CHECKPOINT_INTERVAL || should_stop.load(Ordering::Relaxed) {
+                    continue;
+                }
+                last = std::time::Instant::now();
+                let committed =
+                    writer.write().map_err(|_| "Search writer lock was poisoned".to_string()).and_then(|mut writer| {
+                        writer.commit().map_err(|error| format!("Cannot save search index progress: {error}"))
+                    });
+                match committed {
+                    Ok(_) => {
+                        let _ = fs::write(&marker, &key);
+                    }
+                    Err(error) => {
+                        if let Ok(mut guard) = first_error.lock() {
+                            guard.get_or_insert(error);
+                        }
+                        should_stop.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        })
+    };
+
     // Tracks whether the extractor pool died abnormally mid-walk (all children
     // OS-killed + respawn budget exhausted). When this fires, the walk stops
     // via `should_stop_walker` but the cancel sentinel was never written, so
@@ -768,6 +881,11 @@ pub(super) fn build_index_in_worker(
         let walker = builder.build_parallel();
         let status_path_owned = status_path.to_path_buf();
         let cancel_path_owned = cancel_path.to_path_buf();
+        // Plain text and code are a bounded, guarded file read: done right in
+        // the walk instead of a round trip through an extractor child. With
+        // semantic search on they keep going through the pool, whose indexer
+        // threads also embed them.
+        let read_text_in_walk = vector_db_path.is_none();
 
         walker.run(|| {
             // Per-worker clones of the shared state. The outer closure is FnMut
@@ -775,6 +893,7 @@ pub(super) fn build_index_in_worker(
             // worker its own handle without contention on the original.
             let writer = Arc::clone(&writer);
             let existing_cache = Arc::clone(&existing_cache);
+            let resumed = Arc::clone(&resumed);
             let indexed_files_atomic = Arc::clone(&indexed_files_atomic);
             let scanned_entries_atomic = Arc::clone(&scanned_entries_atomic);
             let skipped_files_atomic = Arc::clone(&skipped_files_atomic);
@@ -869,16 +988,46 @@ pub(super) fn build_index_in_worker(
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                     .map_or(modified_ms, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
 
+                // Resuming: the interrupted build already indexed this file.
+                // Unchanged since, it is done; changed, its old document goes.
+                if let Some(saved) =
+                    resumed.as_ref().as_ref().and_then(|saved| saved.map.get(&file_path.to_lowercase()))
+                {
+                    if saved.modified_ms == modified_ms && saved.size == size {
+                        let new_indexed = indexed_files_atomic.fetch_add(1, Ordering::Relaxed) + 1;
+                        report_index_progress(
+                            &status_path,
+                            new_indexed,
+                            &scanned_entries_atomic,
+                            &skipped_files_atomic,
+                            &last_progress,
+                            throttle_ms,
+                        );
+                        return ignore::WalkState::Continue;
+                    }
+                    if let Ok(writer) = writer.read() {
+                        writer.delete_term(Term::from_field_text(fields.path_exact, &file_path));
+                    }
+                }
+
                 // Reuse-cache check — if this document's (mtime, size) match
                 // the previous index, its already-extracted content is reused
-                // and it is indexed here. On a miss the path goes to the
-                // out-of-process extractor pool; the walk never extracts text.
+                // and it is indexed here. On a miss, plain text is read here
+                // (`read_text_in_walk`) and everything else goes to the
+                // out-of-process extractor pool.
                 let cached = existing_cache
                     .as_ref()
                     .as_ref()
                     .and_then(|cache| reuse_cached_content(cache, &file_path.to_lowercase(), modified_ms, size));
-                if let Some(content) = cached {
-                    reused_count_atomic.fetch_add(1, Ordering::Relaxed);
+                let reused = cached.is_some();
+                let read_here = (cached.is_none()
+                    && read_text_in_walk
+                    && crate::text_extract::is_plain_text_extension(&extension))
+                .then(|| crate::text_extract::extract_text_for_indexing(path, max_content_bytes).unwrap_or_default());
+                if let Some(content) = cached.or(read_here) {
+                    if reused {
+                        reused_count_atomic.fetch_add(1, Ordering::Relaxed);
+                    }
                     let meta = ContentDocMeta {
                         file_path: &file_path,
                         file_name: &file_name,
@@ -888,7 +1037,11 @@ pub(super) fn build_index_in_worker(
                         modified_ms,
                         created_ms,
                     };
-                    if let Err(error) = add_content_document(&writer, fields, &meta, &content) {
+                    let added = writer
+                        .read()
+                        .map_err(|_| "Search writer lock was poisoned".to_string())
+                        .and_then(|writer| add_content_document(&writer, fields, &meta, &content));
+                    if let Err(error) = added {
                         if let Ok(mut guard) = first_error.lock() {
                             if guard.is_none() {
                                 *guard = Some(error);
@@ -978,6 +1131,12 @@ pub(super) fn build_index_in_worker(
             indexer_panicked = true;
         }
     }
+    // No more checkpoints: what follows commits, discards or swaps the
+    // staging index itself.
+    checkpoint_done.store(true, Ordering::Relaxed);
+    if checkpoint.join().is_err() {
+        indexer_panicked = true;
+    }
     if indexer_panicked {
         let _ = fs::remove_dir_all(staging_dir);
         return Err("Content indexer thread panicked".to_string());
@@ -1054,8 +1213,10 @@ pub(super) fn build_index_in_worker(
     // Reclaim sole ownership of the writer for the final commit, which requires
     // `&mut self`. All worker threads have exited at this point, so the Arc
     // should have exactly one strong reference.
-    let mut writer =
-        Arc::try_unwrap(writer).map_err(|_| "Internal: search writer still held by a worker".to_string())?;
+    let mut writer = Arc::try_unwrap(writer)
+        .map_err(|_| "Internal: search writer still held by a worker".to_string())?
+        .into_inner()
+        .map_err(|_| "Search writer lock was poisoned".to_string())?;
 
     write_index_worker_status(
         status_path,
@@ -1070,11 +1231,24 @@ pub(super) fn build_index_in_worker(
     writer.wait_merging_threads().map_err(|error| format!("Cannot finish search index merges: {error}"))?;
     drop(index);
 
-    // Release the previous-index mmap BEFORE the swap. On Windows, an open
-    // memory map prevents the directory rename inside `swap_in_staging_search_index_for_state`.
+    // Release the previous-index and resumed-progress mmaps BEFORE the swap.
+    // On Windows, an open memory map prevents the directory rename inside
+    // `swap_in_staging_search_index_for_state`. The finished index is no
+    // longer something to resume.
     drop(existing_cache);
+    drop(resumed);
+    let _ = fs::remove_file(staging_dir.join(RESUME_MARKER_FILE));
 
     swap_in_staging_search_index_for_state(state_dir, staging_dir)?;
+
+    // Only a complete build vouches for its documents without text: in an
+    // interrupted one, files are also empty because the pool stopped early.
+    let signature_path = state_dir.join(EXTRACTION_SIGNATURE_FILE);
+    if resumable_interrupt {
+        let _ = fs::remove_file(&signature_path);
+    } else {
+        let _ = fs::write(&signature_path, extraction_signature(options));
+    }
 
     // Wave 8.5 (2026-05-28): run the persistent OCR cache GC pass now
     // that the new index is live. TTL pass drops entries last touched
@@ -1177,8 +1351,9 @@ pub(super) fn build_filename_index_in_worker(
     let index = Index::open_or_create(directory, schema.clone())
         .map_err(|error| format!("Cannot create staging filename index: {error}"))?;
     let fields = extract_filename_index_fields(&schema)?;
+    let (writer_threads, writer_budget) = index_writer_sizing();
     let writer = index
-        .writer_with_num_threads(index_writer_threads(), WRITER_MEMORY_BUDGET_BYTES_INDEXING)
+        .writer_with_num_threads(writer_threads, writer_budget)
         .map_err(|error| format!("Cannot create filename index writer: {error}"))?;
 
     write_index_worker_status(
@@ -1453,6 +1628,14 @@ pub(super) fn run_index_worker_watch_mode_inner(
     // process was suspended (sleep/hibernate) and reconcile immediately.
     const RECONCILE_INTERVAL_MS: u128 = 6 * 60 * 60 * 1_000;
     const SLEEP_GAP_THRESHOLD_MS: u128 = 2 * 60 * 1_000;
+    // After a failed batch or lost events, a reconciliation this soon heals
+    // what was missed (not at once: a persistent error shouldn't spin).
+    const RECONCILE_SOON_MS: u128 = 60 * 1_000;
+    // One watcher per index, whatever started it: a second one leaves now
+    // instead of fighting the first over the index writer.
+    let Some(_only_watcher) = claim_watcher_lock(state_dir) else {
+        return Ok(());
+    };
     let options_bytes =
         fs::read(options_path).map_err(|error| format!("Cannot read watcher worker options: {error}"))?;
     let options: FileSearchIndexOptions = serde_json::from_slice(&options_bytes)
@@ -1484,9 +1667,12 @@ pub(super) fn run_index_worker_watch_mode_inner(
         // Drop noise events at the source so they never wake the main loop.
         // Access events (file reads by Search Indexer/Defender) and metadata-only
         // changes never change index content — skip them entirely.
+        // Kept: "rescan" notices (Windows' event buffer overflowed, so
+        // changes were lost) arrive as `Other` events.
         if let Ok(ref event) = result {
             use notify::event::ModifyKind;
             match &event.kind {
+                _ if event.need_rescan() => {}
                 EventKind::Access(_)
                 | EventKind::Modify(ModifyKind::Metadata(_) | ModifyKind::Other)
                 | EventKind::Any
@@ -1516,7 +1702,17 @@ pub(super) fn run_index_worker_watch_mode_inner(
     }
 
     let mut last_apply_ms: u128 = 0;
-    let mut last_reconcile_ms: u128 = unix_now_ms();
+    let reconcile_soon = |now_ms: u128| now_ms.saturating_sub(RECONCILE_INTERVAL_MS - RECONCILE_SOON_MS);
+    // Changes made while Dash wasn't running are found by a reconciliation
+    // soon after start (a minute in, not during launch) instead of at the
+    // next 6-hour pass — unless the index was just written (a build that
+    // just finished, a quick restart), when there is nothing to catch up.
+    let index_just_written = fs::metadata(active_dir.join("meta.json"))
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < Duration::from_mins(10));
+    let mut last_reconcile_ms: u128 = if index_just_written { unix_now_ms() } else { reconcile_soon(unix_now_ms()) };
     let mut last_loop_iter_ms: u128 = unix_now_ms();
     let mut updated_total = 0_u64;
     let mut deleted_total = 0_u64;
@@ -1557,7 +1753,11 @@ pub(super) fn run_index_worker_watch_mode_inner(
         let resumed_from_suspend = loop_gap_ms > SLEEP_GAP_THRESHOLD_MS;
         if resumed_from_suspend || now_ms.saturating_sub(last_reconcile_ms) >= RECONCILE_INTERVAL_MS {
             last_reconcile_ms = now_ms;
-            if let Ok((reconciled_updates, reconciled_deletes)) = reconcile_watched_index(&active_dir, &options) {
+            let reconciled = reconcile_watched_index(&active_dir, &options);
+            if reconciled.is_err() {
+                last_reconcile_ms = reconcile_soon(now_ms);
+            }
+            if let Ok((reconciled_updates, reconciled_deletes)) = reconciled {
                 if reconciled_updates > 0 || reconciled_deletes > 0 {
                     updated_total += reconciled_updates;
                     deleted_total += reconciled_deletes;
@@ -1600,7 +1800,31 @@ pub(super) fn run_index_worker_watch_mode_inner(
         }
         collect_watcher_events(&rx, &mut pending, strategy, cancel_path);
 
-        let (updated_batch, deleted_batch) = apply_watch_batch_to_index(&active_dir, &options, pending)?;
+        // A watcher error or a rescan notice means events were lost.
+        if pending.iter().any(|event| event.as_ref().map_or(true, Event::need_rescan)) {
+            last_reconcile_ms = last_reconcile_ms.min(reconcile_soon(unix_now_ms()));
+        }
+
+        // A failed batch (the index busy, a file locked, ...) no longer
+        // ends the watcher: it's reported, and a reconciliation soon picks
+        // up what the batch would have changed.
+        let (updated_batch, deleted_batch) = match apply_watch_batch_to_index(&active_dir, &options, pending) {
+            Ok(counts) => counts,
+            Err(error) => {
+                last_apply_ms = unix_now_ms();
+                last_reconcile_ms = last_reconcile_ms.min(reconcile_soon(last_apply_ms));
+                let _ = write_index_worker_status(
+                    status_path,
+                    &IndexWorkerStatusFile::progress(
+                        updated_total,
+                        watched_roots,
+                        deleted_total,
+                        format!("Watcher update failed, retrying soon: {error}"),
+                    ),
+                );
+                continue;
+            }
+        };
 
         // Always mark the apply time so the rate limiter kicks in even when
         // a batch produced no changes (e.g. all events were already filtered).
@@ -1613,7 +1837,7 @@ pub(super) fn run_index_worker_watch_mode_inner(
 
         updated_total += updated_batch;
         deleted_total += deleted_batch;
-        write_index_worker_status(
+        let _ = write_index_worker_status(
             status_path,
             &IndexWorkerStatusFile::progress(
                 updated_total,
@@ -1621,8 +1845,22 @@ pub(super) fn run_index_worker_watch_mode_inner(
                 deleted_total,
                 format!("{}: +{updated_batch} / -{deleted_batch}", strategy.name),
             ),
-        )?;
+        );
     }
+}
+
+/// The content watcher's lock: `index-watcher.lock`, held open with no
+/// sharing for the watcher's lifetime (Windows releases it if the process
+/// dies). `None` when another watcher holds it.
+pub(super) fn claim_watcher_lock(state_dir: &Path) -> Option<fs::File> {
+    let mut open = fs::OpenOptions::new();
+    open.create(true).truncate(false).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        open.share_mode(0);
+    }
+    open.open(state_dir.join("index-watcher.lock")).ok()
 }
 
 pub(super) fn collect_watcher_events(
@@ -1658,12 +1896,16 @@ pub(super) fn reconcile_watched_index(
 ) -> Result<(u64, u64), String> {
     use notify::event::{ModifyKind, RemoveKind};
 
-    let Some(cache) = load_existing_index_for_reuse(active_dir) else {
+    let Some(mut cache) = load_existing_index_for_reuse(active_dir) else {
         // No readable index to diff against — a scheduled rebuild will cover it.
         return Ok((0, 0));
     };
 
-    let mut seen: HashSet<String> = HashSet::with_capacity(cache.map.len());
+    // Entries found on disk are taken out of `cache.map` as the walk meets
+    // them, so what is left at the end is what disappeared — no second set
+    // of every path. Only files the content index holds are compared: other
+    // files (programs, media, ...) used to be queued as "changed" by the
+    // hundred thousand, only to be dropped when applied.
     let mut events: Vec<notify::Result<Event>> = Vec::new();
     let offline = offline_roots(&options.roots);
 
@@ -1674,15 +1916,11 @@ pub(super) fn reconcile_watched_index(
         let builder = index_walker(root, options, true);
         for entry in builder.build().flatten() {
             let path = entry.path();
-            if !should_include_path(path, options) {
-                continue;
-            }
-            let path_lower = path.to_string_lossy().to_lowercase();
-            seen.insert(path_lower.clone());
             let is_file = entry.file_type().is_some_and(|file_type| file_type.is_file());
-            if !is_file {
+            if !is_file || !should_include_path(path, options) || !should_index_for_content(path, options) {
                 continue;
             }
+            let existing = cache.map.remove(&path.to_string_lossy().to_lowercase());
             let Ok(meta) = fs::metadata(path) else {
                 continue;
             };
@@ -1691,10 +1929,8 @@ pub(super) fn reconcile_watched_index(
                 .ok()
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map_or(0, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
-            let unchanged = cache
-                .map
-                .get(&path_lower)
-                .is_some_and(|existing| existing.modified_ms == modified_ms && existing.size == meta.len());
+            let unchanged =
+                existing.is_some_and(|existing| existing.modified_ms == modified_ms && existing.size == meta.len());
             if !unchanged {
                 events.push(Ok(Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path.to_path_buf())));
             }
@@ -1704,7 +1940,7 @@ pub(super) fn reconcile_watched_index(
     // Index entries whose file no longer exists on disk → deletions the live
     // watcher missed. Resolve the case-preserved path from the stored doc.
     for (path_lower, existing) in &cache.map {
-        if seen.contains(path_lower) || offline.iter().any(|root| is_under_root(path_lower, root)) {
+        if offline.iter().any(|root| is_under_root(path_lower, root)) {
             continue;
         }
         let doc: TantivyDocument = match cache.searcher.doc(existing.address) {
@@ -1757,11 +1993,14 @@ pub(super) fn apply_watch_batch_to_index(
         .max(8 * 1024);
     let mut updated_batch = 0_u64;
     let mut deleted_batch = 0_u64;
+    let mut missing_text = false;
 
     for event in events {
-        let (updated, deleted) = apply_watch_event_to_writer(&event, &mut writer, &fields, options, max_content_bytes);
+        let (updated, deleted, missed) =
+            apply_watch_event_to_writer(&event, &mut writer, &fields, options, max_content_bytes);
         updated_batch += updated;
         deleted_batch += deleted;
+        missing_text |= missed;
     }
 
     if updated_batch == 0 && deleted_batch == 0 {
@@ -1770,5 +2009,12 @@ pub(super) fn apply_watch_batch_to_index(
 
     writer.commit().map_err(|error| format!("Cannot commit isolated watcher update: {error}"))?;
     writer.wait_merging_threads().map_err(|error| format!("Cannot finish isolated watcher merge: {error}"))?;
+    // The index now holds text-less documents a full build would extract
+    // (see `apply_watch_event_to_writer`): the next build retries them.
+    if missing_text {
+        if let Some(state_dir) = active_dir.parent() {
+            let _ = fs::remove_file(state_dir.join(EXTRACTION_SIGNATURE_FILE));
+        }
+    }
     Ok((updated_batch, deleted_batch))
 }

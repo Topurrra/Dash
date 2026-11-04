@@ -6,8 +6,8 @@ pub(super) fn should_include_path(path: &Path, options: &FileSearchIndexOptions)
     // Wave 6 (2026-05-28): hard-block on the four Windows system trees
     // (Windows / Program Files / Program Files (x86) / ProgramData). These
     // contain zero user-authored content and were previously eating
-    // ~200k+ index entries per drive for no user benefit. Applied here so
-    // `WalkDir::filter_entry` skips descending into the entire subtree.
+    // ~200k+ index entries per drive for no user benefit. The walk itself
+    // never enters these trees (`index_walker`); this catches single paths.
     if is_system_protected_path(path) {
         return false;
     }
@@ -131,13 +131,6 @@ pub(super) fn path_extension_or_dotfile_token(path: &Path) -> String {
     }
 
     String::new()
-}
-
-/// Read indexable text from a file. Dispatches to format-aware extractors
-/// (PDF, DOCX, XLSX, PPTX) in addition to plain text — see the
-/// `commands::text_extract` module for per-format details.
-pub(super) fn read_text_for_index(path: &Path, max_bytes: usize) -> Option<String> {
-    crate::text_extract::extract_text_for_indexing(path, max_bytes)
 }
 
 /// Extract up to `max_bytes` of readable text from a file for the command

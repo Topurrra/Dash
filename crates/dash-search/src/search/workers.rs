@@ -330,10 +330,11 @@ pub(super) const EXTRACTOR_CHILD_MEMORY_CAP_BYTES: usize = 512 * 1024 * 1024;
 pub(super) const EXTRACTOR_POOL_PATH_BUFFER: usize = 64;
 /// Bounded results channel — caps how much extracted text waits to be indexed.
 pub(super) const EXTRACTOR_POOL_RESULT_BUFFER: usize = 16;
-/// Global cap on extractor-child respawns for one index build. A healthy build
-/// needs zero; a pathological one (memory-bomb files, a broken extractor) is
-/// bounded here so a systemic failure cannot spawn processes without end. Once
-/// it is reached, a slot whose child dies just exits and the pool shrinks.
+/// Global cap on extractor-child respawns after crashes for one index build
+/// (timeouts don't count). A healthy build needs zero; a pathological one
+/// (memory-bomb files, a broken extractor) is bounded here so a systemic
+/// failure cannot spawn processes without end. Once it is reached, a slot
+/// whose child dies just exits and the pool shrinks.
 pub(super) const EXTRACTOR_POOL_MAX_RESPAWNS: usize = 32;
 
 /// One finished extraction handed back from a pool child.
@@ -583,7 +584,12 @@ pub(super) fn extractor_slot(
         }
 
         // Respawn within the global budget so the pool stays at full strength.
-        if respawn_budget.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)).is_err() {
+        // Only a crash draws on it: a timeout means a working child met one
+        // slow file, and a folder of slow PDFs used to spend the budget and
+        // end content indexing early.
+        if !timed_out
+            && respawn_budget.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)).is_err()
+        {
             eprintln!("dash-search: content extractor respawn budget spent — pool shrinking");
             return;
         }
@@ -935,8 +941,10 @@ pub(super) fn start_isolated_filename_index_worker(
     }
 
     // Release the cached filename-index mmap so the worker's directory-rename
-    // swap can succeed on Windows (an open mmap blocks the rename). The monitor
-    // re-opens the handle once the build's status reports success.
+    // swap can succeed on Windows (an open mmap blocks the rename), and keep it
+    // closed until the build ends. The monitor re-opens the handle once the
+    // build's status reports success.
+    FILENAME_BUILD_RUNNING.store(true, Ordering::Relaxed);
     if let Ok(mut guard) = FILENAME_ENGINE.lock() {
         *guard = None;
     }
@@ -1088,6 +1096,7 @@ pub(super) fn start_filename_index_worker_monitor(
                     apply_filename_index_worker_status(&app, status_file);
                     if status_file.finished {
                         build_finished = true;
+                        FILENAME_BUILD_RUNNING.store(false, Ordering::Relaxed);
                     }
                 }
                 if !handle_reopened && status_file.finished && status_file.success {
@@ -1098,6 +1107,7 @@ pub(super) fn start_filename_index_worker_monitor(
 
             let exited = worker.child.lock().map_or(None, |mut child| child.try_wait().ok().flatten());
             if exited.is_some() {
+                FILENAME_BUILD_RUNNING.store(false, Ordering::Relaxed);
                 // A build that never transitioned to a live updater (the walker
                 // path with no watchable roots) reaches success only at exit.
                 if !handle_reopened
@@ -1186,16 +1196,17 @@ pub(super) fn start_isolated_watch_worker(
         return Ok(false);
     }
 
-    {
-        let mut worker_lock =
-            SEARCH_WATCHER_WORKER.lock().map_err(|_| "Search watcher worker lock failed".to_string())?;
-        if let Some(worker) = worker_lock.as_ref() {
-            let still_running = worker.child.lock().is_ok_and(|mut child| child.try_wait().ok().flatten().is_none());
-            if still_running {
-                return Ok(true);
-            }
-            *worker_lock = None;
+    // Held until the new watcher is recorded below: checking, releasing and
+    // spawning let two callers at launch (startup and the scheduler's first
+    // tick) both find no watcher and both start one — two watchers fighting
+    // over one index.
+    let mut worker_lock = SEARCH_WATCHER_WORKER.lock().map_err(|_| "Search watcher worker lock failed".to_string())?;
+    if let Some(worker) = worker_lock.as_ref() {
+        let still_running = worker.child.lock().is_ok_and(|mut child| child.try_wait().ok().flatten().is_none());
+        if still_running {
+            return Ok(true);
         }
+        *worker_lock = None;
     }
 
     let mut options = normalize_index_options(options)?;
@@ -1254,11 +1265,8 @@ pub(super) fn start_isolated_watch_worker(
         cancel_path: cancel_path.clone(),
     };
 
-    {
-        let mut worker_lock =
-            SEARCH_WATCHER_WORKER.lock().map_err(|_| "Search watcher worker lock failed".to_string())?;
-        *worker_lock = Some(worker.clone());
-    }
+    *worker_lock = Some(worker.clone());
+    drop(worker_lock);
 
     let watcher_strategy = watcher_strategy_for_index_size(indexed_files).name.to_string();
     update_status(|status| {

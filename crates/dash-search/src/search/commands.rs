@@ -84,8 +84,8 @@ pub(super) fn watchable_index_roots(options: &FileSearchIndexOptions) -> Vec<Str
 /// lives. Plain drive roots (`C:\`) are also allowed now (we hard-block
 /// the system trees below them instead).
 ///
-/// Matching is "is OR is under": `C:\Windows\System32\foo.dll` matches, so
-/// `WalkDir`'s `filter_entry` will skip descending into these trees during
+/// Matching is "is OR is under": `C:\Windows\System32\foo.dll` matches, and
+/// `index_walker`'s entry filter skips descending into these trees during
 /// indexing. The notify watcher's root filter uses the same predicate.
 pub(super) fn is_system_protected_path(path: &Path) -> bool {
     let normalized = normalize_path_for_exclusion(path);

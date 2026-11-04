@@ -101,6 +101,144 @@ fn name_walker_ignores_ignore_files_content_walker_honours_them() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Excluded folders are not entered at all, not just filtered file by file.
+#[test]
+fn walker_does_not_enter_excluded_folders() {
+    let root = std::env::temp_dir().join(format!("dash-excluded-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+    fs::write(root.join("node_modules/pkg/index.js"), "x").unwrap();
+    fs::write(root.join("keep.txt"), "x").unwrap();
+    let options: FileSearchIndexOptions = serde_json::from_value(
+        serde_json::json!({ "roots": [], "includeHidden": false, "indexContent": true, "excludeFolders": ["node_modules"] }),
+    )
+    .unwrap();
+    let seen: Vec<String> = index_walker(&root.display().to_string(), &options, false)
+        .build()
+        .flatten()
+        .filter_map(|e| e.path().file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    assert!(seen.contains(&"keep.txt".to_string()), "{seen:?}");
+    assert!(!seen.iter().any(|name| name == "node_modules" || name == "pkg" || name == "index.js"), "{seen:?}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Saved progress survives cleanup; a build continues only progress made
+/// with its own settings, and other leftovers are deleted.
+#[test]
+fn interrupted_builds_are_kept_and_matched() {
+    let state = std::env::temp_dir().join(format!("dash-resume-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&state);
+    let build = |stamp: u128, marker: Option<&str>| {
+        let dir = staging_search_index_dir_for_state(&state, stamp);
+        fs::create_dir_all(&dir).unwrap();
+        if let Some(key) = marker {
+            fs::write(dir.join(RESUME_MARKER_FILE), key).unwrap();
+        }
+        dir
+    };
+    let unsaved = build(1, None);
+    let other = build(2, Some("other settings"));
+    let mine = build(3, Some("my settings"));
+
+    remove_staging_index_dirs(&state, STAGING_SEARCH_INDEX_PREFIX);
+    assert!(!unsaved.exists(), "nothing saved: swept as before");
+    assert!(other.exists() && mine.exists(), "saved progress is kept");
+
+    assert_eq!(take_resumable_staging(&state, "my settings"), Some(mine.clone()));
+    assert!(!other.exists(), "progress made with other settings is deleted");
+    assert_eq!(take_resumable_staging(&state, "new settings"), None);
+    assert!(!mine.exists());
+    let _ = fs::remove_dir_all(&state);
+}
+
+/// Only one content watcher can hold an index's watcher lock.
+#[cfg(windows)]
+#[test]
+fn second_watcher_is_refused() {
+    let state = std::env::temp_dir().join(format!("dash-watch-lock-{}", std::process::id()));
+    fs::create_dir_all(&state).unwrap();
+    let first = claim_watcher_lock(&state);
+    assert!(first.is_some());
+    assert!(claim_watcher_lock(&state).is_none(), "held by the first");
+    drop(first);
+    assert!(claim_watcher_lock(&state).is_some(), "free again once released");
+    let _ = fs::remove_dir_all(&state);
+}
+
+/// Removing a folder removes everything under it and nothing next to it.
+#[test]
+fn folder_delete_takes_its_contents_only() {
+    let dir = std::env::temp_dir().join(format!("dash-cascade-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let schema = build_search_schema();
+    let index = Index::open_or_create(MmapDirectory::open(&dir).unwrap(), schema.clone()).unwrap();
+    let fields = extract_fields(&schema).unwrap();
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 20_000_000).unwrap();
+    for path in [r"C:\a", r"C:\a\x.txt", r"C:\a\b\y.txt", r"C:\ab\z.txt", r"C:\a b.txt"] {
+        let meta = ContentDocMeta {
+            file_path: path,
+            file_name: "x",
+            extension: "txt",
+            entry_type: ENTRY_TYPE_FILE,
+            size: 1,
+            modified_ms: 1,
+            created_ms: 1,
+        };
+        add_content_document(&writer, fields, &meta, "").unwrap();
+    }
+    writer.commit().unwrap();
+    delete_path_and_children(&writer, fields.path_exact, Path::new(r"C:\a"));
+    writer.commit().unwrap();
+    writer.wait_merging_threads().unwrap();
+    let mut left: Vec<String> = load_existing_index_for_reuse(&dir).unwrap().map.into_keys().collect();
+    left.sort();
+    assert_eq!(left, vec![r"c:\a b.txt".to_string(), r"c:\ab\z.txt".to_string()]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The reuse snapshot reads paths, sizes and dates without the stored text,
+/// skips deleted documents, and reuses empty text only when told to.
+#[test]
+fn previous_index_is_read_for_reuse() {
+    let dir = std::env::temp_dir().join(format!("dash-reuse-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let schema = build_search_schema();
+    let index = Index::open_or_create(MmapDirectory::open(&dir).unwrap(), schema.clone()).unwrap();
+    let fields = extract_fields(&schema).unwrap();
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 20_000_000).unwrap();
+    let doc = |path: &'static str, size: u64, modified_ms: u64| ContentDocMeta {
+        file_path: path,
+        file_name: "x",
+        extension: "txt",
+        entry_type: ENTRY_TYPE_FILE,
+        size,
+        modified_ms,
+        created_ms: modified_ms,
+    };
+    add_content_document(&writer, fields, &doc(r"C:\Docs\Notes.txt", 11, 1_000), "hello world").unwrap();
+    add_content_document(&writer, fields, &doc(r"C:\Docs\scan.pdf", 500, 2_000), "").unwrap();
+    add_content_document(&writer, fields, &doc(r"C:\Docs\gone.txt", 3, 3_000), "bye").unwrap();
+    writer.commit().unwrap();
+    writer.delete_term(tantivy::Term::from_field_text(fields.path_exact, r"C:\Docs\gone.txt"));
+    writer.commit().unwrap();
+    writer.wait_merging_threads().unwrap();
+
+    let mut cache = load_existing_index_for_reuse(&dir).unwrap();
+    assert_eq!(cache.map.len(), 2, "the deleted document is left out");
+    let notes = &cache.map[r"c:\docs\notes.txt"];
+    assert_eq!((notes.size, notes.modified_ms), (11, 1_000));
+    assert_eq!(reuse_cached_content(&cache, r"c:\docs\notes.txt", 1_000, 11).as_deref(), Some("hello world"));
+    assert_eq!(reuse_cached_content(&cache, r"c:\docs\notes.txt", 1_001, 11), None, "changed file");
+    assert_eq!(reuse_cached_content(&cache, r"c:\docs\scan.pdf", 2_000, 500), None, "empty text retried by default");
+    cache.keep_empty = true;
+    assert_eq!(reuse_cached_content(&cache, r"c:\docs\scan.pdf", 2_000, 500).as_deref(), Some(""));
+    drop(cache);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn relative_date_phrases_resolve_to_rolling_windows() {
     // "today" — a 24h window.
