@@ -773,7 +773,7 @@ pub async fn start_file_search_index(
         // its outcome does not affect the content-index build result the user
         // sees, and post-7d the two indexers no longer touch each other.
         let _ = start_isolated_filename_index_worker(&app_for_worker, options.clone(), true);
-        start_isolated_index_worker(app_for_worker, options)
+        start_isolated_index_worker(app_for_worker, options, true)
     })
     .await
     .map_err(|error| format!("Search index launcher failed: {error}"))?
@@ -791,7 +791,7 @@ pub async fn start_content_search_index(
 ) -> Result<FileSearchBuildResult, String> {
     on_owner!("start_content_search_index", { "options": options });
     let app_for_worker = Arc::clone(&app);
-    tokio::task::spawn_blocking(move || start_isolated_index_worker(app_for_worker, options))
+    tokio::task::spawn_blocking(move || start_isolated_index_worker(app_for_worker, options, true))
         .await
         .map_err(|error| format!("Search index launcher failed: {error}"))?
 }

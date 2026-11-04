@@ -2,8 +2,8 @@
 //! Semantic-search vector store.
 //!
 //! Multiple embedding vectors per content-indexed document — one per text
-//! chunk (see `embedding::chunk_text`) — keyed by absolute path. Written by
-//! the content indexer (`search.rs::run_content_indexer`, behind the
+//! chunk (see `embedding::chunk_text`) — keyed by absolute path. Written in
+//! the background by the content watcher (`search::semantic`, behind the
 //! semantic toggle) and read at query time to find the documents *closest
 //! in meaning* to the query: the ones the keyword passes miss because they
 //! share no literal words. Scoring a document by its BEST chunk (not one
@@ -46,9 +46,21 @@ use std::time::SystemTime;
 
 pub const VECTOR_CACHE_FILE: &str = "vector_cache.redb";
 
-/// Key = absolute path (utf-8), value = packed chunk set:
-/// `[u16 dim][u16 chunk_count][i8; dim]…` (one i8 block per chunk).
-const VECTOR_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("vector_cache_v2");
+/// Key = absolute path (utf-8), value = `[u64 modified_ms]` of the text the
+/// vectors were made from, then the packed chunk set (see `pack`), which is
+/// empty for a document without text. The modification time is what lets
+/// the background embedder (`search::semantic`) tell a current vector from
+/// a stale one. (`v2` held vectors without it; those are left unread.)
+const VECTOR_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("vector_cache_v3");
+
+/// One document's vectors to store: its path, the modification time of the
+/// text they come from, and one f32 embedding per passage (none when the
+/// document has no text).
+pub struct DocVectors {
+    pub path: String,
+    pub modified_ms: u64,
+    pub chunks: Vec<Vec<f32>>,
+}
 
 /// Serialize store access at the process level (mirrors `OCR_CACHE_LOCK`).
 static VECTOR_CACHE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -160,17 +172,13 @@ fn open_db(path: &Path) -> Result<Database, String> {
     Ok(db)
 }
 
-/// Store (or overwrite) one document's chunk vectors. `chunks` are the raw
-/// f32 embeddings, one per text passage; they're quantized to int8 here.
-/// Errors are logged, never bubbled — a failed write just costs one doc's
-/// semantic recall.
-pub fn store(db_path: &Path, path: &str, chunks: &[Vec<f32>]) {
-    if chunks.is_empty() {
-        return;
-    }
-    let quantized: Vec<Vec<i8>> = chunks.iter().filter(|c| !c.is_empty()).map(|c| quantize(c)).collect();
-    let packed = pack(&quantized);
-    if packed.is_empty() {
+/// Store (or overwrite) documents' chunk vectors in one transaction; they're
+/// quantized to int8 here. A document stored without chunks is recorded as
+/// done (no text to embed) so it isn't tried again until it changes. Errors
+/// are logged, never bubbled — a failed write just leaves the documents for
+/// the next pass.
+pub fn store_many(db_path: &Path, docs: &[DocVectors]) {
+    if docs.is_empty() {
         return;
     }
     let Ok(_guard) = VECTOR_CACHE_LOCK.lock() else {
@@ -185,21 +193,64 @@ pub fn store(db_path: &Path, path: &str, chunks: &[Vec<f32>]) {
     };
     if let Ok(write_txn) = db.begin_write() {
         if let Ok(mut table) = write_txn.open_table(VECTOR_TABLE) {
-            let _ = table.insert(path, packed.as_slice());
+            for doc in docs {
+                let quantized: Vec<Vec<i8>> =
+                    doc.chunks.iter().filter(|c| !c.is_empty()).map(|c| quantize(c)).collect();
+                let mut value = doc.modified_ms.to_le_bytes().to_vec();
+                value.extend(pack(&quantized));
+                let _ = table.insert(doc.path.as_str(), value.as_slice());
+            }
         }
         let _ = write_txn.commit();
     }
 }
 
-/// Wipe the store (called at the start of a full rebuild so vectors for
-/// deleted files don't linger as orphans). Best-effort.
-pub fn clear(db_path: &Path) {
+/// Path → modification time of every stored document: what the background
+/// embedder compares against the index to find missing and stale vectors.
+pub fn stored_versions(db_path: &Path) -> std::collections::HashMap<String, u64> {
+    let mut versions = std::collections::HashMap::new();
+    let Ok(_guard) = VECTOR_CACHE_LOCK.lock() else {
+        return versions;
+    };
+    if !db_path.exists() {
+        return versions;
+    }
+    let Ok(db) = open_db(db_path) else {
+        return versions;
+    };
+    if let Ok(read_txn) = db.begin_read() {
+        if let Ok(table) = read_txn.open_table(VECTOR_TABLE) {
+            if let Ok(iter) = table.iter() {
+                for (key, value) in iter.flatten() {
+                    if let Some(stamp) = value.value().get(..8).and_then(|bytes| bytes.try_into().ok()) {
+                        versions.insert(key.value().to_string(), u64::from_le_bytes(stamp));
+                    }
+                }
+            }
+        }
+    }
+    versions
+}
+
+/// Drop the vectors of `paths` (files gone from the index, or no longer
+/// documents that get embedded).
+pub fn remove_many(db_path: &Path, paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
     let Ok(_guard) = VECTOR_CACHE_LOCK.lock() else {
         return;
     };
-    let _ = fs::remove_file(db_path);
-    if let Ok(mut cache) = DECODE_CACHE.lock() {
-        *cache = None;
+    let Ok(db) = open_db(db_path) else {
+        return;
+    };
+    if let Ok(write_txn) = db.begin_write() {
+        if let Ok(mut table) = write_txn.open_table(VECTOR_TABLE) {
+            for path in paths {
+                let _ = table.remove(path.as_str());
+            }
+        }
+        let _ = write_txn.commit();
     }
 }
 
@@ -234,7 +285,9 @@ fn read_all(db_path: &Path) -> Vec<ChunkSet> {
             if let Ok(iter) = table.iter() {
                 for entry in iter.flatten() {
                     let path = entry.0.value().to_string();
-                    if let Some(chunks) = unpack(entry.1.value()) {
+                    // After the modification time; documents without text
+                    // have no chunks and are skipped here.
+                    if let Some(chunks) = entry.1.value().get(8..).and_then(unpack) {
                         out.push((path, chunks));
                     }
                 }

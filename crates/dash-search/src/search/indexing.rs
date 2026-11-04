@@ -48,9 +48,45 @@ pub(super) fn run_index_worker_index_mode_inner(
         staging_dir
     };
 
-    let result = build_index_in_worker(state_dir, &staging_dir, &options, status_path, cancel_path);
+    let result = build_index_in_worker(state_dir, &staging_dir, &options, status_path, cancel_path, false);
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging_dir);
+    }
+    result
+}
+
+/// Subprocess entry point for the scheduled content refresh (`update`):
+/// updates the live index in place (`build_index_in_worker` with
+/// `in_place`) when it was fully built with today's extraction settings and
+/// version; otherwise — no index yet, OCR or the text limit changed, a new
+/// Dash version — a full build as in `index` mode.
+pub(super) fn run_index_worker_update_mode(
+    state_dir: &Path,
+    options_path: &Path,
+    status_path: &Path,
+    cancel_path: &Path,
+) -> Result<(), String> {
+    let options_bytes = fs::read(options_path).map_err(|error| format!("Cannot read index worker options: {error}"))?;
+    let options: FileSearchIndexOptions = serde_json::from_slice(&options_bytes)
+        .map_err(|error| format!("Cannot parse index worker options: {error}"))?;
+    let options = normalize_index_options(options)?;
+    recover_content_index_dirs_for_state(state_dir)?;
+    let active_dir = active_search_index_dir_for_state(state_dir);
+    let same_extraction = fs::read_to_string(state_dir.join(EXTRACTION_SIGNATURE_FILE))
+        .is_ok_and(|saved| saved == extraction_signature(&options));
+    if !active_dir.exists() || !same_extraction {
+        return run_index_worker_index_mode(state_dir, options_path, status_path, cancel_path);
+    }
+    write_index_worker_status(
+        status_path,
+        &IndexWorkerStatusFile::progress(0, 0, 0, "Updating search index".to_string()),
+    )?;
+    let result = build_index_in_worker(state_dir, &active_dir, &options, status_path, cancel_path, true);
+    if let Err(error) = &result {
+        let _ = write_index_worker_status(
+            status_path,
+            &IndexWorkerStatusFile::finished(false, false, 0, 0, 0, error.clone(), Some(error.clone())),
+        );
     }
     result
 }
@@ -176,7 +212,12 @@ pub(super) fn load_existing_index_for_reuse(active_dir: &Path) -> Option<Existin
     let index = Index::open(directory).ok()?;
     let schema = index.schema();
     let fields = extract_fields(&schema).ok()?;
-    let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into().ok()?;
+    // A small doc-store cache: each reused file's text is read once, roughly
+    // in index order, and blocks hold whole documents (up to 1 MB of text) —
+    // tantivy's default of 100 blocks per segment held gigabytes during a
+    // rebuild.
+    let reader =
+        index.reader_builder().reload_policy(ReloadPolicy::Manual).doc_store_cache_num_blocks(8).try_into().ok()?;
     let searcher: tantivy::Searcher = reader.searcher();
 
     // Paths come from `path_exact`'s term dictionary (one raw term per
@@ -351,10 +392,6 @@ pub(super) fn run_content_indexer(
     should_stop: &AtomicBool,
     status_path: &Path,
     throttle_ms: u64,
-    // Semantic search (beta): path to the vector sidecar store, `Some` only when
-    // the toggle is on AND the embedder is compiled in and loaded. `None` skips
-    // all embedding work (the default), so this loop is unchanged when off.
-    vector_db_path: Option<&Path>,
 ) {
     loop {
         // Hold the receiver lock only for `recv` itself — never across the
@@ -417,22 +454,8 @@ pub(super) fn run_content_indexer(
             should_stop.store(true, Ordering::Relaxed);
             continue;
         }
-        // Semantic search: chunk the extracted text into overlapping passages,
-        // embed them in one batch, and store the (int8-quantized) chunk vectors
-        // so the query-time cosine pass can find this doc by the meaning of its
-        // best-matching passage — not one blurry whole-doc average. Best-effort:
-        // a failed embed just drops this doc from semantic recall, never the
-        // keyword index. Skipped for name-only (empty content) docs.
-        if let Some(vec_path) = vector_db_path {
-            if !content.is_empty() {
-                let chunks = crate::embedding::chunk_text(&content, 180, 30, 16);
-                if let Some(vectors) = crate::embedding::embed_batch(&chunks) {
-                    if !vectors.is_empty() {
-                        crate::vector_cache::store(vec_path, &result.path, &vectors);
-                    }
-                }
-            }
-        }
+        // Semantic vectors aren't made here: the watcher embeds documents in
+        // the background (`search::semantic`), so builds stay fast.
         let new_indexed = indexed_files.fetch_add(1, Ordering::Relaxed) + 1;
         report_index_progress(status_path, new_indexed, scanned, skipped, last_progress, throttle_ms);
     }
@@ -532,20 +555,33 @@ pub(super) fn content_index_unchanged(
     matched == u64::try_from(cache.map.len()).unwrap_or(u64::MAX)
 }
 
+/// Builds the content index into `staging_dir` and swaps it in — or, with
+/// `in_place`, updates the live index itself (`staging_dir` is then the
+/// active dir): unchanged files are left alone, changed ones replaced, and
+/// entries whose file is gone removed. No copy, no swap; this is what the
+/// scheduled refresh does (`run_index_worker_update_mode`).
 pub(super) fn build_index_in_worker(
     state_dir: &Path,
     staging_dir: &Path,
     options: &FileSearchIndexOptions,
     status_path: &Path,
     cancel_path: &Path,
+    in_place: bool,
 ) -> Result<(), String> {
+    // A build that fails or stops early drops its staging copy; in place,
+    // that dir is the live index, which must never be deleted.
+    let discard_staging = || {
+        if !in_place {
+            let _ = fs::remove_dir_all(staging_dir);
+        }
+    };
     // ── Content indexing opt-in (Phase 2 / Task 4.3) ──────────────────────
     // When the user has turned "search inside files" off, the content worker
     // no-ops: the filename index (built by a separate worker) still gives full
     // name search. Default is on; the frontend defaults it OFF on first run on
     // low-RAM (Lite) profiles where a content index can't converge.
     if !options.content_indexing_enabled {
-        let _ = fs::remove_dir_all(staging_dir);
+        discard_staging();
         write_index_worker_status(
             status_path,
             &IndexWorkerStatusFile::finished(
@@ -574,7 +610,9 @@ pub(super) fn build_index_in_worker(
             .is_ok_and(|saved| saved == extraction_signature(options));
         cache
     });
-    if let Some(cache) = &existing_cache {
+    // Only when extraction is also as before (`keep_empty`: same settings and
+    // version): unchanged files with OCR just turned on still need a build.
+    if let Some(cache) = existing_cache.as_ref().filter(|cache| !in_place && cache.keep_empty) {
         if content_index_unchanged(options, cache, cancel_path) {
             let doc_count = u64::try_from(cache.map.len()).unwrap_or(u64::MAX);
             let now_ms = unix_now_ms();
@@ -595,7 +633,7 @@ pub(super) fn build_index_in_worker(
             // The caller created an empty staging dir for the (now-skipped)
             // rebuild; the normal path consumes it via the swap, so discard it
             // here to leave the same on-disk state.
-            let _ = fs::remove_dir_all(staging_dir);
+            discard_staging();
             write_index_worker_status(
                 status_path,
                 &IndexWorkerStatusFile::finished(
@@ -614,9 +652,9 @@ pub(super) fn build_index_in_worker(
 
     // What an interrupted build already saved in this staging dir (see
     // `take_resumable_staging`): those files, unchanged since, are skipped.
-    let resumed =
-        staging_dir.join(RESUME_MARKER_FILE).exists().then(|| load_existing_index_for_reuse(staging_dir)).flatten();
-    let resuming = resumed.is_some();
+    let resumed = (!in_place && staging_dir.join(RESUME_MARKER_FILE).exists())
+        .then(|| load_existing_index_for_reuse(staging_dir))
+        .flatten();
 
     let schema = build_search_schema();
     let directory = MmapDirectory::open(staging_dir)
@@ -628,9 +666,18 @@ pub(super) fn build_index_in_worker(
     // indexer threads and the checkpoint thread; we reclaim sole ownership
     // afterward via Arc::try_unwrap for the final commit.
     let (writer_threads, writer_budget) = index_writer_sizing();
-    let writer = index
-        .writer_with_num_threads(writer_threads, writer_budget)
-        .map_err(|error| format!("Cannot create search writer: {error}"))?;
+    // In place, the watcher that was just told to stop may still hold the
+    // live index's writer lock for a moment: wait for it (up to ~10 s).
+    let mut attempts = 0;
+    let writer = loop {
+        match index.writer_with_num_threads(writer_threads, writer_budget) {
+            Err(tantivy::TantivyError::LockFailure(..)) if in_place && attempts < 20 => {
+                attempts += 1;
+                thread::sleep(Duration::from_millis(500));
+            }
+            result => break result.map_err(|error| format!("Cannot create search writer: {error}"))?,
+        }
+    };
 
     // The filename index is built separately by the standalone filename
     // indexer (Phase 3, step 7d retired the in-walk dual-write) — this worker
@@ -670,6 +717,10 @@ pub(super) fn build_index_in_worker(
     let writer = Arc::new(std::sync::RwLock::new(writer));
     let existing_cache = Arc::new(existing_cache);
     let resumed = Arc::new(resumed);
+    // In place: the indexed files the walk met (lower-cased), so the ones it
+    // didn't — deleted, moved, now excluded — can be removed afterwards.
+    let seen: Option<Arc<Mutex<HashSet<String>>>> = in_place.then(|| Arc::new(Mutex::new(HashSet::new())));
+    let unchanged_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let indexed_files_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let scanned_entries_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let skipped_files_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -752,22 +803,6 @@ pub(super) fn build_index_in_worker(
     } else {
         None
     };
-    // Semantic search (beta, 2026-07-01): when the toggle is on AND the embedder
-    // is compiled in (`semantic` feature) and its model loaded, index one vector
-    // per document beside the search index. `None` — the default, or any build
-    // without the feature — makes the indexer threads skip all embedding work.
-    // Cleared up front so vectors for files deleted since the last build don't
-    // linger as orphans (this is the full-rebuild path) — but not when
-    // resuming: the interrupted build already stored vectors for its files.
-    let vector_db_path = if options.semantic_search_enabled && crate::embedding::is_available() {
-        let path = crate::vector_cache::cache_path_for_dir(state_dir);
-        if !resuming {
-            crate::vector_cache::clear(&path);
-        }
-        Some(path)
-    } else {
-        None
-    };
     let (pool, path_tx, result_rx) = ExtractorPool::new(
         extractor_child_count,
         max_content_bytes,
@@ -778,7 +813,7 @@ pub(super) fn build_index_in_worker(
         cache_ctx.as_ref(),
     )
     .map_err(|error| {
-        let _ = fs::remove_dir_all(staging_dir);
+        discard_staging();
         format!("Cannot start content extractor pool: {error}")
     })?;
 
@@ -800,7 +835,6 @@ pub(super) fn build_index_in_worker(
             let last_progress = Arc::clone(&last_progress_at_ms_shared);
             let should_stop = Arc::clone(&should_stop_walker);
             let status_path = status_path.to_path_buf();
-            let vector_db_path = vector_db_path.clone();
             thread::spawn(move || {
                 run_content_indexer(
                     &result_rx,
@@ -814,7 +848,6 @@ pub(super) fn build_index_in_worker(
                     &should_stop,
                     &status_path,
                     throttle_ms,
-                    vector_db_path.as_deref(),
                 );
             })
         })
@@ -845,7 +878,9 @@ pub(super) fn build_index_in_worker(
                     });
                 match committed {
                     Ok(_) => {
-                        let _ = fs::write(&marker, &key);
+                        if !in_place {
+                            let _ = fs::write(&marker, &key);
+                        }
                     }
                     Err(error) => {
                         if let Ok(mut guard) = first_error.lock() {
@@ -881,11 +916,6 @@ pub(super) fn build_index_in_worker(
         let walker = builder.build_parallel();
         let status_path_owned = status_path.to_path_buf();
         let cancel_path_owned = cancel_path.to_path_buf();
-        // Plain text and code are a bounded, guarded file read: done right in
-        // the walk instead of a round trip through an extractor child. With
-        // semantic search on they keep going through the pool, whose indexer
-        // threads also embed them.
-        let read_text_in_walk = vector_db_path.is_none();
 
         walker.run(|| {
             // Per-worker clones of the shared state. The outer closure is FnMut
@@ -894,6 +924,8 @@ pub(super) fn build_index_in_worker(
             let writer = Arc::clone(&writer);
             let existing_cache = Arc::clone(&existing_cache);
             let resumed = Arc::clone(&resumed);
+            let seen = seen.clone();
+            let unchanged_atomic = Arc::clone(&unchanged_atomic);
             let indexed_files_atomic = Arc::clone(&indexed_files_atomic);
             let scanned_entries_atomic = Arc::clone(&scanned_entries_atomic);
             let skipped_files_atomic = Arc::clone(&skipped_files_atomic);
@@ -988,6 +1020,35 @@ pub(super) fn build_index_in_worker(
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                     .map_or(modified_ms, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
 
+                // Updating in place: an unchanged file is already in the index
+                // and is left alone; a changed one's old document goes.
+                if let Some(seen) = &seen {
+                    let key = file_path.to_lowercase();
+                    let current = existing_cache.as_ref().as_ref().and_then(|cache| cache.map.get(&key));
+                    if let Some(current) = current {
+                        let unchanged = current.modified_ms == modified_ms && current.size == size;
+                        if let Ok(mut seen) = seen.lock() {
+                            seen.insert(key);
+                        }
+                        if unchanged {
+                            unchanged_atomic.fetch_add(1, Ordering::Relaxed);
+                            let new_indexed = indexed_files_atomic.fetch_add(1, Ordering::Relaxed) + 1;
+                            report_index_progress(
+                                &status_path,
+                                new_indexed,
+                                &scanned_entries_atomic,
+                                &skipped_files_atomic,
+                                &last_progress,
+                                throttle_ms,
+                            );
+                            return ignore::WalkState::Continue;
+                        }
+                        if let Ok(writer) = writer.read() {
+                            writer.delete_term(Term::from_field_text(fields.path_exact, &file_path));
+                        }
+                    }
+                }
+
                 // Resuming: the interrupted build already indexed this file.
                 // Unchanged since, it is done; changed, its old document goes.
                 if let Some(saved) =
@@ -1012,18 +1073,18 @@ pub(super) fn build_index_in_worker(
 
                 // Reuse-cache check — if this document's (mtime, size) match
                 // the previous index, its already-extracted content is reused
-                // and it is indexed here. On a miss, plain text is read here
-                // (`read_text_in_walk`) and everything else goes to the
-                // out-of-process extractor pool.
+                // and it is indexed here. On a miss, plain text and code — a
+                // bounded, guarded file read — are read here, and everything
+                // else goes to the out-of-process extractor pool.
                 let cached = existing_cache
                     .as_ref()
                     .as_ref()
                     .and_then(|cache| reuse_cached_content(cache, &file_path.to_lowercase(), modified_ms, size));
                 let reused = cached.is_some();
-                let read_here = (cached.is_none()
-                    && read_text_in_walk
-                    && crate::text_extract::is_plain_text_extension(&extension))
-                .then(|| crate::text_extract::extract_text_for_indexing(path, max_content_bytes).unwrap_or_default());
+                let read_here =
+                    (cached.is_none() && crate::text_extract::is_plain_text_extension(&extension)).then(|| {
+                        crate::text_extract::extract_text_for_indexing(path, max_content_bytes).unwrap_or_default()
+                    });
                 if let Some(content) = cached.or(read_here) {
                     if reused {
                         reused_count_atomic.fetch_add(1, Ordering::Relaxed);
@@ -1138,7 +1199,7 @@ pub(super) fn build_index_in_worker(
         indexer_panicked = true;
     }
     if indexer_panicked {
-        let _ = fs::remove_dir_all(staging_dir);
+        discard_staging();
         return Err("Content indexer thread panicked".to_string());
     }
 
@@ -1172,7 +1233,7 @@ pub(super) fn build_index_in_worker(
     // never masked as a recoverable partial.
     if let Ok(guard) = first_error.lock() {
         if let Some(err) = guard.as_ref() {
-            let _ = fs::remove_dir_all(staging_dir);
+            discard_staging();
             return Err(err.clone());
         }
     }
@@ -1186,8 +1247,8 @@ pub(super) fn build_index_in_worker(
         Some(cache) => u64::try_from(cache.map.len()).unwrap_or(u64::MAX),
         None => 0,
     };
-    if resumable_interrupt && indexed_files < prior_active_count {
-        let _ = fs::remove_dir_all(staging_dir);
+    if !in_place && resumable_interrupt && indexed_files < prior_active_count {
+        discard_staging();
         let message = if canceled {
             "Index build cancelled — existing index kept.".to_string()
         } else {
@@ -1218,6 +1279,25 @@ pub(super) fn build_index_in_worker(
         .into_inner()
         .map_err(|_| "Search writer lock was poisoned".to_string())?;
 
+    // In place, after a complete walk: entries the walk didn't meet are gone
+    // from disk, moved, or now excluded. Unplugged drives keep theirs.
+    let mut removed: u64 = 0;
+    if let (true, Some(cache), Some(seen)) = (!resumable_interrupt, existing_cache.as_ref(), &seen) {
+        let seen = seen.lock().map_err(|_| "Seen-files lock was poisoned".to_string())?;
+        let offline = offline_roots(&options.roots);
+        for (key, entry) in &cache.map {
+            if seen.contains(key) || offline.iter().any(|root| is_under_root(key, root)) {
+                continue;
+            }
+            let Ok(stored) = cache.searcher.doc::<TantivyDocument>(entry.address) else { continue };
+            if let Some(path) = doc_text(&stored, cache.fields.path) {
+                writer.delete_term(Term::from_field_text(fields.path_exact, &path));
+                removed += 1;
+            }
+        }
+    }
+    let unchanged = unchanged_atomic.load(Ordering::Relaxed);
+
     write_index_worker_status(
         status_path,
         &IndexWorkerStatusFile::progress(
@@ -1237,9 +1317,10 @@ pub(super) fn build_index_in_worker(
     // longer something to resume.
     drop(existing_cache);
     drop(resumed);
-    let _ = fs::remove_file(staging_dir.join(RESUME_MARKER_FILE));
-
-    swap_in_staging_search_index_for_state(state_dir, staging_dir)?;
+    if !in_place {
+        let _ = fs::remove_file(staging_dir.join(RESUME_MARKER_FILE));
+        swap_in_staging_search_index_for_state(state_dir, staging_dir)?;
+    }
 
     // Only a complete build vouches for its documents without text: in an
     // interrupted one, files are also empty because the pool stopped early.
@@ -1320,7 +1401,12 @@ pub(super) fn build_index_in_worker(
         IndexWorkerStatusFile::finished(true, canceled, indexed_files, scanned_entries, skipped_files, message, None)
             .into_partial()
     } else {
-        let final_message = if reused_content_count > 0 {
+        let final_message = if in_place {
+            format!(
+                "Search index up to date — {indexed_files} files, {} new or changed, {removed} removed",
+                indexed_files.saturating_sub(unchanged)
+            )
+        } else if reused_content_count > 0 {
             format!(
                 "Indexed {indexed_files} entries (reused content for {reused_content_count} unchanged files — incremental rebuild)"
             )
@@ -1726,6 +1812,18 @@ pub(super) fn run_index_worker_watch_mode_inner(
         ),
     )?;
 
+    // Semantic search: documents without a current vector are embedded here
+    // while no file events wait, a step at a time (`search::semantic`),
+    // from two minutes after start. The backlog is read again after the
+    // index changes.
+    let mut semantic_on = options.semantic_search_enabled && crate::embedding::is_available();
+    let vectors = crate::vector_cache::cache_path_for_dir(state_dir);
+    let semantic_from = std::time::Instant::now() + Duration::from_mins(2);
+    let mut backlog: Option<SemanticBacklog> = None;
+    let mut backlog_stale = true;
+    let mut backlog_read_at = std::time::Instant::now();
+    let mut semantic_reported_at = std::time::Instant::now();
+
     loop {
         if cancel_path.exists() {
             write_index_worker_status(
@@ -1759,6 +1857,7 @@ pub(super) fn run_index_worker_watch_mode_inner(
             }
             if let Ok((reconciled_updates, reconciled_deletes)) = reconciled {
                 if reconciled_updates > 0 || reconciled_deletes > 0 {
+                    backlog_stale = true;
                     updated_total += reconciled_updates;
                     deleted_total += reconciled_deletes;
                     let _ = write_index_worker_status(
@@ -1793,7 +1892,33 @@ pub(super) fn run_index_worker_watch_mode_inner(
         let mut pending = Vec::new();
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(value) => pending.push(value),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if semantic_on && std::time::Instant::now() >= semantic_from {
+                    if backlog.is_none() || (backlog_stale && backlog_read_at.elapsed() >= Duration::from_mins(2)) {
+                        backlog = semantic_backlog(&active_dir, &vectors);
+                        backlog_stale = false;
+                        backlog_read_at = std::time::Instant::now();
+                    }
+                    if let Some(work) = backlog.as_mut().filter(|work| work.remaining() > 0) {
+                        let until = std::time::Instant::now() + Duration::from_millis(1_500);
+                        semantic_on = embed_some(work, &vectors, until).is_some();
+                        let left = work.remaining();
+                        if left == 0 || semantic_reported_at.elapsed() >= Duration::from_secs(30) {
+                            semantic_reported_at = std::time::Instant::now();
+                            let _ = write_index_worker_status(
+                                status_path,
+                                &IndexWorkerStatusFile::progress(
+                                    updated_total,
+                                    watched_roots,
+                                    deleted_total,
+                                    format!("Semantic search: {left} documents left to embed"),
+                                ),
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("Index watcher event channel disconnected".to_string());
             }
@@ -1835,6 +1960,7 @@ pub(super) fn run_index_worker_watch_mode_inner(
             continue;
         }
 
+        backlog_stale = true;
         updated_total += updated_batch;
         deleted_total += deleted_batch;
         let _ = write_index_worker_status(

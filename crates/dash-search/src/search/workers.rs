@@ -2,9 +2,13 @@
 
 use super::*;
 
+/// Starts the content index worker. `full`: rebuild from scratch (what a
+/// user asks for); otherwise the scheduled refresh, which updates the live
+/// index in place when it can (`run_index_worker_update_mode`).
 pub(super) fn start_isolated_index_worker(
     app: std::sync::Arc<dyn dash_core::Host>,
     options: FileSearchIndexOptions,
+    full: bool,
 ) -> Result<FileSearchBuildResult, String> {
     let mut options = normalize_index_options(options)?;
     // A fresh rebuild should resume live watching when the desired setting is enabled.
@@ -54,7 +58,7 @@ pub(super) fn start_isolated_index_worker(
     );
     command
         .arg(INDEX_WORKER_ARG)
-        .arg("index")
+        .arg(if full { "index" } else { "update" })
         .arg("--state-dir")
         .arg(&state_dir)
         .arg("--options")
@@ -96,6 +100,11 @@ pub(super) fn start_isolated_index_worker(
         status.exclude_extensions.clone_from(&options.exclude_extensions);
         // A fresh build restarts the live scan counters from zero so a stale
         // count from the previous build never flashes before the first poll.
+        // The document count too: it only ever rises during a build (see
+        // `apply_index_worker_status`), so the previous index's total used
+        // to stay on screen until the rebuild passed it — no visible
+        // progress at all. Like the filename count, it now climbs from 0.
+        status.indexed_files = 0;
         status.scanned_entries = 0;
         status.skipped_files = 0;
         status.last_error = None;
@@ -1516,7 +1525,7 @@ pub fn maybe_run_index_worker_from_args() -> bool {
     let worker_args = args.get(worker_arg_position + 2..).map(<[std::ffi::OsString]>::to_vec).unwrap_or_default();
 
     let result = match mode {
-        "index" | "watch" | "filename-index" => {
+        "index" | "update" | "watch" | "filename-index" => {
             let state_dir = worker_arg_path(&worker_args, "--state-dir");
             let options_path = worker_arg_path(&worker_args, "--options");
             let status_path = worker_arg_path(&worker_args, "--status");
@@ -1524,6 +1533,7 @@ pub fn maybe_run_index_worker_from_args() -> bool {
             match (state_dir, options_path, status_path, cancel_path) {
                 (Ok(state_dir), Ok(options_path), Ok(status_path), Ok(cancel_path)) => match mode {
                     "index" => run_index_worker_index_mode(&state_dir, &options_path, &status_path, &cancel_path),
+                    "update" => run_index_worker_update_mode(&state_dir, &options_path, &status_path, &cancel_path),
                     "filename-index" => {
                         run_index_worker_filename_mode(&state_dir, &options_path, &status_path, &cancel_path)
                     }

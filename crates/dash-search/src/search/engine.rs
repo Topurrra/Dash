@@ -257,7 +257,7 @@ pub(super) fn run_scheduled_file_search_rebuild(app: &std::sync::Arc<dyn dash_co
         status.rebuild_schedule = config.rebuild_schedule.clone();
     });
 
-    let _ = start_isolated_index_worker(Arc::clone(app), config.options.clone())?;
+    let _ = start_isolated_index_worker(Arc::clone(app), config.options.clone(), false)?;
     Ok(())
 }
 
