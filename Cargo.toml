@@ -6,7 +6,7 @@ members = ["crates/dash-core", "crates/dash-clipboard", "crates/dash-search", "a
 resolver = "2"
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 publish = false
 license = "GPL-3.0-or-later"
