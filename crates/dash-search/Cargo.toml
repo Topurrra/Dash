@@ -10,8 +10,9 @@ description = "File search: filename + content indexes, queries, ranking, extrac
 default = []
 # The ONNX runtime (shared with other ONNX users in the host app).
 onnx = ["dep:ort", "ort/download-binaries", "ort/tls-native"]
-# Meaning search with EmbeddingGemma.
-semantic = ["onnx", "dep:tokenizers"]
+# Meaning search with the Model2Vec potion-retrieval-32M static model.
+# `tokenizers` gives model2vec-rs its regex backend (fancy-regex, pure Rust).
+semantic = ["dep:model2vec-rs", "dep:tokenizers"]
 # In-process libtesseract (else tesseract.exe is spawned).
 ocr-leptess = ["dep:leptess"]
 
@@ -40,6 +41,9 @@ grep-regex = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 ort = { version = "=2.0.0-rc.14", optional = true, default-features = false, features = ["std"] }
 tokenizers = { version = "0.21", optional = true, default-features = false, features = ["fancy-regex"] }
+# Without its own regex features: those add esaxx-rs, built against the
+# static C runtime, which won't link beside ONNX Runtime's dynamic one.
+model2vec-rs = { version = "=0.4.0", optional = true, default-features = false, features = ["local-only"] }
 leptess = { version = "0.14", optional = true }
 
 [target.'cfg(windows)'.dependencies]

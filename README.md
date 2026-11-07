@@ -76,7 +76,7 @@ macOS and Linux are built and tested in CI but haven't been tried by hand yet, a
 cargo build --release -p dash
 ```
 
-Windows installer: `installer/build.ps1` (needs NSIS, plus the runtime files listed in `installer/dash.nsi`: PDFium, Tesseract, the EmbeddingGemma 2 model).
+Windows installer: `installer/build.ps1` (needs NSIS, plus the runtime files listed in `installer/dash.nsi`: PDFium, Tesseract, the potion-retrieval-32M model).
 macOS `.dmg`: `packaging/macos/make_dmg.sh`. Linux AppImage: `packaging/linux/make_appimage.sh`. CI builds both, and the Release workflow attaches them to each published release.
 
 | Crate | What |

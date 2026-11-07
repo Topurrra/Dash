@@ -50,8 +50,13 @@ pub const VECTOR_CACHE_FILE: &str = "vector_cache.redb";
 /// vectors were made from, then the packed chunk set (see `pack`), which is
 /// empty for a document without text. The modification time is what lets
 /// the background embedder (`search::semantic`) tell a current vector from
-/// a stale one. (`v2` held vectors without it; those are left unread.)
-const VECTOR_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("vector_cache_v3");
+/// a stale one. `v4`: potion-retrieval-32M, 512-d. Older tables hold another
+/// model's vectors (`OLD_TABLES`) and are dropped when the store opens.
+const VECTOR_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("vector_cache_v4");
+
+/// `v2`: `EmbeddingGemma` vectors without a modification time; `v3`: with one.
+const OLD_TABLES: [TableDefinition<&str, &[u8]>; 2] =
+    [TableDefinition::new("vector_cache_v2"), TableDefinition::new("vector_cache_v3")];
 
 /// One document's vectors to store: its path, the modification time of the
 /// text they come from, and one f32 embedding per passage (none when the
@@ -167,6 +172,9 @@ fn open_db(path: &Path) -> Result<Database, String> {
     let write_txn = db.begin_write().map_err(|e| format!("Cannot initialize vector cache: {e}"))?;
     {
         let _ = write_txn.open_table(VECTOR_TABLE).map_err(|e| format!("Cannot initialize vector table: {e}"))?;
+        for old in OLD_TABLES {
+            let _ = write_txn.delete_table(old);
+        }
     }
     write_txn.commit().map_err(|e| format!("Cannot commit vector cache init: {e}"))?;
     Ok(db)

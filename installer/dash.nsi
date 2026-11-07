@@ -5,7 +5,7 @@
 ; %LOCALAPPDATA%\Dash and are never removed here.
 ; Runtimes (installer\runtimes, see its README): PDFium (PDF text), Tesseract
 ; and its language files (OCR), the Visual C++ runtime Tesseract needs, and
-; the EmbeddingGemma 2 model (search by meaning).
+; the potion-retrieval-32M model (search by meaning).
 !define RUNTIMES "runtimes"
 
 Unicode true
@@ -65,11 +65,12 @@ Section "Dash" Main
   File "${RUNTIMES}\msvc-runtime\*.dll"
   SetOutPath "$INSTDIR\tessdata"
   File "${RUNTIMES}\tessdata-runtime\*.traineddata"
+  ; The previous model's files, left by an update from 1.0.0 or earlier.
+  RMDir /r "$INSTDIR\embedding-runtime\onnx"
   SetOutPath "$INSTDIR\embedding-runtime"
   File "${RUNTIMES}\embedding-runtime\tokenizer.json"
-  SetOutPath "$INSTDIR\embedding-runtime\onnx"
-  File "${RUNTIMES}\embedding-runtime\onnx\model_q4.onnx"
-  File "${RUNTIMES}\embedding-runtime\onnx\model_q4.onnx_data"
+  File "${RUNTIMES}\embedding-runtime\model.safetensors"
+  File "${RUNTIMES}\embedding-runtime\config.json"
   SetOutPath "$INSTDIR"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 

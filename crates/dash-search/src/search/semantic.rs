@@ -91,7 +91,7 @@ pub(super) fn embed_some(backlog: &mut SemanticBacklog, vectors: &Path, until: s
             .ok()
             .and_then(|doc| doc_text(&doc, backlog.fields.content))
             .unwrap_or_default();
-        let chunks = crate::embedding::chunk_text(&text, 180, 30, 16);
+        let chunks = crate::embedding::chunk_text(&text, 180, 30, 4);
         let chunks = if chunks.is_empty() { Vec::new() } else { crate::embedding::embed_batch(&chunks)? };
         done.push(DocVectors { path, modified_ms, chunks });
     }

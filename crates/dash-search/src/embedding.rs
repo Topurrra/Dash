@@ -1,29 +1,22 @@
 //! Runs in any app that is a `dash_core::Host`.
 //! Text embeddings for semantic search.
 //!
-//! Wraps a bundled `EmbeddingGemma` 2 ONNX model (text-only, q4, 768-d) via
-//! `ort` + `tokenizers` directly. The model is an asymmetric encoder —
-//! queries get a "task: search result | query: " prefix and documents get
-//! "title: none | text: ". Leaving out the prefixes silently lowers quality.
+//! A static embedding model, `Model2Vec` `potion-retrieval-32M` (MIT, 512-d),
+//! through `model2vec-rs`: a text's vector is the weighted mean of its
+//! tokens' vectors — a table lookup, no neural network at run time. On
+//! 3,467 of the owner's documents it embedded ~270,000 passages a second
+//! with ~0.4 GB of RAM, where `EmbeddingGemma` 2 (the model before) managed
+//! ~2 a second with ~10 GB: days for a large home folder instead of
+//! seconds. Queries and documents are embedded the same way (no prefixes).
 //!
-//! Text-only: the model accepts optional image, video and audio features;
-//! we pass empty tensors so those encoders are never exercised. The output
-//! vectors are identical to the full multimodal pipeline's text vectors.
+//! The real implementation is behind the `semantic` cargo feature. Builds
+//! without it get inert stubs (`embed` → `None`, `is_available` →
+//! `false`), so semantic search is simply absent, never a build break.
 //!
-//! RAM: ~310 MB peak, ~300 MB idle. The native tokenizer keeps ~70 MB
-//! (vs ~300 MB for a JS tokenizer), and with ONNX Runtime's memory arena
-//! disabled the activation buffers are freed after each run instead of kept
-//! (~700 MB savings).
-//!
-//! Gating mirrors the other native-runtime features (`vosk`, `ocr-leptess`,
-//! `screenrec`): the real implementation is behind the `semantic` cargo
-//! feature, which pulls `ort` + `tokenizers`. Builds without the feature
-//! get inert stubs (`embed` → `None`, `is_available` → `false`), so
-//! semantic search is simply absent, never a build break.
-//!
-//! Everything here is offline: the model + tokenizer are read from the
-//! bundled resource dir (`embedding-runtime/`, set via `set_model_dir` at
-//! startup). No `HuggingFace` download, no network.
+//! Everything here is offline: `tokenizer.json`, `model.safetensors` and
+//! `config.json` are read from the bundled resource dir
+//! (`embedding-runtime/`, set via `set_model_dir` at startup). No
+//! `HuggingFace` download, no network.
 //!
 //! `chunk_text` (below) splits a document into overlapping passages so each
 //! is embedded separately — a long document's specific matching passage is
@@ -49,12 +42,15 @@ pub fn ort_environment() -> Option<&'static ort::environment::Environment> {
     .as_ref()
 }
 
-/// `EmbeddingGemma` 2 output dimensionality.
-pub const EMBED_DIM: usize = 768;
+/// `potion-retrieval-32M` output dimensionality.
+pub const EMBED_DIM: usize = 512;
+
+/// The model files, inside the model dir.
+const MODEL_FILES: [&str; 3] = ["tokenizer.json", "model.safetensors", "config.json"];
 
 /// Absolute path to the bundled model dir (`embedding-runtime/`), resolved
-/// from the Tauri resource dir once at startup. `embed` reads the ONNX +
-/// tokenizer files from here.
+/// from the Tauri resource dir once at startup. `embed` reads the model files
+/// from here.
 static MODEL_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Record where the bundled model lives. Called once from app setup with
@@ -73,8 +69,7 @@ fn model_dir() -> Option<PathBuf> {
 
 /// Whether the model files are there (cheap; doesn't load the model).
 pub fn model_files_present() -> bool {
-    model_dir()
-        .is_some_and(|dir| dir.join("tokenizer.json").is_file() && dir.join("onnx").join("model_q4.onnx").is_file())
+    model_dir().is_some_and(|dir| MODEL_FILES.iter().all(|file| dir.join(file).is_file()))
 }
 
 /// Split a document into overlapping word-window passages for per-chunk
@@ -116,144 +111,49 @@ pub fn chunk_text(text: &str, target_words: usize, overlap: usize, max_chunks: u
 
 #[cfg(feature = "semantic")]
 mod imp {
-    use super::{model_dir, EMBED_DIM};
-    use ort::session::Session;
-    use ort::value::Tensor;
-    use std::sync::{LazyLock, Mutex};
-    use tokenizers::Tokenizer;
+    use super::{model_dir, EMBED_DIM, MODEL_FILES};
+    use model2vec_rs::model::StaticModel;
+    use std::sync::LazyLock;
 
-    const QUERY_PREFIX: &str = "task: search result | query: ";
-    const DOC_PREFIX: &str = "title: none | text: ";
+    /// Tokens read per text; longer passages are cut (Dash's are ~180 words).
+    const MAX_TOKENS: usize = 512;
 
-    struct EmbedModel {
-        session: Session,
-        tokenizer: Tokenizer,
-    }
+    static MODEL: LazyLock<Option<StaticModel>> = LazyLock::new(load_model);
 
-    static MODEL: LazyLock<Mutex<Option<EmbedModel>>> = LazyLock::new(|| Mutex::new(load_model()));
-
-    fn load_model() -> Option<EmbedModel> {
+    fn load_model() -> Option<StaticModel> {
         let dir = model_dir()?;
-        let tokenizer_path = dir.join("tokenizer.json");
-        let model_path = dir.join("onnx").join("model_q4.onnx");
-        if !tokenizer_path.exists() || !model_path.exists() {
+        if !MODEL_FILES.iter().all(|file| dir.join(file).is_file()) {
             eprintln!("embedding: model files not found in {}; semantic search disabled.", dir.display());
             return None;
         }
-
-        let mut tokenizer = match Tokenizer::from_file(&tokenizer_path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("embedding: failed to load tokenizer ({e}); semantic search disabled.");
-                return None;
+        match StaticModel::from_pretrained(&dir, None, Some(true), None) {
+            Ok(model) if model.dim() == EMBED_DIM => Some(model),
+            Ok(model) => {
+                eprintln!(
+                    "embedding: model has {} dimensions, expected {EMBED_DIM}; semantic search disabled.",
+                    model.dim()
+                );
+                None
             }
-        };
-        tokenizer.with_padding(Some(tokenizers::PaddingParams::default()));
-        if let Err(e) =
-            tokenizer.with_truncation(Some(tokenizers::TruncationParams { max_length: 2048, ..Default::default() }))
-        {
-            eprintln!("embedding: failed to set truncation ({e}); continuing anyway.");
+            Err(error) => {
+                eprintln!("embedding: failed to load the model ({error}); semantic search disabled.");
+                None
+            }
         }
-
-        let env = super::ort_environment()?;
-        let session = match Session::builder(env).and_then(|mut b| b.commit_from_file(&model_path)) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("embedding: failed to load ONNX model ({e}); semantic search disabled.");
-                return None;
-            }
-        };
-
-        Some(EmbedModel { session, tokenizer })
     }
 
     pub fn is_available() -> bool {
-        MODEL.lock().is_ok_and(|m| m.is_some())
-    }
-
-    fn make_empty_features() -> ort::Result<Tensor<f32>> {
-        Tensor::<f32>::from_array(([0usize, 512usize], Vec::<f32>::new().into_boxed_slice()))
-    }
-
-    fn raw_embed(model: &mut EmbedModel, texts: &[&str]) -> Option<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Some(Vec::new());
-        }
-        let mut all_vecs = Vec::new();
-
-        for chunk_start in (0..texts.len()).step_by(16) {
-            let batch = &texts[chunk_start..(chunk_start + 16).min(texts.len())];
-            let encodings = model.tokenizer.encode_batch(batch.to_vec(), true).ok()?;
-            let batch_size = encodings.len();
-            let seq_len = encodings[0].get_ids().len();
-
-            let mut ids_flat = Vec::with_capacity(batch_size * seq_len);
-            let mut mask_flat = Vec::with_capacity(batch_size * seq_len);
-            for enc in &encodings {
-                ids_flat.extend(enc.get_ids().iter().map(|&id| i64::from(id)));
-                mask_flat.extend(enc.get_attention_mask().iter().map(|&m| i64::from(m)));
-            }
-
-            let input_ids = Tensor::<i64>::from_array(([batch_size, seq_len], ids_flat.into_boxed_slice())).ok()?;
-            let attention_mask =
-                Tensor::<i64>::from_array(([batch_size, seq_len], mask_flat.into_boxed_slice())).ok()?;
-
-            let outputs = model
-                .session
-                .run(ort::inputs![
-                    "input_ids" => input_ids,
-                    "attention_mask" => attention_mask,
-                    "image_features" => make_empty_features().ok()?,
-                    "video_features" => make_empty_features().ok()?,
-                    "audio_features" => make_empty_features().ok()?
-                ])
-                .ok()?;
-
-            let (shape, data) = outputs["sentence_embedding"].try_extract_tensor::<f32>().ok()?;
-
-            // A negative or huge dimension is just "not the expected one".
-            let out_dim = if shape.len() == 2 { usize::try_from(shape[1]).unwrap_or(0) } else { 0 };
-            if out_dim != EMBED_DIM {
-                eprintln!("embedding: unexpected output dim {out_dim}, expected {EMBED_DIM}");
-                return None;
-            }
-
-            for j in 0..batch_size {
-                let start = j * EMBED_DIM;
-                let end = start + EMBED_DIM;
-                if end > data.len() {
-                    return None;
-                }
-                let v: Vec<f32> = data[start..end].to_vec();
-                let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-                if norm <= 0.0 {
-                    all_vecs.push(v);
-                } else {
-                    all_vecs.push(v.iter().map(|x| x / norm).collect());
-                }
-            }
-        }
-
-        Some(all_vecs)
+        MODEL.is_some()
     }
 
     pub fn embed_query(text: &str) -> Option<Vec<f32>> {
-        let prefixed = format!("{QUERY_PREFIX}{text}");
-        let mut guard = MODEL.lock().ok()?;
-        let model = guard.as_mut()?;
-        let mut vecs = raw_embed(model, &[&prefixed])?;
-        vecs.pop()
+        embed_docs(&[text])?.pop()
     }
 
     pub fn embed_docs(texts: &[&str]) -> Option<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Some(Vec::new());
-        }
-        let prefixed: Vec<String> = texts.iter().map(|t| format!("{DOC_PREFIX}{t}")).collect();
-        let refs: Vec<&str> = prefixed.iter().map(std::string::String::as_str).collect();
-        let mut guard = MODEL.lock().ok()?;
-        let model = guard.as_mut()?;
-        raw_embed(model, &refs)
+        let model = MODEL.as_ref()?;
+        let texts: Vec<String> = texts.iter().map(|text| (*text).to_string()).collect();
+        Some(model.encode_with_args(&texts, Some(MAX_TOKENS), 256))
     }
 }
 
@@ -275,8 +175,8 @@ pub fn is_available() -> bool {
     imp::is_available()
 }
 
-/// Embed one piece of text (query side) with the query prefix, or `None` if
-/// semantic search is unavailable or the text is empty. Never panics.
+/// Embed one piece of text (a query), or `None` if semantic search is
+/// unavailable or the text is empty. Never panics.
 pub fn embed(text: &str) -> Option<Vec<f32>> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -285,7 +185,7 @@ pub fn embed(text: &str) -> Option<Vec<f32>> {
     imp::embed_query(trimmed)
 }
 
-/// Embed many passages at once (index/document side) with the document prefix.
+/// Embed many passages at once (index/document side).
 /// Returns one vector per input in order, or `None` if semantic search is
 /// unavailable. Empty-after-trim inputs are dropped, so the output length may
 /// be shorter than the input — callers pair vectors with chunks by filtering
@@ -306,7 +206,7 @@ mod tests {
     /// cargo test -p dash-search --features semantic -- --ignored model`.
     #[cfg(feature = "semantic")]
     #[test]
-    #[ignore = "needs the ~200 MB model; set DASH_TEST_MODEL_DIR"]
+    #[ignore = "needs the ~125 MB model; set DASH_TEST_MODEL_DIR"]
     fn model_ranks_by_meaning() {
         let dir = std::env::var("DASH_TEST_MODEL_DIR").expect("DASH_TEST_MODEL_DIR");
         set_model_dir(PathBuf::from(dir));
@@ -344,11 +244,11 @@ mod tests {
 
     #[cfg(feature = "semantic")]
     #[test]
-    #[ignore = "loads the real bundled ONNX model; run with --ignored"]
+    #[ignore = "loads the real bundled model; set DASH_TEST_MODEL_DIR and run with --ignored"]
     fn loads_the_bundled_model_and_embeds_sensibly() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("embedding-runtime");
-        assert!(dir.join("onnx").join("model_q4.onnx").exists(), "no model at {}", dir.display());
-        set_model_dir(dir);
+        let dir = PathBuf::from(std::env::var("DASH_TEST_MODEL_DIR").expect("DASH_TEST_MODEL_DIR"));
+        set_model_dir(dir.clone());
+        assert!(model_files_present(), "no model at {}", dir.display());
 
         assert!(is_available(), "model failed to load (semantic search would be silently OFF)");
 

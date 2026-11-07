@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 dash-core.workspace = true
 dash-clipboard = { path = "../crates/dash-clipboard" }
-# With semantic search (EmbeddingGemma 2 through ONNX Runtime, linked in);
+# With semantic search (the Model2Vec potion-retrieval-32M static model);
 # the model ships in the installer (installer/dash.nsi).
 dash-search = { path = "../crates/dash-search", features = ["semantic"] }
 serde_json.workspace = true
